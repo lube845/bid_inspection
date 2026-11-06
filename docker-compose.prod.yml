@@ -1,0 +1,27 @@
+# 生产模式覆盖文件：代码打进镜像，不挂载源码、不开热重载。
+#
+# 用法（注意必须显式指定 -f，此时 docker-compose.override.yml 不会被自动加载）：
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# 部署前请在 .env 中修改 SECRET_KEY / ADMIN_PASSWORD / POSTGRES_PASSWORD，
+# 并把 SEED_DEMO 设为 false。
+name: bid-inspection
+
+services:
+  api:
+    environment:
+      ENVIRONMENT: production
+      ALLOW_RERUN_RUNNING_TASKS: "false"
+    # 覆盖掉开发模式的源码挂载，只保留数据卷
+    volumes: !override
+      - storage:/data/storage
+
+  worker:
+    environment:
+      ENVIRONMENT: production
+      ALLOW_RERUN_RUNNING_TASKS: "false"
+    volumes: !override
+      - storage:/data/storage
+
+  frontend:
+    volumes: !override []

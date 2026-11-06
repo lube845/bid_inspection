@@ -1,0 +1,4 @@
+pytest==8.3.4
+httpx==0.28.1
+# watchdog 提供 watchmedo 命令：开发模式下用它监听 .py 变更并自动重启 Celery Worker
+watchdog==6.0.0

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m compileall -q app tests)",
+      "Bash(.venv/bin/python -c \"import fastapi, sqlalchemy, celery, openpyxl, pypdf, docx; print\\('ok'\\)\")",
+      "Bash(.venv/bin/pip download *)",
+      "Bash(pip config *)",
+      "Bash(node --check frontend/app.js)"
+    ]
+  }
+}

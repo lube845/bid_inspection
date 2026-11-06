@@ -1,0 +1,107 @@
+# 开发模式覆盖文件（docker compose 会自动加载，无需额外参数）
+#
+# 目标：改代码 → 保存 → 立刻在浏览器看到结果，不重建镜像。
+#
+#   backend/app/*.py   -> uvicorn --reload 自动重载（秒级）
+#   backend/app/*.py   -> watchmedo 自动重启 Celery Worker（秒级）
+#   frontend/*         -> nginx 直接读挂载目录，刷新浏览器即生效
+#   requirements.txt / Dockerfile.dev 变更 -> 需要重建镜像（docker compose watch 会自动处理）
+#
+# 生产部署不要用这个文件，请使用：
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+name: bid-inspection
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    # --reload 只监听 /app/app 下 *.py 的变化，热重载不重建容器
+    command:
+      - "sh"
+      - "./entrypoint.sh"
+      - "uvicorn"
+      - "app.main:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--reload"
+      - "--reload-dir"
+      - "/app/app"
+      - "--reload-include"
+      - "*.py"
+      - "--log-level"
+      - "info"
+    environment:
+      ENVIRONMENT: development
+      # Worker 重启后允许重新执行停留在 running 的任务（开发期便利，生产保持 false）
+      ALLOW_RERUN_RUNNING_TASKS: "true"
+      # 改表结构后自动补齐新增列，无需重建数据库
+      AUTO_SYNC_SCHEMA: "true"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8888}
+    volumes:
+      # 宿主机源码直挂容器：改代码立即可见，无需 docker compose build
+      - ./backend:/app
+    develop:
+      watch:
+        # 依赖文件变化时自动重建并重启容器（配合 `docker compose watch` 使用）
+        - path: ./backend/requirements.txt
+          action: rebuild
+          target: requirements.txt
+        - path: ./backend/requirements-dev.txt
+          action: rebuild
+          target: requirements-dev.txt
+        - path: ./backend/Dockerfile.dev
+          action: rebuild
+          target: Dockerfile.dev
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    # watchmedo 监听 .py 变化并重启 worker；预 fork 的 Celery 任务会在重启时中断（开发期可接受）
+    command:
+      - "watchmedo"
+      - "auto-restart"
+      - "--recursive"
+      - "--pattern"
+      - "*.py"
+      - "--ignore-pattern"
+      - "tests.*"
+      - "--ignore-pattern"
+      - "\\.pytest_cache.*"
+      - "--"
+      - "python"
+      - "-m"
+      - "celery"
+      - "-A"
+      - "app.workers.celery_app"
+      - "worker"
+      - "--loglevel=info"
+      - "--concurrency=2"
+    environment:
+      ENVIRONMENT: development
+      ALLOW_RERUN_RUNNING_TASKS: "true"
+    volumes:
+      - ./backend:/app
+    develop:
+      watch:
+        - path: ./backend/requirements.txt
+          action: rebuild
+          target: requirements.txt
+        - path: ./backend/requirements-dev.txt
+          action: rebuild
+          target: requirements-dev.txt
+        - path: ./backend/Dockerfile.dev
+          action: rebuild
+          target: Dockerfile.dev
+
+  frontend:
+    volumes:
+      # 静态资源由 nginx 直接从挂载目录读取，改完刷新浏览器即可
+      - ./frontend:/usr/share/nginx/html:ro

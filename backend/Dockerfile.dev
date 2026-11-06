@@ -1,0 +1,24 @@
+# 开发模式镜像：与生产镜像一致，但额外安装开发依赖（pytest / watchdog 等），
+# 并把代码放在 /app 下，方便通过 bind mount 挂载宿主机源码实现热重载。
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120
+
+WORKDIR /app
+
+# 默认使用国内镜像加速；海外环境可覆盖为 https://pypi.org/simple
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir --retries 10 --index-url "${PIP_INDEX_URL}" -r requirements.txt -r requirements-dev.txt
+
+COPY app ./app
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
+
+EXPOSE 8000
+
+CMD ["./entrypoint.sh", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
