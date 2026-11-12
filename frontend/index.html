@@ -75,7 +75,9 @@
           </div>
           <p id="login-error" class="form-error" role="alert" hidden></p>
           <button class="btn primary block" type="submit">登录系统</button>
-          <p class="hint">账号由系统管理员分配；初始账号见部署说明。</p>
+          <p class="hint">账号由系统管理员分配；初始口令见部署配置的 .env。</p>
+          <!-- 免责声明在小屏（hero 隐藏）时仍需可见，见 .login-note-inline -->
+          <p class="login-note login-note-inline"><svg class="icon" aria-hidden="true"><use href="#i-info"></use></svg>系统输出为疑似异常线索，不构成围标串标认定结论。</p>
         </form>
       </section>
 
