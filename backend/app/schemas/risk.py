@@ -11,3 +11,5 @@ class BatchReviewRequest(BaseModel):
     evidence_ids: list[str] = Field(min_length=1)
     status: str = Field(default="undecided")
     comment: str | None = Field(default=None, max_length=1000)
+    # 默认跳过已有审核结论的证据，避免批量标记覆盖人工判断
+    skip_reviewed: bool = Field(default=True)

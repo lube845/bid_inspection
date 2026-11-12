@@ -123,6 +123,12 @@ def project_stats(db: Session, project: Project) -> dict:
             "last_status": last_task.status if last_task else None,
             "last_task_id": last_task.id if last_task else None,
             "last_analysis_at": last_task.finished_at or last_task.created_at if last_task else None,
+            # 价格维度覆盖情况：供项目概览显著提示「哪些企业未识别到报价」
+            "price_coverage": (
+                ((last_task.progress or {}).get("price") or {}).get("coverage")
+                if last_task
+                else None
+            ),
         },
     }
 
@@ -299,6 +305,7 @@ def collect_todos(db: Session, project: Project, ctx: dict | None = None) -> lis
             "请到风险管理页集中处理",
             "medium",
             f"#/risks?project_id={project.id}&review_status=pending",
+            created_at=ctx.get("pending_review_at"),
         )
 
     finished = last_task is not None and last_task.status in FINISHED_TASK_STATUSES
@@ -334,6 +341,13 @@ def _todo_context(db: Session, project: Project) -> dict:
             ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
         )
     ) or 0
+    pending_review_at = db.scalar(
+        select(func.max(ComparisonEvidence.created_at)).where(
+            ComparisonEvidence.project_id == project.id,
+            ComparisonEvidence.is_current.is_(True),
+            ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
+        )
+    )
     exported = bool(
         db.scalar(
             select(func.count())
@@ -360,6 +374,7 @@ def _todo_context(db: Session, project: Project) -> dict:
         ],
         "last_task": last_task,
         "pending_review_count": pending_review,
+        "pending_review_at": pending_review_at,
         "exported": exported,
     }
 

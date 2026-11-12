@@ -233,3 +233,17 @@ def test_total_quote_falls_back_to_uppercase_amount():
     assert quote is not None
     assert quote.amount == 1_500_000
     assert quote.upper == "壹佰伍拾万元整"
+
+
+def test_total_quote_supports_parenthesized_unit():
+    """回归：投标总报价（人民币元）：9986000 这类常见写法必须能识别。"""
+    cases = [
+        ("投标总报价（人民币元）：9986000", 9_986_000),
+        ("投标总报价(人民币元): 9,986,000.00", 9_986_000),
+        ("投标总报价（万元）：998.6", 9_986_000),
+        ("投标总报价（元）：9986000", 9_986_000),
+    ]
+    for text, expected in cases:
+        quote = extract_quote("c1", "甲公司", [make_block(text, file_name="报价.txt")])
+        assert quote is not None, text
+        assert quote.amount == expected, text

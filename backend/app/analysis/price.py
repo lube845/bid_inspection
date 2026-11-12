@@ -16,16 +16,27 @@ from app.analysis.thresholds import price_thresholds
 from app.models.enums import EvidenceType, RiskLevel
 from app.utils.text import compact_snippet
 
+_TOTAL_KEYWORDS = (
+    r"投标总报价|投标报价|总报价|报价总额|投标总价|总价|投标价格|报价金额"
+)
+_UNIT_PATTERN = r"亿元|百万元|万元|千元|万|亿|元"
+_NUMBER_PATTERN = r"[0-9][0-9,]*(?:\.[0-9]{1,2})?"
+# 兼容：
+#   投标总报价：10,000,000.00 元
+#   投标总报价（人民币元）：9986000
+#   投标总报价（万元）：998.6
+#   投标总报价：人民币 998.6 万元
 _TOTAL_PATTERN = re.compile(
-    r"(?:投标总报价|投标报价|总报价|报价总额|投标总价|总价|投标价格|报价金额)"
-    r"\s*(?:为|是)?\s*[:：]?\s*(?:人民币)?\s*"
-    r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*"
-    r"(亿元|百万元|万元|千元|万|亿|元)",
+    rf"(?:{_TOTAL_KEYWORDS})"
+    rf"\s*(?:[（(]\s*(?:人民币)?\s*({_UNIT_PATTERN})\s*[）)])?"
+    rf"\s*(?:为|是)?\s*[:：]?\s*(?:人民币)?\s*"
+    rf"({_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?"
 )
 # 只有大写金额的写法：投标总报价：壹仟万元整
 _UPPER_TOTAL_PATTERN = re.compile(
-    r"(?:投标总报价|投标报价|总报价|报价总额|投标总价|总价|投标价格|报价金额)"
-    r"\s*(?:为|是)?\s*[:：]?\s*(?:人民币)?\s*"
+    rf"(?:{_TOTAL_KEYWORDS})"
+    rf"\s*(?:[（(]\s*(?:人民币)?\s*(?:{_UNIT_PATTERN})\s*[）)])?"
+    rf"\s*(?:为|是)?\s*[:：]?\s*(?:人民币)?\s*"
     r"([零壹贰叁肆伍陆柒捌玖拾佰仟万亿兆圆元角分整]{3,})"
 )
 _UPPER_PATTERN = re.compile(
@@ -196,9 +207,11 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
 
         for match in _TOTAL_PATTERN.finditer(block.content):
             keyword = match.group(0)
-            amount_text = match.group(1).replace(",", "")
+            amount_text = match.group(2).replace(",", "")
+            # 单位可能写在括号里（人民币元）、数字后面（万元），也可能省略（按元）
+            unit = match.group(3) or match.group(1) or "元"
             try:
-                amount = float(amount_text) * _UNIT_MULTIPLIER[match.group(2)]
+                amount = float(amount_text) * _UNIT_MULTIPLIER[unit]
             except (ValueError, KeyError):
                 continue
             if amount <= 0:

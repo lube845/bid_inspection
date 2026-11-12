@@ -16,7 +16,7 @@ from app.models import (
     User,
 )
 from app.models.enums import EvidenceType, ReviewStatus, RiskLevel, TaskStatus
-from app.services import audit
+from app.services import audit, evidence_context
 
 RISK_LABELS = {
     RiskLevel.NONE.value: "无",
@@ -178,6 +178,10 @@ def overview(db: Session, project: Project, task_id: str | None = None) -> dict:
         for evidence in price_evidences
         for participant in evidence.participants
     }
+    # 价格维度的覆盖情况由分析阶段写入任务进度；这里原样下发给前端做显式提示。
+    price_coverage = (
+        (task.progress or {}).get("price") or {}
+    ).get("coverage") or {}
 
     top_evidences = sorted(
         all_evidences,
@@ -228,6 +232,8 @@ def overview(db: Session, project: Project, task_id: str | None = None) -> dict:
             ),
             "personnel_duplicate_count": len(personnel_names),
             "price_abnormal_company_count": len(price_companies),
+            # 价格维度覆盖情况：识别到报价的企业数 / 应识别企业数 / 未识别的企业
+            "price_coverage": price_coverage,
             "pending_review_count": sum(
                 1 for e in all_evidences if e.review_status == ReviewStatus.PENDING.value
             ),
@@ -265,9 +271,9 @@ def task_history(db: Session, project_id: str) -> list[dict]:
     ]
 
 
-def pair_detail(db: Session, pair: ComparisonPair) -> dict:
+def _pair_evidences(db: Session, pair: ComparisonPair) -> list[ComparisonEvidence]:
+    """组合下的全部证据（含同时涉及两家企业的价格异常证据）。"""
     task = db.get(AnalysisTask, pair.analysis_task_id)
-    names = _snapshot_names(task)
     evidences = [evidence for evidence in pair.evidences if evidence.is_current]
     if task:
         price_evidences = _price_evidences(db, task)
@@ -275,9 +281,19 @@ def pair_detail(db: Session, pair: ComparisonPair) -> dict:
             participant_ids = {p.company_id for p in evidence.participants}
             if {pair.company_a_id, pair.company_b_id} <= participant_ids:
                 evidences.append(evidence)
-
     evidences.sort(key=lambda e: (_RISK_ORDER.get(e.severity, 0), e.created_at), reverse=True)
+    return evidences
+
+
+def pair_detail(db: Session, pair: ComparisonPair) -> dict:
+    task = db.get(AnalysisTask, pair.analysis_task_id)
+    names = _snapshot_names(task)
+    evidences = _pair_evidences(db, pair)
     counts = Counter(e.evidence_type for e in evidences)
+    text_evidences = [e for e in evidences if e.evidence_type == EvidenceType.TEXT.value]
+    excluded = sum(
+        1 for e in text_evidences if (e.evidence_data or {}).get("excluded_by_tender")
+    )
     return {
         "pair": {
             "id": pair.id,
@@ -300,7 +316,82 @@ def pair_detail(db: Session, pair: ComparisonPair) -> dict:
             "personnel": counts[EvidenceType.PERSONNEL.value],
             "price": counts[EvidenceType.PRICE.value],
         },
-        "evidences": [_evidence_summary(e) for e in evidences],
+        # 统一数量口径：识别数 / 命中招标公共内容被排除数 / 有效数
+        "count_breakdown": {
+            "text": {
+                "identified": len(text_evidences),
+                "excluded_by_tender": excluded,
+                "effective": len(text_evidences) - excluded,
+            }
+        },
+        "evidences": _with_group_positions([_evidence_summary(e) for e in evidences]),
+    }
+
+
+def pair_evidences(
+    db: Session,
+    pair: ComparisonPair,
+    *,
+    evidence_type: str | None = None,
+    review_status: str | None = None,
+    severity: str | None = None,
+    tender: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    before: int = evidence_context.DEFAULT_BEFORE_CHARS,
+    after: int = evidence_context.DEFAULT_AFTER_CHARS,
+) -> dict:
+    """按需返回证据及其默认上下文（比对分析页首屏只加载这一份数据）。"""
+    evidences = _pair_evidences(db, pair)
+    counts = Counter(e.evidence_type for e in evidences)
+    filtered = []
+    for evidence in evidences:
+        if evidence_type and evidence.evidence_type != evidence_type:
+            continue
+        if review_status and evidence.review_status != review_status:
+            continue
+        if severity and evidence.severity != severity:
+            continue
+        excluded = bool((evidence.evidence_data or {}).get("excluded_by_tender"))
+        if tender == "hit" and not excluded:
+            continue
+        if tender == "effective" and excluded:
+            continue
+        filtered.append(evidence)
+
+    total = len(filtered)
+    start = max(0, (page - 1) * page_size)
+    rows = filtered[start : start + page_size]
+    reader = evidence_context.BlockReader(db)
+    items = []
+    for evidence in rows:
+        summary = _evidence_summary(evidence)
+        summary["sides"] = evidence_context.build_sides(
+            db,
+            evidence,
+            before=before,
+            after=after,
+            reader=reader,
+        )
+        items.append(summary)
+    _with_group_positions(items)
+    return {
+        "pair_id": pair.id,
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "counts": {
+            "text": counts[EvidenceType.TEXT.value],
+            "personnel": counts[EvidenceType.PERSONNEL.value],
+            "price": counts[EvidenceType.PRICE.value],
+        },
+        "context": {
+            "before_chars": before,
+            "after_chars": after,
+            "step_chars": evidence_context.CONTEXT_STEP_CHARS,
+            "max_chars": evidence_context.MAX_CONTEXT_CHARS,
+        },
     }
 
 
@@ -331,6 +422,7 @@ def _source_summary(source: dict | None) -> dict | None:
 
 
 def _evidence_summary(evidence: ComparisonEvidence) -> dict:
+    data = evidence.evidence_data or {}
     return {
         "id": evidence.id,
         "evidence_type": evidence.evidence_type,
@@ -339,13 +431,46 @@ def _evidence_summary(evidence: ComparisonEvidence) -> dict:
         "summary": evidence.summary,
         "review_status": evidence.review_status,
         # 是否命中招标文件公共内容（被排除的雷同内容仍保留识别记录）
-        "excluded_by_tender": bool((evidence.evidence_data or {}).get("excluded_by_tender")),
+        "excluded_by_tender": bool(data.get("excluded_by_tender")),
         "pair_id": evidence.comparison_pair_id,
         "source_a": _source_summary(evidence.source_a),
         "source_b": _source_summary(evidence.source_b),
         "companies": [p.company_name for p in evidence.participants],
         "created_at": evidence.created_at,
+        # 同一组候选文本块可能命中多处相似片段，用候选标识分组展示
+        "group_key": _group_key(data),
+        "matched_chars": data.get("matched_chars"),
+        "similarity_percent": data.get("similarity_percent"),
+        "match_interval_count": data.get("match_interval_count"),
     }
+
+
+def _group_key(data: dict) -> str | None:
+    """同一组候选文本块的证据共享同一个分组标识。"""
+    chunk_a = data.get("chunk_a_id")
+    chunk_b = data.get("chunk_b_id")
+    if not chunk_a or not chunk_b:
+        return None
+    return f"{chunk_a}|{chunk_b}"
+
+
+def _with_group_positions(items: list[dict]) -> list[dict]:
+    """给同一组内的证据标注「第 N 处 / 共 M 处」。"""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for item in items:
+        key = item.get("group_key")
+        if key:
+            groups[key].append(item)
+    for members in groups.values():
+        total = len(members)
+        for index, member in enumerate(members, start=1):
+            member["group_index"] = index
+            member["group_size"] = total
+    for item in items:
+        if not item.get("group_key"):
+            item["group_index"] = None
+            item["group_size"] = None
+    return items
 
 
 def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
@@ -369,6 +494,8 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
         "evidence_data": evidence.evidence_data,
         "source_a": _source_summary(evidence.source_a),
         "source_b": _source_summary(evidence.source_b),
+        # 双方命中片段与默认上下文，供三栏对照直接渲染
+        "sides": evidence_context.build_sides(db, evidence),
         "participants": [
             {
                 "company_id": p.company_id,
@@ -393,6 +520,22 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
         "algorithm_version": evidence.algorithm_version,
         "created_at": evidence.created_at,
     }
+
+
+def evidence_context_payload(
+    db: Session,
+    evidence: ComparisonEvidence,
+    side: str,
+    before: int,
+    after: int,
+) -> dict:
+    """按需读取某一侧的扩展上下文。"""
+    try:
+        return evidence_context.build_side_context(
+            db, evidence, side, before=before, after=after
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc))
 
 
 def apply_review(

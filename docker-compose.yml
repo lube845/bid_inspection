@@ -47,6 +47,14 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8888}
       RUN_BOOTSTRAP: "1"
+      # OCR 识别（扫描件）部署级默认值，系统管理里的「OCR 识别」规则可覆盖
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_PROVIDER: ${OCR_PROVIDER:-baidu}
+      BAIDU_API_KEY: ${BAIDU_API_KEY:-}
+      BAIDU_SECRET_KEY: ${BAIDU_SECRET_KEY:-}
+      BAIDU_LANGUAGE_TYPE: ${BAIDU_LANGUAGE_TYPE:-CHN_ENG}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-60}
+      OCR_MAX_FILE_MB: ${OCR_MAX_FILE_MB:-6}
     volumes:
       - storage:/data/storage
     ports:
@@ -81,6 +89,14 @@ services:
       SYNC_TASKS: "false"
       SEED_DEMO: "false"
       RUN_BOOTSTRAP: "0"
+      # OCR 识别（扫描件）部署级默认值，系统管理里的「OCR 识别」规则可覆盖
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_PROVIDER: ${OCR_PROVIDER:-baidu}
+      BAIDU_API_KEY: ${BAIDU_API_KEY:-}
+      BAIDU_SECRET_KEY: ${BAIDU_SECRET_KEY:-}
+      BAIDU_LANGUAGE_TYPE: ${BAIDU_LANGUAGE_TYPE:-CHN_ENG}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-60}
+      OCR_MAX_FILE_MB: ${OCR_MAX_FILE_MB:-6}
     volumes:
       - storage:/data/storage
     depends_on:

@@ -15,7 +15,9 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
-from app.api.deps import get_stream_user
+from app.api.deps import get_current_user, get_stream_user
+from app.core.config import settings
+from app.core.security import create_scoped_ticket
 from app.db.session import SessionLocal
 from app.models import (
     AnalysisTask,
@@ -132,6 +134,19 @@ def _build_snapshot(project_id: str) -> dict:
         }
     finally:
         db.close()
+
+
+@router.post("/projects/{project_id}/events/ticket")
+def project_events_ticket(
+    project_id: str,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """签发限定到该项目的短期事件流票据（EventSource 无法设置请求头）。"""
+    ttl = settings.scoped_ticket_expire_seconds
+    return {
+        "ticket": create_scoped_ticket(user.id, "events", project_id, ttl),
+        "expires_in": ttl,
+    }
 
 
 @router.get("/projects/{project_id}/events")

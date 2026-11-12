@@ -15,8 +15,11 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 def _authenticate(db: Session, username: str, password: str) -> User:
     user = db.scalars(select(User).where(User.username == username)).first()
-    if not user or not user.is_active or not verify_password(password, user.password_hash):
+    # 先校验密码，再暴露「已停用」状态，避免通过错误密码探测账号是否存在
+    if not user or not verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="账号已停用，请联系管理员")
     return user
 
 

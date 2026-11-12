@@ -9,6 +9,16 @@ class ProjectStatus(str, Enum):
     ARCHIVED = "archived"  # 已归档
 
 
+# 项目状态文案的唯一来源：服务端下发，前端不再维护第二套字典
+PROJECT_STATUS_LABELS = {
+    ProjectStatus.PENDING.value: "准备中",
+    ProjectStatus.READY.value: "待分析",
+    ProjectStatus.ANALYZING.value: "分析中",
+    ProjectStatus.ANALYZED.value: "分析完成",
+    ProjectStatus.ARCHIVED.value: "已归档",
+}
+
+
 class FileKind(str, Enum):
     TENDER = "tender"  # 招标文件
     BID = "bid"  # 投标企业文件

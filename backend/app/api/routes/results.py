@@ -44,6 +44,41 @@ def pair_detail(
     return results_service.pair_detail(db, pair)
 
 
+@router.get("/pairs/{pair_id}/evidences")
+def pair_evidences(
+    pair_id: str,
+    evidence_type: str | None = None,
+    review_status: str | None = None,
+    severity: str | None = None,
+    tender: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    before: int = Query(default=100, ge=0, le=2000),
+    after: int = Query(default=100, ge=0, le=2000),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """按需返回证据及默认上下文。
+
+    比对分析页首屏只拉取这一份数据，左右两列不再默认加载完整原文。
+    """
+    pair = db.get(ComparisonPair, pair_id)
+    if not pair:
+        raise HTTPException(404, "企业组合不存在")
+    return results_service.pair_evidences(
+        db,
+        pair,
+        evidence_type=evidence_type,
+        review_status=review_status,
+        severity=severity,
+        tender=tender,
+        page=page,
+        page_size=page_size,
+        before=before,
+        after=after,
+    )
+
+
 @router.get("/evidences/{evidence_id}")
 def evidence_detail(
     evidence_id: str,
@@ -54,6 +89,25 @@ def evidence_detail(
     if not evidence:
         raise HTTPException(404, "证据不存在")
     return results_service.evidence_detail(db, evidence)
+
+
+@router.get("/evidences/{evidence_id}/context")
+def evidence_context(
+    evidence_id: str,
+    side: str = Query(default="a", pattern="^[ab]$"),
+    before: int = Query(default=100, ge=0, le=2000),
+    after: int = Query(default=100, ge=0, le=2000),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """按需读取证据某一侧的扩展上下文。"""
+    evidence = db.get(ComparisonEvidence, evidence_id)
+    if not evidence:
+        raise HTTPException(404, "证据不存在")
+    try:
+        return results_service.evidence_context_payload(db, evidence, side, before, after)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @router.post("/evidences/{evidence_id}/review")

@@ -27,6 +27,7 @@ from app.models import (
     Project,
 )
 from app.models.enums import (
+    PROJECT_STATUS_LABELS,
     EvidenceType,
     FileKind,
     FileParseStatus,
@@ -99,6 +100,16 @@ def summary(
     pending_by_project = dict(
         db.execute(
             select(ComparisonEvidence.project_id, func.count())
+            .where(current_filter, ComparisonEvidence.review_status == ReviewStatus.PENDING.value)
+            .group_by(ComparisonEvidence.project_id)
+        ).all()
+    )
+    pending_at_by_project = dict(
+        db.execute(
+            select(
+                ComparisonEvidence.project_id,
+                func.max(ComparisonEvidence.created_at),
+            )
             .where(current_filter, ComparisonEvidence.review_status == ReviewStatus.PENDING.value)
             .group_by(ComparisonEvidence.project_id)
         ).all()
@@ -195,6 +206,7 @@ def summary(
             "unconfirmed_companies": unconfirmed_by_project.get(project.id, []),
             "last_task": last_task,
             "pending_review_count": pending_by_project.get(project.id, 0),
+            "pending_review_at": pending_at_by_project.get(project.id),
             "exported": project.id in exported_projects,
         }
         todos.extend(project_service.collect_todos(db, project, ctx=ctx))
@@ -364,13 +376,8 @@ def _rule_version_label(rule_versions: dict) -> str:
 
 
 def _project_status_label(status: str) -> str:
-    return {
-        ProjectStatus.PENDING.value: "准备中",
-        ProjectStatus.READY.value: "准备中",
-        ProjectStatus.ANALYZING.value: "分析中",
-        ProjectStatus.ANALYZED.value: "分析完成",
-        ProjectStatus.ARCHIVED.value: "已归档",
-    }.get(status, status)
+    """状态文案统一走 enums.PROJECT_STATUS_LABELS，避免前后端各维护一套。"""
+    return PROJECT_STATUS_LABELS.get(status, status)
 
 
 def _as_timestamp(value: datetime | None) -> float | None:

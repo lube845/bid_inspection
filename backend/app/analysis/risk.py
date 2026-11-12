@@ -44,13 +44,16 @@ def text_risk(
     high_similarity = _rule(thresholds, "risk_text_high_similarity")
     medium_count = _rule(thresholds, "risk_text_medium_count")
     medium_similarity = _rule(thresholds, "risk_text_medium_similarity")
-    if evidence_count >= high_count or max_similarity >= high_similarity:
+    # 规则页文案是「条数与相似度同时满足」，这里保持同一口径：
+    # 只有证据条数达标且最高相似度也达到阈值时才升级，避免条数够但相似度很低
+    # 的证据被误判为中/高风险。
+    if evidence_count >= high_count and max_similarity >= high_similarity:
         value = RiskLevel.HIGH.value
         reasons.append(
             f"文本相似证据 {evidence_count} 条（阈值 {high_count} 条），"
             f"最高相似度 {max_similarity:.0%}（阈值 {high_similarity:.0%}）"
         )
-    elif evidence_count >= medium_count or max_similarity >= medium_similarity:
+    elif evidence_count >= medium_count and max_similarity >= medium_similarity:
         value = RiskLevel.MEDIUM.value
         reasons.append(
             f"文本相似证据 {evidence_count} 条（阈值 {medium_count} 条），"

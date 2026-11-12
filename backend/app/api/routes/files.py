@@ -3,7 +3,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_current_user_allow_query
+from app.api.deps import get_current_user, get_file_access_user
+from app.core.security import create_scoped_ticket
 from app.api.serializers import file_payload, page_payload
 from app.core.config import settings
 from app.db.session import get_db
@@ -252,11 +253,59 @@ def get_page(
     }
 
 
+@router.get("/files/{file_id}/original")
+def file_original(
+    file_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """返回原始文件的访问地址（按需打开完整原文时使用）。
+
+    只返回地址与定位信息，不在比对结果页初始化时加载文件内容。
+    """
+    file = _get_file(db, file_id)
+    pages = sorted(file.pages, key=lambda p: p.page_index)
+    return {
+        "file_id": file.id,
+        "file_name": file.file_name,
+        "file_type": file.file_type,
+        "file_version": file.version,
+        "page_count": file.page_count,
+        "size": file.file_size,
+        # 原文地址本身不接受长期登录 JWT；调用方先请求 ticket 再拼接到该地址
+        "url": f"/files/{file.id}/content",
+        "ticket_endpoint": f"/files/{file.id}/ticket",
+        "pages": [
+            {
+                "page_index": page.page_index,
+                "printed_page_number": page.printed_page_number,
+                "parse_status": page.parse_status,
+            }
+            for page in pages
+        ],
+    }
+
+
+@router.post("/files/{file_id}/ticket")
+def file_ticket(
+    file_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """签发限定到该文件的短期访问票据，供 <a>/<iframe> 直接打开原文。"""
+    _get_file(db, file_id)
+    ttl = settings.scoped_ticket_expire_seconds
+    return {
+        "ticket": create_scoped_ticket(user.id, "file", file_id, ttl),
+        "expires_in": ttl,
+    }
+
+
 @router.get("/files/{file_id}/content")
 def file_content(
     file_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user_allow_query),
+    user: User = Depends(get_file_access_user),
 ) -> FileResponse:
     file = _get_file(db, file_id)
     try:
@@ -274,7 +323,7 @@ def file_content(
 def download_file(
     file_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user_allow_query),
+    user: User = Depends(get_file_access_user),
 ) -> FileResponse:
     file = _get_file(db, file_id)
     try:

@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.models import DetectionRuleVersion, User
 from app.models.base import utcnow
 from app.models.enums import RuleStatus
+from app.services.ocr import BAIDU_LANGUAGE_TYPES, MAX_RAW_FILE_MB
 
 
 class RuleError(Exception):
@@ -69,16 +70,36 @@ PRICE_PARAMS = {
     "tail_concentration_min_count": 3,
 }
 
+# OCR 识别属于解析期设置，不参与比对判定，但同样走规则版本管理：
+# 开关、调用方式与凭据都有版本记录，改动可追溯。
+OCR_PARAMS = {
+    # 是否启用 OCR：只影响没有原生文本层的扫描页
+    "ocr_enabled": False,
+    # 调用方式，V1 只提供百度 OCR
+    "ocr_provider": "baidu",
+    # 百度智能云 OCR 凭据（API Key / Secret Key），对外展示时脱敏
+    "baidu_api_key": "",
+    "baidu_secret_key": "",
+    "baidu_language_type": "CHN_ENG",
+    "baidu_detect_direction": True,
+    "baidu_probability": False,
+    "ocr_timeout_seconds": 60,
+    # 单次 OCR 上传的原始文件大小上限（MB），超过时 PDF 自动拆分成多个文件
+    "ocr_max_file_mb": 6,
+}
+
 DIMENSION_PARAMS: dict[str, dict] = {
     "text": TEXT_PARAMS,
     "personnel": PERSONNEL_PARAMS,
     "price": PRICE_PARAMS,
+    "ocr": OCR_PARAMS,
 }
 
 DIMENSION_LABELS = {
     "text": "文本相似",
     "personnel": "人员重复",
     "price": "价格异常",
+    "ocr": "OCR 识别",
 }
 
 # 这些参数在 V1.0 只存储与展示，尚未接入检测引擎。
@@ -86,6 +107,14 @@ NOT_ENFORCED_PARAMS = {
     "personnel": {"key_positions"},
     "price": {"amount_case_consistency"},
 }
+
+# 敏感参数：对外只返回脱敏占位符，只有管理员能读写真实值
+SENSITIVE_PARAMS = {"baidu_api_key", "baidu_secret_key"}
+SECRET_MASK = "********"
+
+# OCR 属于解析期设置：不进入分析任务的规则快照，
+# 既避免把解析参数混进分析配置，也避免密钥被写进任务记录。
+SNAPSHOT_EXCLUDED_DIMENSIONS = {"ocr"}
 
 
 def default_params(dimension: str) -> dict:
@@ -117,6 +146,18 @@ def default_params(dimension: str) -> dict:
             "price_sequence_tolerance": settings.price_sequence_tolerance,
             "special_tail": ["888", "999", "998"],
             "tail_concentration_min_count": 3,
+        }
+    if dimension == "ocr":
+        return {
+            "ocr_enabled": settings.ocr_enabled,
+            "ocr_provider": settings.ocr_provider,
+            "baidu_api_key": settings.baidu_api_key,
+            "baidu_secret_key": settings.baidu_secret_key,
+            "baidu_language_type": settings.baidu_language_type,
+            "baidu_detect_direction": settings.baidu_detect_direction,
+            "baidu_probability": settings.baidu_probability,
+            "ocr_timeout_seconds": settings.ocr_timeout_seconds,
+            "ocr_max_file_mb": settings.ocr_max_file_mb,
         }
     return dict(PERSONNEL_PARAMS)
 
@@ -249,6 +290,47 @@ def _validate_text_params(params: dict) -> None:
         raise RuleError("文本块长度需满足 目标下限 ≤ 目标上限 ≤ 最大长度")
 
 
+def _normalize_ocr_params(params: dict) -> None:
+    """把 OCR 参数收敛到接口允许的范围内。
+
+    百度接口对 base64 + urlencode 后的请求体限制 8MB，换算成原始文件约 6MB；
+    超出的一律按 6MB 处理，解析时才不会因为体积被拒。
+    """
+    try:
+        max_mb = int(params.get("ocr_max_file_mb") or MAX_RAW_FILE_MB)
+    except (TypeError, ValueError):
+        max_mb = MAX_RAW_FILE_MB
+    params["ocr_max_file_mb"] = max(1, min(max_mb, MAX_RAW_FILE_MB))
+
+
+def _validate_ocr_params(params: dict) -> None:
+    """OCR 参数校验，避免管理员误填导致解析阶段整批失败。"""
+    provider = str(params.get("ocr_provider") or "").strip().lower()
+    if provider not in {"baidu"}:
+        raise RuleError("OCR 调用方式必须是 baidu")
+    language = str(params.get("baidu_language_type") or "CHN_ENG").strip().upper()
+    if language not in BAIDU_LANGUAGE_TYPES:
+        raise RuleError(
+            "OCR 识别语言必须是 " + "、".join(BAIDU_LANGUAGE_TYPES) + " 之一"
+        )
+    try:
+        timeout = int(params.get("ocr_timeout_seconds") or 60)
+        max_mb = int(params.get("ocr_max_file_mb") or 8)
+    except (TypeError, ValueError) as exc:
+        raise RuleError("OCR 超时时间与文件体积上限必须是数值") from exc
+    if not 5 <= timeout <= 600:
+        raise RuleError("OCR 超时时间必须在 5～600 秒之间")
+    if not 1 <= max_mb <= MAX_RAW_FILE_MB:
+        raise RuleError(
+            f"OCR 单次文件大小上限必须在 1～{MAX_RAW_FILE_MB}MB 之间"
+        )
+    if params.get("ocr_enabled") and provider == "baidu":
+        if not str(params.get("baidu_api_key") or "").strip():
+            raise RuleError("启用 OCR 前必须填写百度 API Key")
+        if not str(params.get("baidu_secret_key") or "").strip():
+            raise RuleError("启用 OCR 前必须填写百度 Secret Key")
+
+
 def create_version(
     db: Session,
     dimension: str,
@@ -267,8 +349,20 @@ def create_version(
 
     current = active_version(db, dimension)
     merged = {**default_params(dimension), **params}
+    # 前端回传的是脱敏占位符时，保留当前生效版本里的真实值
+    for key in SENSITIVE_PARAMS:
+        if str(merged.get(key) or "").strip() == SECRET_MASK:
+            fallback = (current.params or {}).get(key) if current else None
+            merged[key] = (
+                fallback
+                if fallback is not None
+                else default_params(dimension).get(key, "")
+            )
     if dimension == "text":
         _validate_text_params(merged)
+    if dimension == "ocr":
+        _normalize_ocr_params(merged)
+        _validate_ocr_params(merged)
     record = DetectionRuleVersion(
         dimension=dimension,
         version_no=_next_version_no(db, dimension),
@@ -316,6 +410,8 @@ def active_snapshot(db: Session) -> dict[str, dict]:
     """当前生效的各维度规则版本快照。"""
     snapshot: dict[str, dict] = {}
     for dimension in DIMENSION_PARAMS:
+        if dimension in SNAPSHOT_EXCLUDED_DIMENSIONS:
+            continue
         record = active_version(db, dimension)
         if not record:
             continue
@@ -327,6 +423,15 @@ def active_snapshot(db: Session) -> dict[str, dict]:
             "params": dict(record.params or {}),
         }
     return snapshot
+
+
+def active_ocr_config(db: Session) -> dict:
+    """当前生效的 OCR 配置（含真实凭据，仅供解析流程内部使用）。"""
+    record = active_version(db, "ocr")
+    config = default_params("ocr")
+    if record:
+        config.update(record.params or {})
+    return config
 
 
 def resolve_thresholds(snapshot: dict[str, dict]) -> dict:
@@ -367,12 +472,31 @@ def resolve_thresholds(snapshot: dict[str, dict]) -> dict:
     return thresholds
 
 
-def version_payload(record: DetectionRuleVersion) -> dict:
-    """规则版本的对外结构。"""
+def _mask_params(params: dict) -> dict:
+    """敏感参数脱敏：只提示「已配置」，不泄露真实值。"""
+    masked = {}
+    for key, value in (params or {}).items():
+        if key in SENSITIVE_PARAMS and str(value or "").strip():
+            masked[key] = SECRET_MASK
+        else:
+            masked[key] = value
+    return masked
+
+
+def version_payload(record: DetectionRuleVersion, include_secrets: bool = False) -> dict:
+    """规则版本的对外结构。
+
+    ``include_secrets=False`` 时敏感参数会被脱敏，只有管理员编辑规则时才会
+    拿到真实值（前端用占位符回传，服务端识别占位符后保留原值）。
+    """
     dimension = record.dimension
+    params = dict(record.params or {})
+    previous = dict(record.previous_params or {})
+    if not include_secrets:
+        params = _mask_params(params)
+        previous = _mask_params(previous)
     changed = []
-    previous = record.previous_params or {}
-    for key, value in (record.params or {}).items():
+    for key, value in params.items():
         if previous.get(key) != value:
             changed.append({"key": key, "before": previous.get(key), "after": value})
     return {
@@ -387,12 +511,15 @@ def version_payload(record: DetectionRuleVersion) -> dict:
             RuleStatus.ACTIVE.value: "已生效",
             RuleStatus.ARCHIVED.value: "历史版本",
         }.get(record.status, record.status),
-        "params": record.params or {},
-        "previous_params": record.previous_params or {},
+        "params": params,
+        "previous_params": previous,
         "changed": changed,
         "change_reason": record.change_reason,
         "created_by_name": record.created_by_name,
         "created_at": record.created_at,
         "activated_at": record.activated_at,
         "not_enforced_params": sorted(NOT_ENFORCED_PARAMS.get(dimension, set())),
+        "has_secrets": any(
+            str((record.params or {}).get(key) or "").strip() for key in SENSITIVE_PARAMS
+        ),
     }

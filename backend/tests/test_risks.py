@@ -208,6 +208,27 @@ def test_batch_review_marks_undecided(db):
     assert records[0].comment == "需要进一步核查"
 
 
+def test_batch_review_can_skip_existing_conclusions(db):
+    """批量标记默认可跳过已有人工结论，避免覆盖审核结果。"""
+    project, task, companies = _world(db)
+    evidence = _evidence(db, project, task, EvidenceType.TEXT.value)
+    evidence.review_status = ReviewStatus.CONFIRMED.value
+    db.commit()
+    reviewer = User(username="reviewer2", password_hash=hash_password("x"), display_name="审核人", role="reviewer")
+    db.add(reviewer)
+    db.commit()
+
+    result = risk_service.batch_review(
+        db, [evidence.id], "undecided", None, reviewer, skip_reviewed=True
+    )
+    db.commit()
+
+    assert result["updated"] == 0
+    assert result["skipped_reviewed"] == [evidence.id]
+    db.refresh(evidence)
+    assert evidence.review_status == ReviewStatus.CONFIRMED.value
+
+
 def test_risk_detail_includes_code_and_files(db):
     project, task, companies = _world(db)
     evidence = _evidence(db, project, task, EvidenceType.TEXT.value, participants=companies[:2])

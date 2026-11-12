@@ -175,7 +175,8 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 
 ### 5.3 系统管理（PRD §4.13）
 
-- **检测规则版本**：按文本相似 / 人员重复 / 价格异常三个维度管理。每次修改**新建一个版本**（旧版本转 `archived` 保留），记录修改前/后内容、修改人、修改时间与修改原因；生效需要管理员权限 + 生效确认。
+- **检测规则版本**：按文本相似 / 人员重复 / 价格异常 / OCR 识别四个维度管理。左侧切换维度，右侧按板块分组展示参数（每个参数附一句口径说明）与版本历史。每次修改**新建一个版本**（旧版本转 `archived` 保留），记录修改前/后内容、修改人、修改时间与修改原因；生效需要管理员权限 + 生效确认。
+- **OCR 识别**：页面顶部提供「启用 OCR 识别」开关（改动直接生成并生效一个新版本），并展示调用方式（百度智能云 OCR）、接口文档链接、凭据配置状态、单次上传体积上限与「测试连接」按钮（校验能否换取 access_token）。API Key / Secret Key 属于敏感配置，列表页只显示「已配置 / 未配置」，编辑时留空表示不修改，真实值不返回浏览器。超过单次体积上限的 PDF 会在解析时自动拆分成多个文件逐份上传。
 - **操作日志**：记录登录退出、项目增删改归档、文件上传下载替换删除、启动分析、重试任务、修改检测规则、审核证据、导出报告。操作结果 / 操作来源 / 变更前后信息写在 `audit_log.payload` JSON 中（不改表结构）。
 - **用户管理**：新增 / 编辑 / 禁用 / 重置密码 / 分配角色。系统至少保留一个启用的管理员账号，管理员不能禁用自己。
 
@@ -192,6 +193,8 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 
 运行期分析函数从任务快照读取阈值（`analysis/thresholds.py`），因此**规则被修改后，历史任务重跑仍使用启动时的那一版规则**。部署配置（`core/config.py`）只在首次初始化时作为出厂版本 v1 的种子。
 
+「OCR 识别」维度属于**解析期设置**，不进入分析任务快照（避免把解析参数与密钥写进任务配置）：文件解析时读取当前生效的 OCR 版本，决定是否启用 OCR 与调用方式。
+
 ### 5.5 项目内子页面
 
 进入项目后有 7 个子页面（Tab）：
@@ -206,12 +209,20 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 | 比对结果 | 全部企业组合的统计概览：各维度证据数、风险等级分布、企业组合矩阵 |
 | 分析报告 | 导出整体统计报告（Excel 四表） |
 
-### 比对分析（三栏对比）
+### 比对分析（三栏证据对比）
+
+页面从「双文档全文对照」调整为「双侧证据对照」：左列与中列只展示命中片段及其前后必要上下文，完整原文按需打开。
 
 - **企业选择器**：任选两家企业切换组合，默认定位综合风险最高的组合。
+- **左列 / 中列（证据片段）**：每条证据一张卡片，展示命中片段、前后上下文和来源信息（投标人、文件、物理页码、章节）。
+  - 绿色标记算法确认的相似文字，橙色标记双方不一致的文字，颜色只用于辅助阅读，不代表风险等级；
+  - 「展开更多前文 / 展开更多后文」只按需拉取当前证据所需的文本范围，不重新加载整份文档；
+  - 「查看完整原文」打开原文查看器，自动定位到证据所在页并高亮命中区间；
+  - 两侧证据顺序一致，滚动一侧时另一侧跟随。
 - **右侧证据列**：通过颜色和标识区分两类信息——
   - 左侧色条表示人工审核状态（待审核 / 确认异常线索 / 正常排除 / 暂不判断）；
   - 「命中招标说明 · 公共内容已排除」标签表示该段雷同内容命中招标文件公共内容（已从有效结论中排除，但保留原始识别记录）。
+- **右侧分析区**：相似指标、命中区间数、差异说明、来源定位与章节定位，以及人工审核操作。
 - **筛选**：可按审核状态、风险等级、是否命中招标说明筛选，筛选只影响清单展示，不改变原始识别结果。
 - **单独导出**：导出当前企业组合的证据 Excel（沿用四表结构，只含该组合的数据）。
 - **人工审核**：审核动作直接在三栏右侧完成，不再单设「人工审核」页面；审核状态在证据清单、比对结果统计和 Excel 报告中统一体现。
@@ -244,11 +255,13 @@ Bid_Inspection/
 │   │   ├── schemas/                # 请求/响应 DTO
 │   │   ├── api/routes/             # auth / projects / companies / files / analysis / results / events / workbench / risks / system
 │   │   ├── services/               # 业务编排（文件、逻辑标书、分析、结果、报告、规则、工作台、风险、系统）
+│   │   ├── services/evidence_context.py # 证据命中片段、上下文读取与相似/差异标记
 │   │   ├── analysis/               # 文本相似、人员、价格、风险规则 + 阈值读取（thresholds.py）
 │   │   ├── workers/                # Celery app、任务、同步/异步分发
 │   │   ├── storage/                # 存储抽象 + 本地实现（可换 MinIO）
 │   │   ├── utils/text.py           # 规范化 + 原文偏移映射
 │   │   └── services/parser.py      # PDF/DOCX/TXT 解析适配
+│   │   └── services/ocr.py         # OCR 提供方（V1：百度智能云 OCR）
 │   └── tests/
 └── frontend/
     ├── index.html                  # 管理台单页（hash 路由）
@@ -354,12 +367,12 @@ detection_rule_version      # 检测规则版本：按维度存参数快照，�
 | 认证 | `POST /auth/login`、`POST /auth/logout`、`GET /auth/me` |
 | 工作台 | `GET /workbench` |
 | 风险 | `GET /risks`、`GET /risks/filters`、`GET /risks/{id}`、`POST /risks/batch-review` |
-| 系统 | `GET /system/rules`、`POST /system/rules/versions`、`POST /system/rules/versions/{id}/activate`、`GET /system/logs`、`GET /system/log-options`、`GET/POST /system/users`、`PATCH /system/users/{id}`、`POST /system/users/{id}/password` |
+| 系统 | `GET /system/rules`、`POST /system/rules/versions`、`POST /system/rules/versions/{id}/activate`、`POST /system/ocr/test`（校验百度 OCR 凭据）、`GET /system/logs`、`GET /system/log-options`、`GET/POST /system/users`、`PATCH /system/users/{id}`、`POST /system/users/{id}/password` |
 | 项目 | `GET/POST /projects`、`GET/PATCH/DELETE /projects/{id}`、`POST /projects/{id}/archive`、`GET /projects/{id}/dashboard` |
 | 企业 | `GET/POST /projects/{id}/companies`、`GET/PATCH/DELETE /companies/{id}`、`POST /companies/{id}/confirm`、`PUT /companies/{id}/file-order`、`GET /companies/{id}/logical-document` |
-| 文件 | `POST /projects/{id}/tender-files`、`POST /companies/{id}/files`、`GET /projects/{id}/files`、`GET/DELETE /files/{id}`、`POST /files/{id}/replace`、`POST /files/{id}/parse`、`POST /projects/{id}/parse`、`GET /projects/{id}/parse-center`、`GET /files/{id}/pages/{page}`、`GET /files/{id}/content` |
+| 文件 | `POST /projects/{id}/tender-files`、`POST /companies/{id}/files`、`GET /projects/{id}/files`、`GET/DELETE /files/{id}`、`POST /files/{id}/replace`、`POST /files/{id}/parse`、`POST /projects/{id}/parse`、`GET /projects/{id}/parse-center`、`GET /files/{id}/pages/{page}`、`GET /files/{id}/original`、`GET /files/{id}/content` |
 | 分析 | `GET /projects/{id}/analysis/prepare`、`POST /projects/{id}/analysis/tasks`、`GET /projects/{id}/tasks`、`GET /tasks/{id}`、`POST /tasks/{id}/cancel`、`POST /tasks/{id}/pairs/{pairId}/retry` |
-| 结果 | `GET /projects/{id}/results/overview`、`GET /pairs/{id}`、`GET /evidences/{id}` |
+| 结果 | `GET /projects/{id}/results/overview`、`GET /pairs/{id}`、`GET /pairs/{id}/evidences`（证据 + 默认上下文，分页）、`GET /evidences/{id}`、`GET /evidences/{id}/context`（按需扩展上下文） |
 | 审核 | `POST /evidences/{id}/review`、`GET /projects/{id}/reviews` |
 | 报告 | `GET /projects/{id}/reports/excel`、`GET /pairs/{id}/reports/excel`（单组合证据导出） |
 
@@ -406,7 +419,27 @@ PDF 预览接口支持 `?token=` 查询参数（浏览器 iframe 无法设置 Au
 
 ### 9.5 OCR
 
-`services/ocr.py` 定义 `OCRProvider` 接口，默认 `NoopOCRProvider`：扫描页会被标记为空白/需 OCR，文件状态为部分成功，不伪造识别文本。接入 PaddleOCR/Tesseract 时替换 `get_ocr_provider()` 即可。
+`services/ocr.py` 定义 `OCRProvider` 接口，V1 接入**百度智能云 OCR**（通用文字识别 · 标准含位置版）：
+
+- **识别接口**：`POST https://aip.baidubce.com/rest/2.0/ocr/v1/general`（`application/x-www-form-urlencoded`）
+- **鉴权接口**：`GET https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=<API Key>&client_secret=<Secret Key>`，token 按有效期缓存
+- **接口文档**：<https://cloud.baidu.com/doc/OCR/s/vk3h7y58v>
+
+调用方式：
+
+- 扫描版 PDF 用 `pdf_file`（base64）+ `pdf_file_num` 指定页码，与解析器「按页取文本」的接口一一对应；
+- 图片文件用 `image`（base64）；
+- 识别失败只记日志并把该页标记为未识别，不伪造识别文本。
+
+**单次体积上限与自动拆分**：百度接口限制的是 base64 + urlencode 之后的请求体（8MB），换算成原始文件约 6MB。系统管理里的「单次 OCR 文件大小上限（MB）」就是按原始文件计的上限（1～6MB，默认 6）。识别时的处理顺序：
+
+1. 把需要识别的页（只有没有文本层的扫描页）用 pypdf 拆成**单页 PDF 文件**，每个文件都在上限内；
+2. 逐份上传，用 `pdf_file_num` 指定该文件里的页码（拆分后固定为 1）；
+3. 单页仍超限（扫描图特别大）→ 取出该页内嵌的扫描图片，用 Pillow 先降质量、再等比缩小压到上限内，以 `image` 逐张上传，识别文本按顺序拼接。
+
+按页拆分而不是整份上传，是因为接口一次只识别一页：整份上传会让 N 页传输 N 份完整文件，拆开后总传输量约等于原文件大小。原生文本页不参与拆分，因此不会浪费额度。
+
+开关与凭据在**系统管理 → 检测规则 → OCR 识别**里配置（走规则版本管理，改动有版本记录）；未启用时扫描页标记为空白/需 OCR，文件状态为部分成功。接入其他服务只需再实现一个 `OCRProvider` 子类并在 `build_ocr_provider()` 里注册。
 
 ### 9.6 存储
 

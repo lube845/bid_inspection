@@ -5,18 +5,21 @@ V1 先支持可稳定提取文本的格式：
 - DOCX：python-docx 提取段落
 - TXT / MD：按文本读取
 
-扫描件 OCR 通过 OCRProvider 接口预留，真实模型接入后替换
-`app.services.ocr.get_ocr_provider()` 即可，不影响解析流程。
+扫描件 OCR 通过 OCRProvider 接口接入（V1 为百度智能云 OCR），由调用方
+（文件解析服务）按当前生效的「OCR 识别」规则构造识别器传入。
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.models.enums import ExtractionMethod, PageStatus
-from app.services.ocr import get_ocr_provider
+from app.services.ocr import NoopOCRProvider, OCRProvider
+
+_logger = logging.getLogger(__name__)
 
 
 class ParseError(Exception):
@@ -51,10 +54,12 @@ class ParsedDocument:
     note: str | None = None
 
 
-def parse_document(path: Path, file_type: str) -> ParsedDocument:
+def parse_document(
+    path: Path, file_type: str, ocr_provider: OCRProvider | None = None
+) -> ParsedDocument:
     file_type = file_type.lower().lstrip(".")
     if file_type == "pdf":
-        return _parse_pdf(path)
+        return _parse_pdf(path, ocr_provider)
     if file_type == "docx":
         return _parse_docx(path)
     if file_type in {"txt", "md"}:
@@ -114,7 +119,7 @@ def _make_block(text: str, start: int, end: int) -> ParsedBlock:
     )
 
 
-def _parse_pdf(path: Path) -> ParsedDocument:
+def _parse_pdf(path: Path, ocr_provider: OCRProvider | None = None) -> ParsedDocument:
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover - dependency is pinned
@@ -126,7 +131,10 @@ def _parse_pdf(path: Path) -> ParsedDocument:
         raise ParseError(f"PDF 无法打开: {exc}") from exc
 
     pages: list[ParsedPage] = []
-    ocr = get_ocr_provider()
+    ocr = ocr_provider or NoopOCRProvider()
+    # 没有文本层的页先记下来，最后一次性交给 OCR：识别器可以据此把大文件拆成
+    # 符合单次体积上限的多个文件逐份上传，避免整份大 PDF 被接口拒绝。
+    pending: list[tuple[int, float | None, float | None]] = []
     for index, pdf_page in enumerate(reader.pages, start=1):
         try:
             text = pdf_page.extract_text() or ""
@@ -150,31 +158,7 @@ def _parse_pdf(path: Path) -> ParsedDocument:
             pass
 
         if not text.strip():
-            ocr_text = ocr.extract_text(path, index)
-            if ocr_text:
-                pages.append(
-                    ParsedPage(
-                        page_index=index,
-                        page_text=ocr_text,
-                        extraction_method=ExtractionMethod.OCR.value,
-                        width=width,
-                        height=height,
-                        note="OCR 识别",
-                        blocks=_split_blocks(ocr_text),
-                    )
-                )
-            else:
-                pages.append(
-                    ParsedPage(
-                        page_index=index,
-                        page_text="",
-                        extraction_method=ExtractionMethod.NONE.value,
-                        parse_status=PageStatus.EMPTY.value,
-                        width=width,
-                        height=height,
-                        note="空白页或扫描页，OCR 未启用/未识别",
-                    )
-                )
+            pending.append((index, width, height))
             continue
 
         pages.append(
@@ -188,8 +172,43 @@ def _parse_pdf(path: Path) -> ParsedDocument:
             )
         )
 
+    if pending:
+        recognized: dict[int, str | None] = {}
+        try:
+            recognized = ocr.extract_pages(path, [item[0] for item in pending])
+        except Exception as exc:  # OCR 整体失败不阻断文件解析
+            recognized = {}
+            _logger.warning("OCR 识别失败：%s", exc)
+        for index, width, height in pending:
+            ocr_text = (recognized.get(index) or "").strip()
+            if ocr_text:
+                pages.append(
+                    ParsedPage(
+                        page_index=index,
+                        page_text=ocr_text,
+                        extraction_method=ExtractionMethod.OCR.value,
+                        width=width,
+                        height=height,
+                        note=f"{ocr.describe()} · 识别文本",
+                        blocks=_split_blocks(ocr_text),
+                    )
+                )
+            else:
+                pages.append(
+                    ParsedPage(
+                        page_index=index,
+                        page_text="",
+                        extraction_method=ExtractionMethod.NONE.value,
+                        parse_status=PageStatus.EMPTY.value,
+                        width=width,
+                        height=height,
+                        note=f"空白页或扫描页，{ocr.describe()}未识别到文本",
+                    )
+                )
+
     if not pages:
         raise ParseError("PDF 中没有可解析页面")
+    pages.sort(key=lambda page: page.page_index)
     return ParsedDocument(pages=pages)
 
 

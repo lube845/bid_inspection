@@ -61,7 +61,12 @@ def batch_review(
     """批量标记审核状态（V1.0 只允许标记为待进一步核查）。"""
     try:
         result = risk_service.batch_review(
-            db, payload.evidence_ids, payload.status, payload.comment, user
+            db,
+            payload.evidence_ids,
+            payload.status,
+            payload.comment,
+            user,
+            skip_reviewed=payload.skip_reviewed,
         )
     except risk_service.RiskValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

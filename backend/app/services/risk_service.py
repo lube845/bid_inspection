@@ -48,11 +48,27 @@ class RiskValidationError(Exception):
     """风险管理的业务校验错误。"""
 
 
+def _project_code_head(project: Project | None) -> str:
+    """证据编号的项目段。
+
+    优先使用项目编号；没有编号时用「项目名简写 + 创建日期」生成可读标识，
+    避免把内部占位符 NO-CODE 暴露给审核人员。
+    """
+    if project is None:
+        return "NO-CODE"
+    code = (project.project_code or "").strip()
+    if code:
+        return code
+    name = "".join((project.project_name or "").split())[:8] or "项目"
+    created = project.created_at.strftime("%Y%m%d") if project.created_at else ""
+    return f"{name}{created}" if created else name
+
+
 def evidence_code(
-    project_code: str | None, task_no: int, evidence_type: str, seq: int
+    project: Project | None, task_no: int, evidence_type: str, seq: int
 ) -> str:
     """PRD 5.7：项目编号-任务编号-证据类型-序号，例 DEMO-2026-001-T03-TEXT-0001。"""
-    head = (project_code or "NO-CODE").strip() or "NO-CODE"
+    head = _project_code_head(project)
     type_code = TYPE_CODES.get(evidence_type, str(evidence_type).upper())
     return f"{head}-T{int(task_no):02d}-{type_code}-{seq:04d}"
 
@@ -174,7 +190,7 @@ def _enrich(db: Session, rows: list[ComparisonEvidence]) -> list[dict]:
             {
                 "id": row.id,
                 "evidence_code": evidence_code(
-                    project.project_code if project else None,
+                    project,
                     task.task_no if task else 0,
                     row.evidence_type,
                     seq,
@@ -326,7 +342,7 @@ def risk_detail(db: Session, evidence: ComparisonEvidence) -> dict:
     return {
         **base,
         "evidence_code": evidence_code(
-            project.project_code if project else None,
+            project,
             task.task_no if task else 0,
             evidence.evidence_type,
             seq,
@@ -348,11 +364,16 @@ def batch_review(
     new_status: str,
     comment: str | None,
     reviewer: User,
+    *,
+    skip_reviewed: bool = False,
 ) -> dict:
     """批量标记审核状态。
 
     V1.0 只允许批量标记为「待进一步核查」，明确不支持批量确认或批量排除
     （PRD 4.11.5），避免误操作。
+
+    ``skip_reviewed=True`` 时跳过已有审核结论（非 pending）的证据，避免批量
+    操作覆盖人工结果；被跳过的 id 会在 ``skipped_reviewed`` 中返回。
     """
     if new_status not in BATCH_ALLOWED_STATUSES:
         raise RiskValidationError("V1.0 只支持批量标记为待进一步核查，不支持批量确认或批量排除")
@@ -370,8 +391,11 @@ def batch_review(
         )
     )
     updated = 0
-    skipped: list[str] = []
+    skipped_reviewed: list[str] = []
     for evidence in rows:
+        if skip_reviewed and evidence.review_status != ReviewStatus.PENDING.value:
+            skipped_reviewed.append(evidence.id)
+            continue
         db.add(
             ReviewRecord(
                 evidence_id=evidence.id,
@@ -385,7 +409,12 @@ def batch_review(
         evidence.review_status = new_status
         updated += 1
     skipped = [eid for eid in evidence_ids if eid not in {row.id for row in rows}]
-    return {"updated": updated, "skipped": skipped, "status": new_status}
+    return {
+        "updated": updated,
+        "skipped": skipped,
+        "skipped_reviewed": skipped_reviewed,
+        "status": new_status,
+    }
 
 
 def risk_filters(db: Session) -> dict:

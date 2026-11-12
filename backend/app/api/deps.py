@@ -1,7 +1,7 @@
 from fastapi import Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, decode_scoped_ticket
 from app.db.session import SessionLocal, get_db
 from app.models import User
 from app.models.enums import UserRole
@@ -33,28 +33,55 @@ def get_current_user(
     return _user_from_token(token, db)
 
 
-def get_current_user_allow_query(
+def get_file_access_user(
+    file_id: str,
+    ticket: str | None = Query(default=None, description="文件预览的短期访问票据"),
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None, description="预览 PDF 时通过查询参数传递令牌"),
     db: Session = Depends(get_db),
 ) -> User:
-    value = token
-    if not value and authorization and authorization.lower().startswith("bearer "):
-        value = authorization[7:].strip()
-    return _user_from_token(value, db)
+    """文件预览认证：优先用 Authorization，其次校验限定到该文件的短期票据。
+
+    URL 中不再接受长期登录 JWT，避免令牌进入浏览器历史、Referer 与访问日志。
+    """
+    if authorization and authorization.lower().startswith("bearer "):
+        return _user_from_token(authorization[7:].strip(), db)
+    subject = decode_scoped_ticket(ticket, "file", file_id)
+    if not subject:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="访问票据无效或已过期"
+        )
+    return _load_active_user(db, subject)
 
 
 def get_stream_user(
-    token: str | None = Query(default=None, description="EventSource 通过查询参数传递令牌"),
+    project_id: str,
+    ticket: str | None = Query(default=None, description="SSE 的短期访问票据"),
 ) -> User:
-    """SSE 认证：校验完立即释放数据库连接，避免长连接占用连接池。"""
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少访问令牌")
+    """SSE 认证：校验限定到项目的短期票据，校验完立即释放数据库连接。"""
+    subject = decode_scoped_ticket(ticket, "events", project_id)
+    if not subject:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="访问票据无效或已过期"
+        )
     db = SessionLocal()
     try:
-        return _user_from_token(token, db)
+        user = db.get(User, subject)
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用"
+            )
+        return user
     finally:
         db.close()
+
+
+def _load_active_user(db: Session, subject: str) -> User:
+    user = db.get(User, subject)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用"
+        )
+    return user
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:

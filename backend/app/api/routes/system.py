@@ -6,16 +6,23 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, require_admin
 from app.db.session import get_db
 from app.models import User
+from app.models.enums import UserRole
 from app.schemas.system import (
+    OCRConnectionTest,
     PasswordReset,
     RuleVersionActivate,
     RuleVersionCreate,
     UserCreate,
     UserUpdate,
 )
-from app.services import audit, rule_service, system_service
+from app.services import audit, ocr, rule_service, system_service
 
 router = APIRouter(prefix="/system", tags=["system"])
+
+# 可选的 OCR 调用方式（V1 只有百度智能云 OCR）
+OCR_PROVIDERS = [
+    {"value": "baidu", "label": "百度智能云 OCR", "doc": "https://cloud.baidu.com/doc/OCR/s/vk3h7y58v"},
+]
 
 
 def _handle(exc: Exception) -> HTTPException:
@@ -30,10 +37,14 @@ def list_rules(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    """当前生效规则 + 版本历史（分析人员也需要查看当前生效规则）。"""
+    """当前生效规则 + 版本历史（分析人员也需要查看当前生效规则）。
+
+    OCR 凭据属于敏感配置：非管理员只能看到脱敏后的占位符。
+    """
+    include_secrets = user.role == UserRole.ADMIN.value
     versions = rule_service.list_versions(db)
     active = {
-        dimension: rule_service.version_payload(record)
+        dimension: rule_service.version_payload(record, include_secrets=include_secrets)
         for dimension, record in (
             (dimension, rule_service.active_version(db, dimension))
             for dimension in rule_service.DIMENSION_PARAMS
@@ -50,7 +61,47 @@ def list_rules(
             }
             for dimension in rule_service.DIMENSION_PARAMS
         ],
-        "versions": [rule_service.version_payload(record) for record in versions],
+        "versions": [
+            rule_service.version_payload(record, include_secrets=include_secrets)
+            for record in versions
+        ],
+        "ocr_providers": OCR_PROVIDERS,
+        "can_edit": include_secrets,
+    }
+
+
+@router.post("/ocr/test")
+def test_ocr_connection(
+    payload: OCRConnectionTest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+) -> dict:
+    """测试 OCR 凭据是否可用（只验证能否换取 access_token）。"""
+    config = rule_service.active_ocr_config(db)
+    api_key = (payload.api_key or "").strip() or str(config.get("baidu_api_key") or "")
+    secret_key = (payload.secret_key or "").strip() or str(
+        config.get("baidu_secret_key") or ""
+    )
+    try:
+        token = ocr.fetch_access_token(
+            api_key, secret_key, timeout=20, force=payload.refresh
+        )
+    except ocr.OCRError as exc:
+        raise HTTPException(400, f"OCR 凭据校验失败：{exc}") from exc
+    audit.log_audit(
+        db,
+        "rule.update",
+        "detection_rule_version",
+        "ocr",
+        user,
+        {"action": "ocr_connection_test"},
+        entity_name="百度 OCR 凭据测试",
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "message": "百度 OCR 凭据校验通过，已成功获取 access_token。",
+        "token_preview": f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "已获取",
     }
 
 

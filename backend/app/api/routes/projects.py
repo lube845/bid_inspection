@@ -6,7 +6,12 @@ from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models import AnalysisTask, Company, OriginalFile, Project, User
 from app.models.base import utcnow
-from app.models.enums import FileKind, ProjectStatus, TaskStatus
+from app.models.enums import (
+    PROJECT_STATUS_LABELS,
+    FileKind,
+    ProjectStatus,
+    TaskStatus,
+)
 from app.schemas.project import ProjectCreate, ProjectUpdate
 from app.services import audit, project_service, results_service
 
@@ -34,6 +39,7 @@ def _project_payload(project: Project, stats: dict | None = None) -> dict:
         "project_code": project.project_code,
         "description": project.description,
         "status": project.status,
+        "status_label": PROJECT_STATUS_LABELS.get(project.status, project.status),
         "created_at": project.created_at,
         "updated_at": project.updated_at,
     }

@@ -27,6 +27,7 @@ def test_health_login_and_project_creation():
         project = created.json()
         assert project["project_name"] == "接口测试项目"
         assert project["status"] == "pending"
+        assert project["status_label"] == "准备中"
 
         listed = client.get("/api/v1/projects", headers=headers)
         assert listed.status_code == 200

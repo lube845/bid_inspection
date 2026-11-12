@@ -4,12 +4,24 @@ from pydantic import BaseModel, Field
 class RuleVersionCreate(BaseModel):
     """新建检测规则版本。"""
 
-    dimension: str = Field(pattern="^(text|personnel|price)$")
+    dimension: str = Field(pattern="^(text|personnel|price|ocr)$")
     params: dict = Field(default_factory=dict)
     change_reason: str = Field(min_length=1, max_length=500)
     # 立即生效需要同时给出 activate 与 confirmed（生效确认）
     activate: bool = False
     confirmed: bool = False
+
+
+class OCRConnectionTest(BaseModel):
+    """OCR 凭据连通性测试。
+
+    凭据为空时使用当前生效的「OCR 识别」规则里的配置。
+    """
+
+    api_key: str = Field(default="", max_length=200)
+    secret_key: str = Field(default="", max_length=200)
+    # 重新获取 access_token（忽略本地缓存）
+    refresh: bool = False
 
 
 class RuleVersionActivate(BaseModel):

@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     secret_key: str = "change-me-in-production"
     access_token_expire_minutes: int = 12 * 60
+    # 文件预览 / SSE 使用的短期票据有效期（秒）
+    scoped_ticket_expire_seconds: int = 300
     cors_origins: str = "http://localhost:8080,http://localhost:5173"
 
     database_url: str = "postgresql+psycopg2://bid:bid@db:5432/bid_inspection"
@@ -55,6 +57,19 @@ class Settings(BaseSettings):
     price_cv_threshold: float = 0.05
     price_close_deviation: float = 0.01
     price_sequence_tolerance: float = 0.005
+
+    # OCR 识别（解析期设置）。系统管理里的「OCR 识别」规则版本会覆盖这些默认值。
+    ocr_enabled: bool = False
+    ocr_provider: str = "baidu"
+    baidu_api_key: str = ""
+    baidu_secret_key: str = ""
+    baidu_language_type: str = "CHN_ENG"
+    baidu_detect_direction: bool = True
+    baidu_probability: bool = False
+    ocr_timeout_seconds: int = 60
+    # 单次 OCR 上传的原始文件大小上限（MB）；超过时 PDF 会被自动拆分成多个文件
+    # 逐份上传。百度接口 base64 后的硬上限是 8MB，原始文件最大约 6MB。
+    ocr_max_file_mb: int = 6
 
     algorithm_version: str = "v1.0.0-minhash-lsh"
 

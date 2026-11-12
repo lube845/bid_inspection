@@ -832,8 +832,14 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
         price_failed = False
         if Dimension.PRICE.value in dimensions:
             try:
-                _run_price_stage(db, task, companies, blocks_by_company)
-                _set_progress(task, Dimension.PRICE.value, done=1, status="completed")
+                coverage = _run_price_stage(db, task, companies, blocks_by_company)
+                _set_progress(
+                    task,
+                    Dimension.PRICE.value,
+                    done=1,
+                    status="completed",
+                    coverage=coverage,
+                )
                 db.commit()
             except Exception as exc:
                 db.rollback()
@@ -1054,8 +1060,14 @@ def _run_price_stage(
     task: AnalysisTask,
     companies: list[dict],
     blocks_by_company: dict[str, list[BlockRef]],
-) -> None:
+) -> dict:
+    """执行价格维度并返回覆盖情况。
+
+    返回的 coverage 会写入任务进度，结果页据此提示「哪些企业未识别到报价」，
+    避免识别失败被静默当作「没有异常」。
+    """
     quotes: list[Quote] = []
+    missing: list[str] = []
     for company in companies:
         quote = extract_quote(
             company["company_id"],
@@ -1064,16 +1076,27 @@ def _run_price_stage(
         )
         if quote:
             quotes.append(quote)
+        else:
+            missing.append(company["company_name"])
+
+    coverage = {
+        "expected": len(companies),
+        "recognized": len(quotes),
+        "missing_companies": missing,
+        "status": "completed",
+    }
     if not quotes:
         _log(db, task, "未识别到结构化投标总报价，价格异常分析无结果", "warning")
-        return
+        coverage["status"] = "no_quote"
+        return coverage
 
     findings = analyze_prices(
         quotes, thresholds=task.analysis_config.get("thresholds") or {}
     )
     if not findings:
         _log(db, task, f"识别到 {len(quotes)} 家总报价，未触发价格异常规则")
-        return
+        coverage["finding_count"] = 0
+        return coverage
     mean = sum(q.amount for q in quotes) / len(quotes)
     drafts = build_price_evidences(findings, mean)
     for draft in drafts:
@@ -1088,7 +1111,9 @@ def _run_price_stage(
         ]
         _draft_to_evidence(db, task, None, draft, participants)
     _log(db, task, f"价格异常分析完成，触发 {len(findings)} 条规则")
+    coverage["finding_count"] = len(findings)
     db.flush()
+    return coverage
 
 
 def _apply_price_risk_to_pairs(db: Session, task: AnalysisTask) -> None:

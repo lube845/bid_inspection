@@ -62,12 +62,12 @@
         <form id="login-form" novalidate>
           <div class="form-row">
             <label for="login-username">用户名</label>
-            <input id="login-username" name="username" value="admin" autocomplete="username" required />
+            <input id="login-username" name="username" autocomplete="username" required />
           </div>
           <div class="form-row">
             <label for="login-password">密码</label>
             <div class="password-field">
-              <input id="login-password" name="password" type="password" value="admin123" autocomplete="current-password" required />
+              <input id="login-password" name="password" type="password" autocomplete="current-password" required />
               <button type="button" class="icon-btn password-toggle" id="password-toggle" aria-label="显示密码" aria-pressed="false">
                 <svg class="icon" aria-hidden="true"><use href="#i-eye"></use></svg>
               </button>
@@ -75,7 +75,7 @@
           </div>
           <p id="login-error" class="form-error" role="alert" hidden></p>
           <button class="btn primary block" type="submit">登录系统</button>
-          <p class="hint">默认账号 admin / admin123，可在 .env 中修改</p>
+          <p class="hint">账号由系统管理员分配；初始账号见部署说明。</p>
         </form>
       </section>
 
@@ -126,9 +126,16 @@
         <a href="#/system" data-nav="system"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-system"></use></svg><span>系统管理</span></a>
       </nav>
       <div class="side-foot">
-        <div id="user-box" class="user-box"></div>
-        <button id="logout-btn" class="btn ghost small" type="button"><svg class="icon" aria-hidden="true"><use href="#i-logout"></use></svg>退出登录</button>
-        <a class="side-link" href="/docs" target="_blank" rel="noreferrer">API 文档<svg class="icon" aria-hidden="true"><use href="#i-external"></use></svg></a>
+        <a class="side-link" href="/docs" target="_blank" rel="noreferrer">
+          <svg class="icon" aria-hidden="true"><use href="#i-external"></use></svg>
+          <span>API 文档</span>
+        </a>
+        <div class="account-row">
+          <div id="user-box" class="user-box"></div>
+          <button id="logout-btn" class="icon-btn side-logout" type="button" title="退出登录" aria-label="退出登录">
+            <svg class="icon" aria-hidden="true"><use href="#i-logout"></use></svg>
+          </button>
+        </div>
       </div>
     </aside>
 

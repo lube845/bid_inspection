@@ -27,7 +27,8 @@ from app.models.enums import (
     FileParseStatus,
     PageStatus,
 )
-from app.services import audit, logical_document_service, project_service
+from app.services import audit, logical_document_service, project_service, rule_service
+from app.services.ocr import build_ocr_provider
 from app.services.parser import ParseError, parse_document
 from app.storage.local import get_storage
 from app.utils.text import normalize
@@ -282,7 +283,9 @@ def parse_file(
 
     try:
         path = get_storage().local_path(file.storage_key)
-        parsed = parse_document(path, file.file_type)
+        # OCR 由系统管理里的「OCR 识别」规则决定是否启用与调用方式
+        ocr_provider = build_ocr_provider(rule_service.active_ocr_config(db))
+        parsed = parse_document(path, file.file_type, ocr_provider=ocr_provider)
     except (ParseError, FileNotFoundError) as exc:
         _mark_parse_failed(db, file, company, project, str(exc), actor)
         _maybe_auto_start(db, project, auto_start)
@@ -291,6 +294,12 @@ def parse_file(
         _mark_parse_failed(db, file, company, project, f"解析异常: {exc}", actor)
         _maybe_auto_start(db, project, auto_start)
         return file
+
+    # 重新解析时先清掉旧页面，避免同一文件累积多份页记录，
+    # 否则会出现「成功页数 > 总页数」这类自相矛盾的统计。
+    if file.pages:
+        file.pages.clear()
+        db.flush()
 
     success_pages = 0
     ocr_pages = 0

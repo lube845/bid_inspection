@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 import numpy as np
@@ -45,7 +45,27 @@ _MIN_BLOCK_CONTAINMENT = 0.2
 _MIN_LONG_MATCH_CHARS = 100
 
 ALGORITHM_NAME = "minhash_lsh+jaccard+sequence_matcher"
-NORMALIZATION_VERSION = "norm-v2"
+# norm-v3：忽略字符集补齐纯排版符号（货币、百分号、公式、表格竖线等）。
+# 规范化规则变了，分数就不再与旧规则下的结果同口径，必须升版本区分。
+NORMALIZATION_VERSION = "norm-v3"
+
+
+@dataclass
+class AlignedGroup:
+    """一组连续的相似片段。
+
+    ``blocks`` 保存组内每一段匹配区间（规范化坐标），用于把「相似」精确
+    还原到原文：一段证据里可能包含多个不连续的相似区间，界面需要分别
+    高亮，不能合并成一整块。
+    """
+
+    a_start: int
+    a_end: int
+    b_start: int
+    b_end: int
+    matched: int
+    local_ratio: float
+    blocks: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -70,6 +90,9 @@ class TextMatch:
     excluded_by_tender: bool
     text: str
     localization_status: str = "local"
+    # 组内每一段相似区间在规范化文本上的坐标（两侧各一份）
+    intervals_a: list[tuple[int, int]] = field(default_factory=list)
+    intervals_b: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -179,8 +202,8 @@ class TextIndex:
 
 def _align_chunks(
     chunk_a: TextChunk, chunk_b: TextChunk, rules: dict
-) -> list[tuple[int, int, int, int, int, float]]:
-    """返回 (a_start, a_end, b_start, b_end, matched_chars, local_ratio)。"""
+) -> list[AlignedGroup]:
+    """返回局部对齐得到的连续相似片段组。"""
     na, nb = chunk_a.normalized, chunk_b.normalized
     if not na or not nb:
         return []
@@ -214,7 +237,7 @@ def _align_chunks(
         groups.append([match])
 
     minimum = int(rules["text_min_match_chars"])
-    results: list[tuple[int, int, int, int, int, float]] = []
+    results: list[AlignedGroup] = []
     for group in groups:
         first, last = group[0], group[-1]
         a_start, a_end = first.a, last.a + last.size
@@ -226,7 +249,20 @@ def _align_chunks(
         local_ratio = matched / span if span else 0.0
         if local_ratio < _MIN_LOCAL_RATIO:
             continue
-        results.append((a_start, a_end, b_start, b_end, matched, local_ratio))
+        results.append(
+            AlignedGroup(
+                a_start=a_start,
+                a_end=a_end,
+                b_start=b_start,
+                b_end=b_end,
+                matched=matched,
+                local_ratio=local_ratio,
+                blocks=[
+                    (item.a, item.a + item.size, item.b, item.b + item.size)
+                    for item in group
+                ],
+            )
+        )
     return results
 
 
@@ -269,7 +305,10 @@ def match_chunks(
 
         local = _align_chunks(chunk_a, chunk_b, rules)
         if local:
-            for a_start, a_end, b_start, b_end, matched, local_ratio in local:
+            for group in local:
+                a_start, a_end = group.a_start, group.a_end
+                b_start, b_end = group.b_start, group.b_end
+                matched, local_ratio = group.matched, group.local_ratio
                 if (
                     similarity.jaccard < _MIN_BLOCK_CONTAINMENT
                     and similarity.containment < _MIN_BLOCK_CONTAINMENT
@@ -302,6 +341,8 @@ def match_chunks(
                             baseline_ratio >= float(rules["tender_exclusion_ratio"])
                         ),
                         text=text,
+                        intervals_a=[(item[0], item[1]) for item in group.blocks],
+                        intervals_b=[(item[2], item[3]) for item in group.blocks],
                     )
                 )
             continue
@@ -342,6 +383,8 @@ def match_chunks(
                     ),
                     text=text,
                     localization_status="block_level",
+                    intervals_a=[(0, len(chunk_a.normalized))],
+                    intervals_b=[(0, len(chunk_b.normalized))],
                 )
             )
 
@@ -390,6 +433,28 @@ def _severity(matched: int, local_ratio: float) -> str:
     if matched >= 120 or local_ratio >= 0.9:
         return RiskLevel.MEDIUM.value
     return RiskLevel.LOW.value
+
+
+def _original_intervals(
+    chunk: TextChunk, intervals: list[tuple[int, int]]
+) -> list[dict]:
+    """把规范化坐标上的相似区间还原成原文坐标。
+
+    返回的每一项都带 block_id 与 page_index，界面可以据此把相似片段
+    精确落到原始文件的文本块上。
+    """
+    result: list[dict] = []
+    for start, end in intervals:
+        for item in chunk.original_ranges(start, end):
+            result.append(
+                {
+                    "block_id": item.get("block_id"),
+                    "page_index": item.get("page_index"),
+                    "start": int(item.get("start") or 0),
+                    "end": int(item.get("end") or 0),
+                }
+            )
+    return result
 
 
 def build_text_evidences(
@@ -468,6 +533,10 @@ def build_text_evidences(
         if match.localization_status != "local":
             summary += "（块级命中，未能精确定位局部片段）"
 
+        # 把每一段相似区间还原成原文坐标，供界面分别高亮「相似」与「差异」
+        match_intervals_a = _original_intervals(match.chunk_a, match.intervals_a)
+        match_intervals_b = _original_intervals(match.chunk_b, match.intervals_b)
+
         draft = EvidenceDraft(
                 evidence_type=EvidenceType.TEXT.value,
                 subtype="text_similarity",
@@ -492,6 +561,10 @@ def build_text_evidences(
                     "matched_text": source_a.get("snippet"),
                     "matched_text_b": source_b.get("snippet"),
                     "localization_status": match.localization_status,
+                    # 相似区间（原文坐标）：界面据此区分「相似」与「差异」
+                    "match_intervals_a": match_intervals_a,
+                    "match_intervals_b": match_intervals_b,
+                    "match_interval_count": len(match_intervals_a),
                     # 基准排除
                     "baseline_match": bool(local_coverage > 0),
                     "baseline_ratio": round(local_coverage, 4),

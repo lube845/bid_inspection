@@ -23,14 +23,19 @@ def _login(client, username="admin", password="admin123"):
 def test_ensure_initial_version_is_idempotent(db):
     created = rule_service.ensure_initial_version(db)
     db.commit()
-    assert len(created) == 3
+    assert len(created) == 4
     # 再次调用不应重复创建
     again = rule_service.ensure_initial_version(db)
     db.commit()
     assert again == []
     versions = list(db.scalars(select(DetectionRuleVersion)))
-    assert len(versions) == 3
-    assert {version.dimension for version in versions} == {"text", "personnel", "price"}
+    assert len(versions) == 4
+    assert {version.dimension for version in versions} == {
+        "text",
+        "personnel",
+        "price",
+        "ocr",
+    }
     assert all(version.status == RuleStatus.ACTIVE.value for version in versions)
 
 
