@@ -26,5 +26,6 @@ class StartAnalysisRequest(BaseModel):
 
 
 class ReviewRequest(BaseModel):
-    status: str = Field(pattern="^(confirmed|excluded|undecided)$")
+    # pending 用于「撤回本次审核」：追加一条记录把状态改回待审核，历史记录不删除也不修改。
+    status: str = Field(pattern="^(pending|confirmed|excluded|undecided)$")
     comment: str | None = None

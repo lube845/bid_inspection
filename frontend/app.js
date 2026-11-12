@@ -40,7 +40,7 @@ let riskListState = {
   review_status: "", reviewer_id: "", date_from: "", date_to: "", page: 1, page_size: 20,
 };
 let systemTab = "rules";
-let logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "" };
+let logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "", page: 1, page_size: 50 };
 let selectedCompanyByProject = {};
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -543,7 +543,7 @@ async function renderOverview(container, project) {
   };
   const recent = (project.recent_tasks || []).map((task) => `
     <tr>
-      <td>#${task.task_no}</td><td>${taskPill(task.status)}</td><td>${task.company_count} 家</td>
+      <td>#${task.task_no}</td><td>${taskPill(task.status)}</td><td class="num">${task.company_count} 家</td>
       <td>${fmtDate(task.created_at)}</td><td>${fmtDate(task.finished_at)}</td>
       <td><a class="btn small" href="#/projects/${project.id}?tab=task">查看任务</a></td>
     </tr>`).join("");
@@ -556,19 +556,17 @@ async function renderOverview(container, project) {
       ${statCard("可参与分析企业", num(stats.analyzable_company_count), "shield", "ok")}
       ${statCard("待处理异常", num(stats.pending_issue_count), "alert", num(stats.pending_issue_count) ? "high" : "")}
     </div>
-    <div class="card" style="margin-top:16px">
-      <div class="row">
-        <div>
-          <h2 style="margin:0 0 4px">下一步：${esc(todo.label || "继续完善项目资料")}</h2>
-          <div class="muted small">系统根据当前资料准备情况动态推荐下一步操作。</div>
-        </div>
-        <div class="spacer"></div>
-        <a class="btn primary" href="${todoTarget[todo.code] || `#/projects/${project.id}`}">${esc(todo.label || "进入项目")}</a>
+    <div class="next-step">
+      <div class="next-step-body">
+        <span class="next-step-label">下一步</span>
+        <strong>${esc(todo.label || "继续完善项目资料")}</strong>
+        <span class="small muted">系统根据当前资料准备情况动态推荐下一步操作</span>
       </div>
+      <a class="btn primary" href="${todoTarget[todo.code] || `#/projects/${project.id}`}">${esc(todo.label || "进入项目")}</a>
     </div>
     <div class="grid cols-2">
       <div class="card">
-        <h2>项目准备情况</h2>
+        <div class="card-head"><h2>项目准备情况</h2></div>
         <dl class="kv">
           <dt>招标文件</dt><dd>${stages.tender?.uploaded ? `已上传 ${stages.tender.file_count} 份` : "未上传（跳过公共内容排除）"}</dd>
           <dt>企业资料</dt><dd>${num(stages.companies?.analyzable)} 家可分析，${num(stages.companies?.abnormal)} 家异常，${num(stages.companies?.pending_confirm)} 家待确认</dd>
@@ -578,8 +576,8 @@ async function renderOverview(container, project) {
         </dl>
       </div>
       <div class="card">
-        <h2>最近分析任务</h2>
-        ${recent ? `<table><thead><tr><th>任务</th><th>状态</th><th>企业</th><th>创建时间</th><th>完成时间</th><th></th></tr></thead><tbody>${recent}</tbody></table>` : `<div class="empty">还没有分析任务。</div>`}
+        <div class="card-head"><h2>最近分析任务</h2></div>
+        ${recent ? `<div class="table-scroll"><table><thead><tr><th>任务</th><th>状态</th><th class="num">企业</th><th>创建时间</th><th>完成时间</th><th></th></tr></thead><tbody>${recent}</tbody></table></div>` : `<div class="empty">还没有分析任务。</div>`}
       </div>
     </div>`;
 }
@@ -613,7 +611,7 @@ async function renderFiles(container, project) {
       <div class="name">${esc(file.file_name)}</div>
       <div class="small muted">${file.file_type.toUpperCase()} · ${fmtSize(file.file_size)} · ${file.page_count} 页</div>
       <div>${filePill(file.parse_status)}</div>
-      <a class="btn small" href="${API}/files/${file.id}/content?token=${encodeURIComponent(state.token)}" target="_blank">查看</a>
+      <a class="btn small" href="${API}/files/${file.id}/content?token=${encodeURIComponent(state.token)}" target="_blank" rel="noreferrer">查看</a>
       <button class="btn small" data-parse-file="${file.id}">${file.parse_status === "success" ? "重新解析" : "解析"}</button>
     </div>`).join("");
 
@@ -805,7 +803,7 @@ async function previewLogical(company) {
         <summary><strong>${String(item.sort_order + 1).padStart(2, "0")} ${esc(item.file_name)}</strong>
           <span class="small muted">（${item.page_count} 页，${FILE_STATUS[item.parse_status] || item.parse_status}）</span></summary>
         <div class="small" style="margin:8px 0 0 18px; max-height:160px; overflow:auto">
-          ${(item.pages || []).map((page) => `<a href="${API}/files/${item.file_id}/content?token=${encodeURIComponent(state.token)}#page=${page.page_index}" target="_blank" style="margin-right:10px">第${page.page_index}页</a>`).join("") || `<span class="muted">该文件尚未解析</span>`}
+          ${(item.pages || []).map((page) => `<a href="${API}/files/${item.file_id}/content?token=${encodeURIComponent(state.token)}#page=${page.page_index}" target="_blank" rel="noreferrer" style="margin-right:10px">第${page.page_index}页</a>`).join("") || `<span class="muted">该文件尚未解析</span>`}
         </div>
       </details>`).join("");
     openModal({
@@ -876,7 +874,7 @@ async function openPagesModal(fileId, fileName) {
     title: `解析结果 · ${fileName}`,
     wide: true,
     body: `<div class="row" style="margin-bottom:10px">
-        <a class="btn small" href="${API}/files/${fileId}/content?token=${encodeURIComponent(state.token)}" target="_blank">打开原始文件</a>
+        <a class="btn small" href="${API}/files/${fileId}/content?token=${encodeURIComponent(state.token)}" target="_blank" rel="noreferrer">打开原始文件</a>
         <span class="small muted">左侧选择页面，右侧查看提取文本；原始 PDF 可在新窗口查看。</span>
       </div>
     <div class="viewer-grid" style="grid-template-columns:200px 1fr">
@@ -1173,9 +1171,9 @@ async function renderResults(container, project) {
   const stats = data.stats;
   const pairRows = data.pairs.map((pair) => `
     <tr>
-      <td><a href="#/projects/${project.id}?tab=analysis&pair=${pair.pair_id}">${esc(pair.company_a)} ↔ ${esc(pair.company_b)}</a></td>
-      <td>${pair.text_count}</td><td>${pair.personnel_count}</td><td>${pair.price_count}</td>
-      <td class="opt">${riskPill(pair.text_risk)}</td><td class="opt">${riskPill(pair.personnel_risk)}</td><td class="opt">${riskPill(pair.price_risk)}</td>
+      <td class="cell-main"><a href="#/projects/${project.id}?tab=analysis&pair=${pair.pair_id}">${esc(pair.company_a)} ↔ ${esc(pair.company_b)}</a></td>
+      <td class="num">${pair.text_count}</td><td class="num">${pair.personnel_count}</td><td class="num">${pair.price_count}</td>
+      <td class="col-secondary">${riskPill(pair.text_risk)}</td><td class="col-secondary">${riskPill(pair.personnel_risk)}</td><td class="col-secondary">${riskPill(pair.price_risk)}</td>
       <td>${riskPill(pair.overall_risk)}</td>
       <td><a class="btn small" href="#/projects/${project.id}?tab=analysis&pair=${pair.pair_id}">三栏查看</a></td>
     </tr>`).join("");
@@ -1212,7 +1210,7 @@ async function renderResults(container, project) {
     </div>
     <div class="card">
       <h2>企业组合列表</h2>
-      <table><thead><tr><th>企业组合</th><th>文本证据</th><th>人员重复</th><th>价格异常</th><th class="opt">文本风险</th><th class="opt">人员风险</th><th class="opt">价格风险</th><th>综合风险</th><th>操作</th></tr></thead>
+      <table><thead><tr><th>企业组合</th><th class="num">文本证据</th><th class="num">人员重复</th><th class="num">价格异常</th><th class="col-secondary">文本风险</th><th class="col-secondary">人员风险</th><th class="col-secondary">价格风险</th><th>综合风险</th><th>操作</th></tr></thead>
         <tbody>${pairRows || `<tr><td colspan="9"><div class="empty">暂无结果</div></td></tr>`}</tbody></table>
     </div>
     <div class="card">
@@ -1255,8 +1253,8 @@ async function renderReport(container, project) {
     </div>
     <div class="card">
       <h2>历史分析任务</h2>
-      <table><thead><tr><th>任务</th><th>状态</th><th>企业数</th><th>创建时间</th><th>完成时间</th><th class="opt">算法版本</th></tr></thead>
-        <tbody>${(data.tasks || []).map((t) => `<tr><td>#${t.task_no}</td><td>${taskPill(t.status)}</td><td>${t.company_count}</td><td>${fmtDate(t.created_at)}</td><td>${fmtDate(t.finished_at)}</td><td class="mono opt">${esc(t.algorithm_version)}</td></tr>`).join("") || `<tr><td colspan="6"><div class="empty">暂无任务</div></td></tr>`}</tbody></table>
+      <table><thead><tr><th>任务</th><th>状态</th><th>企业数</th><th>创建时间</th><th>完成时间</th><th class="col-secondary">算法版本</th></tr></thead>
+        <tbody>${(data.tasks || []).map((t) => `<tr><td>#${t.task_no}</td><td>${taskPill(t.status)}</td><td>${t.company_count}</td><td>${fmtDate(t.created_at)}</td><td>${fmtDate(t.finished_at)}</td><td class="mono col-secondary">${esc(t.algorithm_version)}</td></tr>`).join("") || `<tr><td colspan="6"><div class="empty">暂无任务</div></td></tr>`}</tbody></table>
     </div>`;
   const downloadBtn = $("#download-report", container);
   downloadBtn?.addEventListener("click", () => withBusy(downloadBtn, async () => {
@@ -1273,14 +1271,17 @@ async function renderReport(container, project) {
 }
 
 /* ---------- 三栏证据查看器（可嵌入比对分析页，也可独立路由打开） ---------- */
+/* 证据筛选条件提到模块级：切换企业组合后仍保留，避免审核员每组重设一次 */
+let evidenceFilterState = { review: "", severity: "", tender: "" };
+
 async function mountPairViewer(container, pairId, evidenceId) {
   const data = await api(`/pairs/${pairId}`);
   const pair = data.pair;
   let currentType = "text";
   let currentEvidenceId = evidenceId || null;
-  let filterReview = "";
-  let filterSeverity = "";
-  let filterTender = "";
+  let filterReview = evidenceFilterState.review;
+  let filterSeverity = evidenceFilterState.severity;
+  let filterTender = evidenceFilterState.tender;
 
   const byType = (type) => data.evidences.filter((item) => item.evidence_type === type);
   const visible = (type) => byType(type).filter((item) => {
@@ -1305,12 +1306,12 @@ async function mountPairViewer(container, pairId, evidenceId) {
         <strong>${esc(pair.company_a)} ↔ ${esc(pair.company_b)}</strong>
         ${riskPill(pair.overall_risk)}
         <span class="spacer"></span>
-        <select id="ev-filter-review" aria-label="按审核状态筛选证据"><option value="">全部审核状态</option>${Object.entries(REVIEW).map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
-        <select id="ev-filter-severity" aria-label="按风险等级筛选证据"><option value="">全部风险</option>${Object.entries(RISK).map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+        <select id="ev-filter-review" aria-label="按审核状态筛选证据"><option value="">全部审核状态</option>${Object.entries(REVIEW).map(([v, l]) => `<option value="${v}" ${filterReview === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <select id="ev-filter-severity" aria-label="按风险等级筛选证据"><option value="">全部风险</option>${Object.entries(RISK).map(([v, l]) => `<option value="${v}" ${filterSeverity === v ? "selected" : ""}>${l}</option>`).join("")}</select>
         <select id="ev-filter-tender" aria-label="按招标文件命中情况筛选">
           <option value="">全部内容</option>
-          <option value="hit">命中招标说明</option>
-          <option value="effective">未命中招标说明</option>
+          <option value="hit" ${filterTender === "hit" ? "selected" : ""}>命中招标说明</option>
+          <option value="effective" ${filterTender === "effective" ? "selected" : ""}>未命中招标说明</option>
         </select>
       </div>
       <div class="small muted" style="margin-top:8px">
@@ -1350,9 +1351,11 @@ async function mountPairViewer(container, pairId, evidenceId) {
   const renderList = () => {
     const items = visible(currentType);
     const total = byType(currentType).length;
+    /* 审核进度：给的是「这条队列推进到哪了」，不是总数 */
+    const reviewed = byType(currentType).filter((item) => item.review_status !== "pending").length;
     $("#evidence-count", container).textContent = items.length === total
-      ? `${total} 条证据`
-      : `${items.length} / ${total} 条（已筛选）`;
+      ? `${total} 条 · 已审 ${reviewed} · 待审 ${total - reviewed}`
+      : `${items.length} / ${total} 条（已筛选） · 已审 ${reviewed} · 待审 ${total - reviewed}`;
     listEl.innerHTML = items.map((item) => `
       <div class="evidence-item review-${esc(item.review_status)} ${item.excluded_by_tender ? "tender-hit" : ""} ${item.id === currentEvidenceId ? "active" : ""}"
         data-evidence-id="${item.id}" role="button" tabindex="0" aria-pressed="${item.id === currentEvidenceId}" aria-label="查看证据：${esc(item.summary)}">
@@ -1373,6 +1376,23 @@ async function mountPairViewer(container, pairId, evidenceId) {
     });
   };
 
+  /* 下一个待审证据：审核是条队列，审完一条要能直接进下一条 */
+  const nextPendingId = (fromId = currentEvidenceId) => {
+    const queue = visible(currentType);
+    const start = queue.findIndex((item) => item.id === fromId);
+    for (let step = 1; step <= queue.length; step += 1) {
+      const item = queue[(start + step) % queue.length];
+      if (item && item.id !== fromId && item.review_status === "pending") return item.id;
+    }
+    return null;
+  };
+
+  /* 审核后把焦点交还清单，键盘用户不会掉回 body */
+  const focusEvidenceItem = (id) => {
+    const node = listEl.querySelector(`[data-evidence-id="${id}"]`);
+    if (node) node.focus({ preventScroll: false });
+  };
+
   const selectEvidence = async (id) => {
     currentEvidenceId = id;
     renderList();
@@ -1383,7 +1403,9 @@ async function mountPairViewer(container, pairId, evidenceId) {
       renderSides(evidence);
       currentType = evidence.evidence_type;
     } catch (error) {
-      detailEl.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
+      detailEl.innerHTML = `<div class="error-box">${esc(error.message)}</div>
+        <button class="btn small" id="evidence-retry">重试</button>`;
+      $("#evidence-retry", detailEl)?.addEventListener("click", () => selectEvidence(id));
     }
   };
 
@@ -1396,7 +1418,15 @@ async function mountPairViewer(container, pairId, evidenceId) {
       renderList();
       renderTabs();
       renderDetail(refreshed);
+      focusEvidenceItem(evidence.id);
     });
+    const jump = nextPendingId(evidence.id);
+    const jumpBtn = $("#review-next", detailEl);
+    if (jumpBtn) {
+      jumpBtn.disabled = !jump;
+      jumpBtn.textContent = jump ? "下一条待审核 →" : "队列已审完";
+      jumpBtn.addEventListener("click", () => { if (jump) selectEvidence(jump); });
+    }
   };
 
   const renderSides = (evidence) => {
@@ -1410,6 +1440,7 @@ async function mountPairViewer(container, pairId, evidenceId) {
     filterReview = $("#ev-filter-review", container).value;
     filterSeverity = $("#ev-filter-severity", container).value;
     filterTender = $("#ev-filter-tender", container).value;
+    evidenceFilterState = { review: filterReview, severity: filterSeverity, tender: filterTender };
     renderList();
     renderTabs();
     if (currentEvidenceId && !visible(currentType).some((item) => item.id === currentEvidenceId)) {
@@ -1560,7 +1591,7 @@ function evidenceDetailHtml(evidence) {
       <dt>报价明细</dt><dd>
         <table class="small"><thead><tr><th>企业</th><th>总报价</th><th>偏差率</th><th>原文</th></tr></thead><tbody>
         ${quotes.map((quote) => `<tr><td>${esc(quote.company_name)}</td><td>${Number(quote.amount || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td>${(num(quote.deviation_rate) * 100).toFixed(2)}%</td>
-          <td>${quote.source?.file_id ? `<a href="${API}/files/${quote.source.file_id}/content?token=${encodeURIComponent(state.token)}#page=${quote.source.page_index}" target="_blank">${esc(quote.source.file_name)} 第${quote.source.page_index}页</a>` : "—"}</td></tr>`).join("")}
+          <td>${quote.source?.file_id ? `<a href="${API}/files/${quote.source.file_id}/content?token=${encodeURIComponent(state.token)}#page=${quote.source.page_index}" target="_blank" rel="noreferrer">${esc(quote.source.file_name)} 第${quote.source.page_index}页</a>` : "—"}</td></tr>`).join("")}
         </tbody></table></dd>
       <dt>说明</dt><dd class="small muted">${esc(data.note || "")}</dd>`;
   }
@@ -1582,29 +1613,71 @@ function renderHistory(records) {
       ${record.comment ? `<div class="muted">${esc(record.comment)}</div>` : ""}</div>`).join("")}</div>`;
 }
 
+/* 审核表单：确认异常线索是本系统里后果最重的动作，必须带理由并二次确认；
+   排除与暂不判断保留轻量路径。撤回走追加记录，不覆盖历史。 */
 function reviewFormHtml(evidence) {
+  const status = evidence.review_status || "pending";
+  const records = evidence.review_records || [];
+  const last = records[records.length - 1];
+  const revoke = last
+    ? `<button class="btn small" data-review-revoke="1" title="以一条新的审核记录把状态改回待审核，历史记录保留">撤回本次审核</button>`
+    : "";
+  const label = status === "pending" ? "尚未审核" : `当前结论：${REVIEW[status] || status}`;
   return `<div class="detail-block">
     <div class="small" style="font-weight:600">人工审核</div>
-    <textarea id="review-comment" aria-label="审核说明" placeholder="审核说明（可选）"></textarea>
+    <div class="small muted" style="margin:4px 0 8px">${esc(label)}${last ? ` · 最近一位审核人 ${esc(last.reviewer_name)} · ${fmtDate(last.created_at)}` : ""}</div>
+    <label class="small">审核说明<span class="muted">（确认异常线索时必填，将写入导出报告）</span>
+      <textarea id="review-comment" placeholder="写清判断依据，例如：已核对纸质原件，两份技术标第 4.2 节为同一底稿"></textarea>
+    </label>
+    <p id="review-error" class="form-error" role="alert" hidden></p>
     <div class="review-actions">
       <button class="btn small primary" data-review-status="confirmed">确认异常线索</button>
       <button class="btn small" data-review-status="excluded">正常 / 排除</button>
       <button class="btn small" data-review-status="undecided">暂不判断</button>
+      ${revoke}
+    </div>
+    <div class="review-actions">
+      <button class="btn small" id="review-next" type="button" disabled>下一条待审核 →</button>
     </div>
     <div class="small muted" style="margin-top:6px">审核记录只追加保存，不覆盖历史；原始识别结果始终保留。</div>
   </div>`;
 }
 
 function bindReviewForm(root, evidence, refresh) {
-  $$("[data-review-status]", root).forEach((button) => button.addEventListener("click", () => {
-    const comment = $("#review-comment", root)?.value || "";
-    withBusy(button, async () => {
+  const commentValue = () => $("#review-comment", root)?.value || "";
+  const fail = (message) => {
+    const box = $("#review-error", root);
+    if (box) { box.hidden = false; box.textContent = message; box.setAttribute("tabindex", "-1"); box.focus(); }
+    else toast(message, "error");
+  };
+  const submit = async (button, status, comment) => {
+    await withBusy(button, async () => {
       try {
-        await api(`/evidences/${evidence.id}/review`, { method: "POST", body: { status: button.dataset.reviewStatus, comment: comment || null } });
-        toast("审核结论已保存", "success");
+        await api(`/evidences/${evidence.id}/review`, { method: "POST", body: { status, comment: comment || null } });
+        toast(status === "pending" ? "审核结论已撤回" : "审核结论已保存", "success");
         await refresh();
       } catch (error) { toast(error.message, "error"); }
     }, "保存中…");
+  };
+
+  $$("[data-review-status]", root).forEach((button) => button.addEventListener("click", () => {
+    const status = button.dataset.reviewStatus;
+    const comment = commentValue().trim();
+    const box = $("#review-error", root);
+    if (box) { box.hidden = true; box.textContent = ""; }
+    if (status === "confirmed") {
+      if (!comment) { fail("确认异常线索前必须填写审核说明：这条结论会进入导出报告，事后需要能复核。"); return; }
+      const ok = confirm(`将把这条证据标记为「确认异常线索」，并写入导出报告。\n\n待核对：${evidence.summary}\n\n确认继续？`);
+      if (!ok) return;
+      submit(button, status, comment);
+      return;
+    }
+    submit(button, status, comment);
+  }));
+
+  $$("[data-review-revoke]", root).forEach((button) => button.addEventListener("click", () => {
+    if (!confirm("撤回本次审核？\n\n会追加一条「改回待审核」的记录，原审核记录与结论历史都保留。")) return;
+    submit(button, "pending", "撤回本次审核");
   }));
 }
 
@@ -1619,38 +1692,17 @@ const WORKBENCH_STAT_LINKS = {
 
 async function renderWorkbench() {
   const main = $("#main");
-  main.innerHTML = skeletonPage(5);
+  main.innerHTML = skeletonPage(3);
   const data = await api("/workbench");
   const stats = data.stats || {};
   const risk = data.risk || {};
-
-  const statMeta = {
-    project_total: ["projects", ""],
-    project_active: ["activity", ""],
-    task_completed: ["check", "ok"],
-    evidence_total: ["shield", "medium"],
-    evidence_pending_review: ["clock", "high"],
-  };
-  const statCards = [
-    ["project_total", "项目总数", stats.project_total, "#/projects"],
-    ["project_active", "进行中项目", stats.project_active, "#/projects"],
-    ["task_completed", "已完成分析任务", stats.task_completed, "#recent-tasks"],
-    ["evidence_total", "异常证据总数", stats.evidence_total, "#/risks"],
-    ["evidence_pending_review", "待审核证据", stats.evidence_pending_review, "#/risks?review_status=pending"],
-  ].map(([key, label, value]) => {
-    const [iconName, tone] = statMeta[key];
-    return `<button type="button" class="stat clickable" data-stat="${key}" title="点击查看">
-      <span class="stat-head"><span class="stat-icon ${tone}">${icon(iconName)}</span><span class="label">${esc(label)}</span></span>
-      <span class="value">${num(value)}</span>
-    </button>`;
-  }).join("");
 
   const todoRows = (data.todos || []).map((todo) => `
     <tr>
       <td>${pill(todo.severity === "high" ? "high" : todo.severity === "medium" ? "medium" : "low", todo.type_label)}</td>
       <td><a href="#/projects/${esc(todo.project_id)}">${esc(todo.project_name)}</a></td>
       <td>${esc(todo.title)}<div class="small muted">${esc(todo.detail || "")}</div></td>
-      <td class="opt">${fmtDate(todo.created_at)}</td>
+      <td class="col-secondary">${fmtDate(todo.created_at)}</td>
       <td>${pill(todo.status, todo.status === "failed" ? "需处理" : "待处理")}</td>
       <td><a class="btn small" href="${esc(todo.link)}">去处理</a></td>
     </tr>`).join("");
@@ -1660,8 +1712,8 @@ async function renderWorkbench() {
       <td><a href="#/projects/${esc(project.id)}"><strong>${esc(project.project_name)}</strong></a>
         <div class="small muted">${esc(project.project_code || "无项目编号")}</div></td>
       <td>${pill(project.status, project.status_label || PROJECT_STATUS[project.status] || project.status)}</td>
-      <td class="opt">${num(project.company_count)}</td>
-      <td class="opt">${fmtDate(project.last_analysis_at)}</td>
+      <td class="col-secondary">${num(project.company_count)}</td>
+      <td class="col-secondary">${fmtDate(project.last_analysis_at)}</td>
       <td>${num(project.pending_review_count)}</td>
       <td><a class="btn small" href="#/projects/${esc(project.id)}">进入</a></td>
     </tr>`).join("");
@@ -1672,58 +1724,119 @@ async function renderWorkbench() {
       <td><a href="#/projects/${esc(task.project_id)}">${esc(task.project_name)}</a></td>
       <td>${num(task.company_count)}</td>
       <td>${fmtDate(task.created_at)}</td>
-      <td class="opt">${fmtDate(task.finished_at)}</td>
+      <td class="col-secondary">${fmtDate(task.finished_at)}</td>
       <td>${taskPill(task.status)}</td>
-      <td class="mono small opt">${esc(task.algorithm_version || "—")}</td>
-      <td class="small muted opt">${esc(task.rule_version_label || "—")}</td>
+      <td class="mono small col-secondary">${esc(task.algorithm_version || "—")}</td>
+      <td class="small muted col-secondary">${esc(task.rule_version_label || "—")}</td>
       <td><a class="btn small" href="${esc(task.link)}">查看</a></td>
     </tr>`).join("");
 
   const typeIcons = { text: "file", personnel: "user", price: "coins" };
-  const typeCards = Object.entries(risk.by_type || {}).map(([key, value]) =>
-    statCard(TYPE[key] || key, num(value), typeIcons[key] || "layers", "medium")).join("");
-  const severityTone = { high: "high", medium: "medium", low: "", none: "" };
-  const severityCards = Object.entries(risk.by_severity || {}).map(([key, value]) =>
-    statCard(`${RISK[key] || key}风险`, num(value), key === "none" ? "shield" : "alert", severityTone[key] || "")).join("");
-  const reviewIcons = { pending: "clock", confirmed: "alert", excluded: "check", undecided: "info" };
-  const reviewTones = { pending: "medium", confirmed: "high", excluded: "ok", undecided: "medium" };
-  const reviewCards = Object.entries(risk.by_review_status || {}).map(([key, value]) =>
-    statCard(REVIEW[key] || key, num(value), reviewIcons[key] || "clock", reviewTones[key] || "")).join("");
+  const typeLabel = { text: "文本相似", personnel: "人员重复", price: "价格异常" };
+  const severityTone = { high: "high", medium: "medium", low: "low", none: "none" };
+
+  /* 风险分布：不再用 11 张等大卡片平铺，改为一条可读的分布条 + 明细。
+     分布条让「风险集中在哪」一眼可见，卡片墙只能让人逐个相加。 */
+  const bySeverity = risk.by_severity || {};
+  const severityOrder = ["high", "medium", "low", "none"];
+  const severityTotal = severityOrder.reduce((sum, key) => sum + num(bySeverity[key]), 0);
+  const severityBar = severityTotal
+    ? `<div class="dist-bar" role="img" aria-label="风险等级分布：${severityOrder.map((k) => `${RISK[k]}风险 ${num(bySeverity[k])} 条`).join("，")}">
+        ${severityOrder.map((key) => {
+          const value = num(bySeverity[key]);
+          if (!value) return "";
+          return `<span class="dist-seg seg-${key}" style="flex:${value}" title="${RISK[key]}风险 ${value} 条"></span>`;
+        }).join("")}
+      </div>`
+    : `<div class="muted small">暂无风险数据</div>`;
+  const severityLegend = severityOrder.map((key) => `
+    <span class="dist-legend"><i class="dot seg-${key}"></i>${RISK[key]}风险 <b>${num(bySeverity[key])}</b></span>`).join("");
+
+  const byReview = risk.by_review_status || {};
+  const reviewOrder = ["pending", "confirmed", "excluded", "undecided"];
+  const reviewTotal = reviewOrder.reduce((sum, key) => sum + num(byReview[key]), 0);
+  const reviewedCount = num(byReview.confirmed) + num(byReview.excluded) + num(byReview.undecided);
+  const reviewedPercent = reviewTotal ? Math.round((reviewedCount / reviewTotal) * 100) : 0;
+
+  const typeRows = Object.entries(risk.by_type || {}).map(([key, value]) => `
+    <div class="dist-row">
+      <span class="dist-row-label">${icon(typeIcons[key] || "layers")}${TYPE[key] || key}</span>
+      <span class="dist-row-value">${num(value)}</span>
+    </div>`).join("");
 
   main.innerHTML = `
     <div class="page-head">
       <div>
         <h1>工作台</h1>
-        <div class="sub">全局项目统计、待办事项与风险概况</div>
+        <div class="sub">待办优先：先处理需要你决策的事项，再看全局统计</div>
       </div>
       <button class="btn" id="refresh-workbench">${icon("refresh")}刷新</button>
     </div>
 
-    <div class="grid cols-5">${statCards}</div>
-
-    <div class="card">
-      <h2>待办事项</h2>
-      ${todoRows ? `<table><thead><tr><th>类型</th><th>所属项目</th><th>事项</th><th class="opt">创建时间</th><th>状态</th><th>操作</th></tr></thead><tbody>${todoRows}</tbody></table>`
-        : `<div class="empty">暂无待办事项。</div>`}
+    <div class="kpi-strip">
+      <button type="button" class="kpi" data-stat="evidence_pending_review">
+        <span class="kpi-label">待审核证据</span>
+        <span class="kpi-value tone-high">${num(stats.evidence_pending_review)}</span>
+        <span class="kpi-foot">需要人工给出结论</span>
+      </button>
+      <button type="button" class="kpi" data-stat="project_active">
+        <span class="kpi-label">进行中项目</span>
+        <span class="kpi-value">${num(stats.project_active)}</span>
+        <span class="kpi-foot">共 ${num(stats.project_total)} 个项目</span>
+      </button>
+      <button type="button" class="kpi" data-stat="evidence_total">
+        <span class="kpi-label">异常证据总数</span>
+        <span class="kpi-value">${num(stats.evidence_total)}</span>
+        <span class="kpi-foot">已审 ${reviewedPercent}%</span>
+      </button>
+      <button type="button" class="kpi" data-stat="task_completed">
+        <span class="kpi-label">已完成分析任务</span>
+        <span class="kpi-value">${num(stats.task_completed)}</span>
+        <span class="kpi-foot">累计比对次数</span>
+      </button>
     </div>
 
     <div class="card">
-      <h2>最近项目</h2>
-      ${projectRows ? `<table><thead><tr><th>项目</th><th>状态</th><th class="opt">企业数</th><th class="opt">最近分析</th><th>待审核</th><th>操作</th></tr></thead><tbody>${projectRows}</tbody></table>`
+      <div class="card-head">
+        <h2>待办事项</h2>
+        <span class="small muted">${(data.todos || []).length} 项待处理</span>
+      </div>
+      ${todoRows ? `<div class="table-scroll"><table><thead><tr><th>类型</th><th>所属项目</th><th>事项</th><th class="col-secondary">创建时间</th><th>状态</th><th>操作</th></tr></thead><tbody>${todoRows}</tbody></table></div>`
+        : `<div class="empty">暂无待办事项。项目资料齐备后，系统会自动开始比对。</div>`}
+    </div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="card-head"><h2>风险等级分布</h2><span class="small muted">共 ${severityTotal} 条</span></div>
+        ${severityBar}
+        <div class="dist-legend-row">${severityLegend}</div>
+        <div class="card-head" style="margin-top:18px"><h2>按维度</h2></div>
+        ${typeRows || `<div class="muted small">暂无数据</div>`}
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>审核进度</h2><span class="small muted">已审 ${reviewedCount} / ${reviewTotal}</span></div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="${reviewTotal}" aria-valuenow="${reviewedCount}" aria-label="证据审核进度">
+          <div class="progress-fill" style="width:${reviewedPercent}%"></div>
+        </div>
+        <div class="dist-legend-row">
+          ${reviewOrder.map((key) => `<span class="dist-legend"><i class="dot rev-${key}"></i>${REVIEW[key]} <b>${num(byReview[key])}</b></span>`).join("")}
+        </div>
+        <div class="small muted" style="margin-top:12px">
+          ${num(byReview.pending) ? `还有 ${num(byReview.pending)} 条证据没有结论，<a href="#/risks?review_status=pending">去逐条处理 →</a>` : "所有证据都已给出结论。"}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>最近项目</h2><a class="small" href="#/projects">全部项目 →</a></div>
+      ${projectRows ? `<div class="table-scroll"><table><thead><tr><th>项目</th><th>状态</th><th class="col-secondary">企业数</th><th class="col-secondary">最近分析</th><th>待审核</th><th>操作</th></tr></thead><tbody>${projectRows}</tbody></table></div>`
         : `<div class="empty">暂无项目。</div>`}
     </div>
 
     <div class="card" id="recent-tasks">
-      <h2>最近分析任务</h2>
-      ${taskRows ? `<table><thead><tr><th>任务</th><th>项目</th><th>企业数</th><th>创建</th><th class="opt">完成</th><th>状态</th><th class="opt">算法版本</th><th class="opt">规则版本</th><th>操作</th></tr></thead><tbody>${taskRows}</tbody></table>`
+      <div class="card-head"><h2>最近分析任务</h2></div>
+      ${taskRows ? `<div class="table-scroll"><table><thead><tr><th>任务</th><th>项目</th><th>企业数</th><th>创建</th><th class="col-secondary">完成</th><th>状态</th><th class="col-secondary">算法版本</th><th class="col-secondary">规则版本</th><th>操作</th></tr></thead><tbody>${taskRows}</tbody></table></div>`
         : `<div class="empty">暂无分析任务。</div>`}
-    </div>
-
-    <div class="card">
-      <h2>风险统计</h2>
-      <div class="grid cols-3" style="margin-bottom:14px">${typeCards}</div>
-      <div class="grid cols-4" style="margin-bottom:14px">${severityCards}</div>
-      <div class="grid cols-4">${reviewCards}</div>
     </div>`;
 
   $$("[data-stat]").forEach((card) => card.addEventListener("click", () => {
@@ -1769,13 +1882,13 @@ async function renderRisks(params) {
       <td><input type="checkbox" data-evidence-check="${esc(item.id)}" aria-label="选择证据 ${esc(item.evidence_code)}"></td>
       <td class="mono small nowrap">${esc(item.evidence_code)}</td>
       <td class="risk-project"><a href="#/projects/${esc(item.project_id)}">${esc(item.project_name)}</a></td>
-      <td class="opt">#${num(item.task_no)}</td>
+      <td class="col-secondary">#${num(item.task_no)}</td>
       <td>${pill(item.evidence_type, item.evidence_type_label)}</td>
       <td class="risk-companies">${esc((item.companies || []).join("、"))}</td>
       <td>${riskPill(item.severity)}</td>
-      <td class="opt">${fmtDate(item.created_at)}</td>
+      <td class="col-secondary">${fmtDate(item.created_at)}</td>
       <td>${pill(item.review_status, item.review_status_label)}</td>
-      <td class="opt">${esc(item.reviewer_name || "—")}</td>
+      <td class="col-secondary">${esc(item.reviewer_name || "—")}</td>
       <td class="nowrap">
         <button class="btn small" data-risk-detail="${esc(item.id)}">详情</button>
         <a class="btn small" href="${esc(item.viewer_link)}">三栏比对</a>
@@ -1792,8 +1905,9 @@ async function renderRisks(params) {
       </div>
     </div>
 
-    <div class="card">
-      <div class="row">
+    <div class="card filter-bar">
+      <div class="filter-group">
+        <span class="filter-label">范围</span>
         <select id="risk-project" aria-label="按项目筛选">
           <option value="">全部项目</option>
           ${filters.projects.map((project) => `<option value="${esc(project.id)}" ${riskListState.project_id === project.id ? "selected" : ""}>${esc(project.project_name)}</option>`).join("")}
@@ -1802,6 +1916,9 @@ async function renderRisks(params) {
           <option value="">全部企业</option>
           ${companyOptions.map((company) => `<option value="${esc(company.company_id)}" ${riskListState.company_id === company.company_id ? "selected" : ""}>${esc(company.company_name)}</option>`).join("")}
         </select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">线索</span>
         <select id="risk-type" aria-label="按证据类型筛选">
           <option value="">全部类型</option>
           ${Object.entries(TYPE).map(([value, label]) => `<option value="${value}" ${riskListState.evidence_type === value ? "selected" : ""}>${label}</option>`).join("")}
@@ -1810,6 +1927,9 @@ async function renderRisks(params) {
           <option value="">全部等级</option>
           ${Object.entries(RISK).map(([value, label]) => `<option value="${value}" ${riskListState.severity === value ? "selected" : ""}>${label}</option>`).join("")}
         </select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">审核</span>
         <select id="risk-review" aria-label="按审核状态筛选">
           <option value="">全部审核状态</option>
           ${Object.entries(REVIEW).map(([value, label]) => `<option value="${value}" ${riskListState.review_status === value ? "selected" : ""}>${label}</option>`).join("")}
@@ -1818,8 +1938,13 @@ async function renderRisks(params) {
           <option value="">全部审核人</option>
           ${(filters.reviewers || []).map((reviewer) => `<option value="${esc(reviewer.id)}" ${riskListState.reviewer_id === reviewer.id ? "selected" : ""}>${esc(reviewer.name)}</option>`).join("")}
         </select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">时间</span>
         <input type="date" id="risk-from" aria-label="发现时间起" value="${esc(riskListState.date_from)}" title="发现时间起">
         <input type="date" id="risk-to" aria-label="发现时间止" value="${esc(riskListState.date_to)}" title="发现时间止">
+      </div>
+      <div class="filter-actions">
         <button class="btn primary" id="risk-query">${icon("filter")}查询</button>
         <button class="btn" id="risk-reset">${icon("refresh")}重置</button>
       </div>
@@ -1831,12 +1956,14 @@ async function renderRisks(params) {
         <span class="small muted" id="risk-selected">已选 0 条</span>
         <span class="spacer"></span>
         <button class="btn small primary" id="risk-batch" disabled>批量标记为待进一步核查</button>
-        <button class="btn small" disabled title="V1.0 不支持批量确认或批量排除">批量确认（不支持）</button>
-        <button class="btn small" disabled title="V1.0 不支持批量确认或批量排除">批量排除（不支持）</button>
+        <button class="btn small" id="risk-export">${icon("download")}导出当前筛选结果</button>
+      </div>
+      <div class="small muted" style="margin:-4px 0 12px">
+        批量确认 / 批量排除按审计要求不提供：每条证据的结论必须逐条给出并写明依据。
       </div>
       ${rows ? `<div class="table-scroll"><table><thead><tr>
-          <th style="width:32px"></th><th>证据编号</th><th>所属项目</th><th class="opt">任务</th><th>证据类型</th>
-          <th>涉及企业</th><th>风险等级</th><th class="opt">发现时间</th><th>审核状态</th><th class="opt">审核人</th><th>操作</th>
+          <th style="width:32px"></th><th>证据编号</th><th>所属项目</th><th class="col-secondary">任务</th><th>证据类型</th>
+          <th>涉及企业</th><th>风险等级</th><th class="col-secondary">发现时间</th><th>审核状态</th><th class="col-secondary">审核人</th><th>操作</th>
         </tr></thead><tbody>${rows}</tbody></table></div>`
         : `<div class="empty">没有符合条件的证据。</div>`}
       <div class="row" style="margin-top:12px">
@@ -1901,6 +2028,38 @@ async function renderRisks(params) {
   });
 
   $$("[data-risk-detail]").forEach((button) => button.addEventListener("click", () => openRiskDetail(button.dataset.riskDetail)));
+
+  /* 导出：后端报告是项目级的，先让用户确认导出哪个项目，
+     避免导出一个「看不出筛选口径」的文件。 */
+  const exportBtn = $("#risk-export");
+  exportBtn?.addEventListener("click", () => {
+    const projectId = riskListState.project_id;
+    if (!projectId) {
+      toast("请先在上方选择「所属项目」再导出：报告按项目生成。", "error");
+      return;
+    }
+    const projectName = (filters.projects || []).find((project) => project.id === projectId)?.project_name || "项目";
+    const scope = [
+      riskListState.evidence_type && `类型：${TYPE[riskListState.evidence_type] || riskListState.evidence_type}`,
+      riskListState.severity && `等级：${RISK[riskListState.severity] || riskListState.severity}`,
+      riskListState.review_status && `审核：${REVIEW[riskListState.review_status] || riskListState.review_status}`,
+      riskListState.company_id && "已限定企业",
+      (riskListState.date_from || riskListState.date_to) && `时间：${riskListState.date_from || "不限"} 至 ${riskListState.date_to || "不限"}`,
+    ].filter(Boolean).join("；") || "全部证据";
+    if (!confirm(`将导出「${projectName}」的项目分析报告（含当前任务的全部证据）。\n\n当前筛选：${scope}\n\n报告为项目级汇总，不会只包含被筛出的条目。确认导出？`)) return;
+    withBusy(exportBtn, async () => {
+      try {
+        const blob = await api(`/projects/${projectId}/reports/excel`, { blob: true });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${projectName}-分析报告.xlsx`;
+        document.body.appendChild(link); link.click(); link.remove();
+        URL.revokeObjectURL(url);
+        toast("报告已导出", "success");
+      } catch (error) { toast(error.message, "error"); }
+    }, "生成中…");
+  });
 }
 
 async function openRiskDetail(evidenceId) {
@@ -2010,6 +2169,81 @@ function ruleParamValue(value) {
   return String(value ?? "—");
 }
 
+/* 参数说明：告诉审核员这个数字往哪个方向调是「更严」，以及单位。
+   没有方向说明时，一次阈值调整在事后无法复核。 */
+const RULE_PARAM_HINT = {
+  text_similarity: "0–1，调高 = 更严（更少但更确定的雷同命中）",
+  text_min_match_chars: "字符数，调高 = 更严（忽略短匹配）",
+  text_min_block_chars: "字符数，低于该长度的文本块不参与比对",
+  text_chunk_target_min: "字符数，文本块切分目标下限",
+  text_chunk_target_max: "字符数，文本块切分目标上限",
+  text_chunk_max_chars: "字符数，单个文本块硬上限",
+  text_chunk_min_chars: "字符数，低于该长度的块被丢弃",
+  text_shingle_size: "字符级 n-gram 长度，中文建议 3",
+  text_minhash_num_perm: "签名数，越大越精确、越慢",
+  text_lsh_threshold: "0–1，调低 = 召回更多候选（更慢、更宽）",
+  max_candidate_pairs: "候选块对上限，超出后按相似度截断",
+  max_matches_per_pair: "每组企业保留的匹配条数上限",
+  tender_exclusion_ratio: "0–1，命中招标文件该比例即视为公共内容",
+  risk_text_high_count: "条数，达到即判高风险",
+  risk_text_high_similarity: "0–1，相似度达到即判高风险",
+  risk_text_medium_count: "条数，达到即判中风险",
+  risk_text_medium_similarity: "0–1，相似度达到即判中风险",
+  similar_name_ratio: "0–1，姓名相似度达到即视为疑似同名",
+  name_match_modes: "可选 exact / similar",
+  key_positions: "关键岗位名单，命中时风险加权",
+  risk_personnel_high_count: "人数，达到即判高风险",
+  risk_personnel_medium_count: "人数，达到即判中风险",
+  price_cv: "变异系数，调低 = 更严（更易触发报价集中）",
+  price_close_deviation: "偏差率，报价间距小于该值视为过近",
+  price_sequence_tolerance: "公差相对误差，判断等差分布用",
+  special_tail: "需要关注的尾数取值，如 0 / 8",
+  tail_concentration_min_count: "家数，达到即判尾数集中",
+  amount_case_consistency: "启用后比对大写与小写金额是否一致",
+  id_card_match: "启用后按身份证号判重",
+  certificate_match: "启用后按证书编号判重",
+  title_filter: "启用后过滤「先生 / 女士」等称谓再比对",
+};
+
+function ruleParamHint(key) {
+  return RULE_PARAM_HINT[key] || "";
+}
+
+/* 数值参数的安全区间。缺省时按当前值推断，保证合法输入不受影响。 */
+const RULE_PARAM_BOUND = {
+  text_similarity: { min: 0, max: 1, step: 0.01 },
+  text_lsh_threshold: { min: 0, max: 1, step: 0.01 },
+  tender_exclusion_ratio: { min: 0, max: 1, step: 0.01 },
+  price_cv: { min: 0, max: 1, step: 0.001 },
+  price_close_deviation: { min: 0, max: 1, step: 0.001 },
+  price_sequence_tolerance: { min: 0, max: 1, step: 0.001 },
+  similar_name_ratio: { min: 0, max: 1, step: 0.01 },
+  risk_text_high_similarity: { min: 0, max: 1, step: 0.01 },
+  risk_text_medium_similarity: { min: 0, max: 1, step: 0.01 },
+  text_min_match_chars: { min: 1, max: 5000, step: 1 },
+  text_min_block_chars: { min: 1, max: 5000, step: 1 },
+  text_chunk_target_min: { min: 1, max: 10000, step: 1 },
+  text_chunk_target_max: { min: 1, max: 10000, step: 1 },
+  text_chunk_max_chars: { min: 1, max: 20000, step: 1 },
+  text_chunk_min_chars: { min: 1, max: 5000, step: 1 },
+  text_shingle_size: { min: 1, max: 10, step: 1 },
+  text_minhash_num_perm: { min: 16, max: 1024, step: 16 },
+  max_candidate_pairs: { min: 1, max: 1000000, step: 100 },
+  max_matches_per_pair: { min: 1, max: 10000, step: 1 },
+  risk_text_high_count: { min: 0, max: 1000, step: 1 },
+  risk_text_medium_count: { min: 0, max: 1000, step: 1 },
+  risk_personnel_high_count: { min: 0, max: 1000, step: 1 },
+  risk_personnel_medium_count: { min: 0, max: 1000, step: 1 },
+  tail_concentration_min_count: { min: 0, max: 100, step: 1 },
+};
+
+function ruleParamBound(key, value) {
+  const bound = RULE_PARAM_BOUND[key];
+  if (bound) return bound;
+  const magnitude = Math.max(Math.abs(Number(value) || 0), 1);
+  return { min: 0, max: magnitude * 100, step: Number.isInteger(value) ? 1 : 0.01 };
+}
+
 async function renderSystemRules(container) {
   const data = await api("/system/rules");
   const versionsByDimension = {};
@@ -2067,18 +2301,23 @@ function openRuleVersionModal(dimension) {
   if (!dimension) return;
   const active = dimension.active;
   const params = active ? active.params : dimension.default_params;
+  /* 参数键必须走 data-key：value 属性承载的是参数「值」，
+     用它当键会把 {text_similarity: 0.6} 提交成 {"0.6": 0.6}，阈值被静默写坏。 */
   const fields = Object.entries(params || {}).map(([key, value]) => {
     const label = ruleParamLabel(key);
+    const hint = ruleParamHint(key);
+    const hintHtml = hint ? `<span class="field-hint">${esc(hint)}</span>` : "";
     if (typeof value === "boolean") {
-      return `<label class="small">${esc(label)}<input type="checkbox" name="param" value="${esc(key)}" ${value ? "checked" : ""}></label>`;
+      return `<label class="small"><span class="check-line"><input type="checkbox" name="param" data-key="${esc(key)}" ${value ? "checked" : ""}> ${esc(label)}</span>${hintHtml}</label>`;
     }
     if (Array.isArray(value)) {
-      return `<label class="small">${esc(label)}（逗号分隔）<input type="text" name="param" value="${esc(value.join(","))}" data-kind="list"></label>`;
+      return `<label class="small">${esc(label)}（逗号分隔）<input type="text" name="param" data-key="${esc(key)}" value="${esc(value.join(","))}" data-kind="list">${hintHtml}</label>`;
     }
     if (typeof value === "number") {
-      return `<label class="small">${esc(label)}<input type="number" step="any" name="param" value="${esc(value)}" data-kind="number"></label>`;
+      const bound = ruleParamBound(key, value);
+      return `<label class="small">${esc(label)}<input type="number" step="${bound.step}" min="${bound.min}" max="${bound.max}" name="param" data-key="${esc(key)}" value="${esc(value)}" data-kind="number">${hintHtml}</label>`;
     }
-    return `<label class="small">${esc(label)}<input type="text" name="param" value="${esc(value)}"></label>`;
+    return `<label class="small">${esc(label)}<input type="text" name="param" data-key="${esc(key)}" value="${esc(value)}">${hintHtml}</label>`;
   }).join("");
 
   const modal = openModal({
@@ -2099,22 +2338,62 @@ function openRuleVersionModal(dimension) {
   const collect = () => {
     const result = {};
     $$("[name=param]", modal.root).forEach((input) => {
-      const key = input.value;
+      /* 键来自 data-key，绝不能用 input.value（那是参数值） */
+      const key = input.dataset.key;
+      if (!key) return;
       if (input.type === "checkbox") { result[key] = input.checked; return; }
-      if (input.dataset.kind === "number") { result[key] = Number(input.value); return; }
-      if (input.dataset.kind === "list") { result[key] = input.value.split(",").map((item) => item.trim()).filter(Boolean); return; }
+      if (input.dataset.kind === "number") {
+        /* 空输入不再静默变成 0，交给 validate() 拦截 */
+        const raw = String(input.value ?? "").trim();
+        result[key] = raw === "" ? null : Number(raw);
+        return;
+      }
+      if (input.dataset.kind === "list") {
+        result[key] = input.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean);
+        return;
+      }
       result[key] = input.value;
     });
     return result;
   };
+
+  /* 提交前逐项校验：空值、非数值、越界都当场指出，不让坏阈值落库 */
+  const validate = (payload) => {
+    const problems = [];
+    $$("[name=param]", modal.root).forEach((input) => {
+      const key = input.dataset.key;
+      if (!key) return;
+      const label = ruleParamLabel(key);
+      if (input.dataset.kind === "number") {
+        const value = payload[key];
+        if (value === null || value === undefined || value === "" || Number.isNaN(value)) {
+          problems.push(`「${label}」不能为空`);
+          return;
+        }
+        const bound = ruleParamBound(key, value);
+        if (value < bound.min || value > bound.max) {
+          problems.push(`「${label}」应在 ${bound.min}–${bound.max} 之间`);
+        }
+      } else if (input.dataset.kind === "list") {
+        if (!Array.isArray(payload[key]) || payload[key].length === 0) {
+          problems.push(`「${label}」至少填写一项`);
+        }
+      }
+    });
+    return problems;
+  };
+
   const save = async (activate) => {
     const reason = $("#rule-reason", modal.root)?.value || "";
     if (!reason.trim()) { toast("请填写修改原因", "error"); return; }
     if (activate && !$("#rule-confirm", modal.root)?.checked) { toast("生效需要勾选生效确认", "error"); return; }
+    const payload = collect();
+    const problems = validate(payload);
+    if (problems.length) { toast(problems.slice(0, 2).join("；"), "error"); return; }
     try {
       await api("/system/rules/versions", {
         method: "POST",
-        body: { dimension: dimension.dimension, params: collect(), change_reason: reason, activate, confirmed: activate },
+        body: { dimension: dimension.dimension, params: payload, change_reason: reason, activate, confirmed: activate },
       });
       toast(activate ? "规则版本已生效" : "规则版本已保存为待生效", "success");
       modal.close();
@@ -2134,12 +2413,18 @@ async function renderSystemLogs(container, isAdmin) {
   }
   container.innerHTML = skeletonBlock(6);
   const params = new URLSearchParams();
-  Object.entries(logFilterState).forEach(([key, value]) => { if (value) params.set(key, value); });
-  params.set("page_size", "50");
+  Object.entries(logFilterState).forEach(([key, value]) => {
+    if (key === "page" || key === "page_size") return;
+    if (value) params.set(key, value);
+  });
+  const logPageSize = 50;
+  params.set("page", String(logFilterState.page || 1));
+  params.set("page_size", String(logPageSize));
   const [options, data] = await Promise.all([
     api("/system/log-options"),
     api(`/system/logs?${params.toString()}`),
   ]);
+  const logTotalPages = Math.max(1, Math.ceil(num(data.total) / logPageSize));
   const rows = (data.items || []).map((item) => `
     <tr>
       <td>${esc(item.actor_name || "—")}</td>
@@ -2179,12 +2464,21 @@ async function renderSystemLogs(container, isAdmin) {
       ${rows ? `<div class="table-scroll"><table><thead><tr>
         <th>操作人</th><th>操作时间</th><th>操作类型</th><th>操作对象</th><th>操作结果</th><th>操作来源</th><th>变更前后</th>
       </tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="empty">暂无操作日志。</div>`}
-      <div class="row" style="margin-top:12px"><span class="small muted">共 ${num(data.total)} 条</span></div>
+      <div class="row" style="margin-top:12px">
+        <span class="small muted">第 ${num(data.page) || 1} / ${logTotalPages} 页，共 ${num(data.total)} 条</span>
+        <span class="spacer"></span>
+        <button class="btn small" id="log-prev" ${(num(data.page) || 1) <= 1 ? "disabled" : ""}>上一页</button>
+        <button class="btn small" id="log-next" ${(num(data.page) || 1) >= logTotalPages ? "disabled" : ""}>下一页</button>
+      </div>
     </div>`;
 
   const bind = (selector, key) => {
     const element = $(selector);
-    if (element) element.addEventListener("change", () => { logFilterState[key] = element.value; });
+    if (element) element.addEventListener("change", () => {
+      logFilterState[key] = element.value;
+      logFilterState.page = 1;
+      renderSystemLogs(container, isAdmin);
+    });
   };
   bind("#log-action", "action");
   bind("#log-result", "result");
@@ -2194,8 +2488,16 @@ async function renderSystemLogs(container, isAdmin) {
   bind("#log-to", "date_to");
   const logQueryBtn = $("#log-query");
   logQueryBtn.addEventListener("click", () => withBusy(logQueryBtn, () => renderSystemLogs(container, isAdmin), "查询中…"));
+  $("#log-prev")?.addEventListener("click", () => {
+    logFilterState.page = Math.max(1, (num(data.page) || 1) - 1);
+    renderSystemLogs(container, isAdmin);
+  });
+  $("#log-next")?.addEventListener("click", () => {
+    logFilterState.page = Math.min(logTotalPages, (num(data.page) || 1) + 1);
+    renderSystemLogs(container, isAdmin);
+  });
   $("#log-reset").addEventListener("click", () => {
-    logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "" };
+    logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "", page: 1, page_size: 50 };
     renderSystemLogs(container, isAdmin);
   });
 }

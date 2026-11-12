@@ -62,12 +62,12 @@
         <form id="login-form" novalidate>
           <div class="form-row">
             <label for="login-username">用户名</label>
-            <input id="login-username" name="username" value="admin" autocomplete="username" required />
+            <input id="login-username" name="username" autocomplete="username" required />
           </div>
           <div class="form-row">
             <label for="login-password">密码</label>
             <div class="password-field">
-              <input id="login-password" name="password" type="password" value="admin123" autocomplete="current-password" required />
+              <input id="login-password" name="password" type="password" autocomplete="current-password" required />
               <button type="button" class="icon-btn password-toggle" id="password-toggle" aria-label="显示密码" aria-pressed="false">
                 <svg class="icon" aria-hidden="true"><use href="#i-eye"></use></svg>
               </button>
@@ -75,7 +75,9 @@
           </div>
           <p id="login-error" class="form-error" role="alert" hidden></p>
           <button class="btn primary block" type="submit">登录系统</button>
-          <p class="hint">默认账号 admin / admin123，可在 .env 中修改</p>
+          <p class="hint">账号由系统管理员分配；初始口令见部署配置的 .env。</p>
+          <!-- 免责声明在小屏（hero 隐藏）时仍需可见，见 .login-note-inline -->
+          <p class="login-note login-note-inline"><svg class="icon" aria-hidden="true"><use href="#i-info"></use></svg>系统输出为疑似异常线索，不构成围标串标认定结论。</p>
         </form>
       </section>
 
