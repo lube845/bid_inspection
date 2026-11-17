@@ -10,7 +10,7 @@ from app.models import (
     LogicalDocumentVersion,
     OriginalFile,
 )
-from app.models.enums import FileKind, FileParseStatus, LogicalDocStatus
+from app.models.enums import FileKind, LogicalDocStatus
 
 
 def active_company_files(db: Session, company_id: str) -> list[OriginalFile]:
@@ -145,13 +145,3 @@ def logical_document_preview(db: Session, company: Company, include_pages: bool 
         "total_pages": version.total_pages if version else 0,
         "items": items_payload,
     }
-
-
-def count_unparsed_files(db: Session, company_id: str) -> int:
-    files = active_company_files(db, company_id)
-    return sum(
-        1
-        for f in files
-        if f.parse_status
-        not in {FileParseStatus.SUCCESS.value, FileParseStatus.PARTIAL.value}
-    )

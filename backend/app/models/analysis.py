@@ -31,6 +31,9 @@ class AnalysisTask(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     company_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     progress: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # 本次任务使用的模板库片段（id 列表 + 捕获时间）。单独存列而不是塞进
+    # analysis_config：任务详情会把 analysis_config 整个下发，片段列表可能很大。
+    template_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
@@ -99,6 +102,11 @@ class ComparisonPair(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     text_risk: Mapped[str] = mapped_column(String(16), nullable=False, default=RiskLevel.NONE.value)
     personnel_risk: Mapped[str] = mapped_column(String(16), nullable=False, default=RiskLevel.NONE.value)
     price_risk: Mapped[str] = mapped_column(String(16), nullable=False, default=RiskLevel.NONE.value)
+    # 文件级取证：同一份文件被两家提交 / 文档元数据同源。它独立于三个分析维度，
+    # 但必须参与综合风险——否则一条 high 的文件指纹证据会被价格阶段的重算覆盖掉。
+    forensic_risk: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=RiskLevel.NONE.value
+    )
     overall_risk: Mapped[str] = mapped_column(String(16), nullable=False, default=RiskLevel.NONE.value)
     risk_reasons: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[str] = mapped_column(

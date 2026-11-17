@@ -5,7 +5,7 @@ PROD_COMPOSE ?= docker compose -f docker-compose.yml -f docker-compose.prod.yml
 
 .DEFAULT_GOAL := help
 
-.PHONY: help dev prod up down restart logs ps watch rebuild reset test shell db-shell
+.PHONY: help dev prod up down restart logs ps watch rebuild reset test shell db-shell migrate revision stamp schema-check
 
 help: ## 显示可用命令
 	@echo "投标文件智能比对系统 —— 常用命令"
@@ -60,3 +60,17 @@ shell: ## 进入后端容器
 
 db-shell: ## 进入数据库容器
 	$(DEV_COMPOSE) exec db psql -U bid -d bid_inspection
+
+migrate: ## 升级数据库到最新迁移版本
+	$(DEV_COMPOSE) exec api alembic upgrade head
+
+revision: ## 生成迁移脚本（用法：make revision m="描述"）
+	@test -n "$(m)" || (echo "用法：make revision m=\"描述\""; exit 1)
+	$(DEV_COMPOSE) exec api alembic revision --autogenerate -m "$(m)"
+
+stamp: ## 把已有库标记到指定版本（用法：make stamp rev=0001_baseline）
+	@test -n "$(rev)" || (echo "用法：make stamp rev=0001_baseline"; exit 1)
+	$(DEV_COMPOSE) exec api alembic stamp $(rev)
+
+schema-check: ## 检查模型与迁移脚本是否有差异（在容器内跑测试）
+	$(DEV_COMPOSE) exec api pytest -q tests/test_migrations.py

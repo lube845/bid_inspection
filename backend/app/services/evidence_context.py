@@ -28,7 +28,6 @@ from app.models import DocumentBlock, DocumentPage, OriginalFile
 # 默认上下文窗口：命中片段之前 / 之后各 100 字，单侧合计不超过 200 字
 DEFAULT_BEFORE_CHARS = 100
 DEFAULT_AFTER_CHARS = 100
-DEFAULT_CONTEXT_TOTAL = 200
 # 用户主动「展开更多」时的步长
 CONTEXT_STEP_CHARS = 200
 # 服务端允许的单侧上下文上限，避免一次请求返回整份超大文档

@@ -13,3 +13,16 @@ class BatchReviewRequest(BaseModel):
     comment: str | None = Field(default=None, max_length=1000)
     # 默认跳过已有审核结论的证据，避免批量标记覆盖人工判断
     skip_reviewed: bool = Field(default=True)
+
+
+class BatchAssignRequest(BaseModel):
+    evidence_ids: list[str] = Field(min_length=1)
+    # 为空表示取消分派
+    assignee_id: str | None = None
+
+
+class ClusterReviewRequest(BaseModel):
+    evidence_ids: list[str] = Field(min_length=1)
+    status: str = Field(pattern="^(confirmed|excluded|undecided)$")
+    comment: str | None = Field(default=None, max_length=1000)
+    skip_reviewed: bool = Field(default=True)

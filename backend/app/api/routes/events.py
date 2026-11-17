@@ -144,7 +144,9 @@ def project_events_ticket(
     """签发限定到该项目的短期事件流票据（EventSource 无法设置请求头）。"""
     ttl = settings.scoped_ticket_expire_seconds
     return {
-        "ticket": create_scoped_ticket(user.id, "events", project_id, ttl),
+        "ticket": create_scoped_ticket(
+            user.id, "events", project_id, ttl, token_version=user.token_version or 0
+        ),
         "expires_in": ttl,
     }
 

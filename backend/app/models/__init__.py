@@ -16,9 +16,11 @@ from app.models.logical import (
     LogicalDocumentItem,
     LogicalDocumentVersion,
 )
+from app.models.price import PriceQuote
 from app.models.project import Project
 from app.models.review import AuditLog, ReviewRecord
 from app.models.rule import DetectionRuleVersion
+from app.models.template import TemplateFragment
 from app.models.user import User
 
 __all__ = [
@@ -39,8 +41,10 @@ __all__ = [
     "LogicalDocumentItem",
     "LogicalDocumentVersion",
     "OriginalFile",
+    "PriceQuote",
     "Project",
     "ReviewRecord",
+    "TemplateFragment",
     "TextSimilarityResult",
     "User",
 ]

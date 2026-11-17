@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
@@ -19,6 +19,10 @@ class ReviewRecord(Base, UUIDPrimaryKeyMixin):
     old_status: Mapped[str] = mapped_column(String(16), nullable=False)
     new_status: Mapped[str] = mapped_column(String(16), nullable=False)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 0 撤回 / 1 一审 / 2 二审；旧记录默认 1
+    stage: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # 「排除并记为模板」时记录本次学习到的片段，便于追溯
+    template_fragment_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

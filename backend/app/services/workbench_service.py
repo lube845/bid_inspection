@@ -36,17 +36,9 @@ from app.models.enums import (
     RiskLevel,
     TaskStatus,
 )
-from app.services import project_service
+from app.services import project_service, results_service, task_scope
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "none": 3}
-SEVERITY_LABELS = {
-    RiskLevel.HIGH.value: "高",
-    RiskLevel.MEDIUM.value: "中",
-    RiskLevel.LOW.value: "低",
-    RiskLevel.NONE.value: "无",
-}
-
-
 def summary(
     db: Session,
     project_limit: int = 8,
@@ -74,10 +66,16 @@ def summary(
     task_partial = task_counts.get(TaskStatus.PARTIAL.value, 0)
 
     # ---- 证据统计（注意：全部带 is_current，且不 JOIN participant）--------
+    # 口径限定到每个项目的最新任务：重复分析的历史证据不应继续计入待办，
+    # 否则「最新任务 18 条 / 风险页 87 条」这类矛盾会直接误导工作量判断。
+    latest_scope = task_scope.latest_task_ids(db, project_ids)
     # 项目范围为空时（全部项目已删除）统计结果应为零
     current_filter = and_(
         ComparisonEvidence.is_current.is_(True),
         ComparisonEvidence.project_id.in_(project_ids) if project_ids else false(),
+        ComparisonEvidence.analysis_task_id.in_(list(latest_scope.values()))
+        if latest_scope
+        else false(),
     )
     evidence_total = (
         db.scalar(
@@ -85,11 +83,21 @@ def summary(
         )
         or 0
     )
+    # 待办口径按「流程位置」而不是「结论状态」：一审已完成待二审的证据
+    # 不应继续算在待审核里，否则开启二审后待办数会虚高。
     evidence_pending = (
         db.scalar(
             select(func.count())
             .select_from(ComparisonEvidence)
-            .where(current_filter, ComparisonEvidence.review_status == ReviewStatus.PENDING.value)
+            .where(current_filter, ComparisonEvidence.review_stage == 0)
+        )
+        or 0
+    )
+    evidence_awaiting_second = (
+        db.scalar(
+            select(func.count())
+            .select_from(ComparisonEvidence)
+            .where(current_filter, ComparisonEvidence.review_stage == 1)
         )
         or 0
     )
@@ -97,10 +105,11 @@ def summary(
     by_severity = _count_by(db, ComparisonEvidence.severity, current_filter)
     by_review = _count_by(db, ComparisonEvidence.review_status, current_filter)
     by_project = _count_by(db, ComparisonEvidence.project_id, current_filter)
+    pending_filter = and_(current_filter, ComparisonEvidence.review_stage == 0)
     pending_by_project = dict(
         db.execute(
             select(ComparisonEvidence.project_id, func.count())
-            .where(current_filter, ComparisonEvidence.review_status == ReviewStatus.PENDING.value)
+            .where(pending_filter)
             .group_by(ComparisonEvidence.project_id)
         ).all()
     )
@@ -110,7 +119,14 @@ def summary(
                 ComparisonEvidence.project_id,
                 func.max(ComparisonEvidence.created_at),
             )
-            .where(current_filter, ComparisonEvidence.review_status == ReviewStatus.PENDING.value)
+            .where(pending_filter)
+            .group_by(ComparisonEvidence.project_id)
+        ).all()
+    )
+    awaiting_second_by_project = dict(
+        db.execute(
+            select(ComparisonEvidence.project_id, func.count())
+            .where(and_(current_filter, ComparisonEvidence.review_stage == 1))
             .group_by(ComparisonEvidence.project_id)
         ).all()
     )
@@ -197,6 +213,19 @@ def summary(
     }
 
     # ---- 待办清单 ---------------------------------------------------------
+    # 「上次已排除、本次重新出现」需要逐项目对比最近两个任务，成本较高；
+    # 这里只在最近任务已完成时计算一次，失败则按 0 处理，不影响其他待办。
+    reappeared_by_project: dict[str, int] = {}
+    for project in projects:
+        last_task = latest_task_by_project.get(project.id)
+        if last_task is None or last_task.status not in {"completed", "partial"}:
+            continue
+        try:
+            diff = results_service.task_diff(db, project, last_task.id)
+            reappeared_by_project[project.id] = len(diff["evidences"]["reappeared"])
+        except Exception:
+            reappeared_by_project[project.id] = 0
+
     todos: list[dict] = []
     for project in projects:
         last_task = latest_task_by_project.get(project.id)
@@ -207,6 +236,8 @@ def summary(
             "last_task": last_task,
             "pending_review_count": pending_by_project.get(project.id, 0),
             "pending_review_at": pending_at_by_project.get(project.id),
+            "awaiting_second_review_count": awaiting_second_by_project.get(project.id, 0),
+            "reappeared_evidence_count": reappeared_by_project.get(project.id, 0),
             "exported": project.id in exported_projects,
         }
         todos.extend(project_service.collect_todos(db, project, ctx=ctx))
@@ -237,6 +268,7 @@ def summary(
                     (last_task.finished_at or last_task.created_at) if last_task else None
                 ),
                 "pending_review_count": pending_by_project.get(project.id, 0),
+                "awaiting_second_review_count": awaiting_second_by_project.get(project.id, 0),
                 "evidence_count": by_project.get(project.id, 0),
                 "updated_at": project.updated_at,
                 "link": f"#/projects/{project.id}",
@@ -300,6 +332,7 @@ def summary(
             "task_partial": task_partial,
             "evidence_total": evidence_total,
             "evidence_pending_review": evidence_pending,
+            "evidence_awaiting_second_review": evidence_awaiting_second,
         },
         "todos": todos,
         "recent_projects": recent_projects,
@@ -309,6 +342,8 @@ def summary(
                 EvidenceType.TEXT.value: by_type.get(EvidenceType.TEXT.value, 0),
                 EvidenceType.PERSONNEL.value: by_type.get(EvidenceType.PERSONNEL.value, 0),
                 EvidenceType.PRICE.value: by_type.get(EvidenceType.PRICE.value, 0),
+                EvidenceType.FILE.value: by_type.get(EvidenceType.FILE.value, 0),
+                EvidenceType.METADATA.value: by_type.get(EvidenceType.METADATA.value, 0),
             },
             "by_severity": {
                 level: by_severity.get(level, 0)

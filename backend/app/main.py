@@ -12,6 +12,7 @@ from app.api.routes import (
     events,
     files,
     projects,
+    quotes,
     results,
     risks,
     system,
@@ -108,6 +109,7 @@ app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(projects.router, prefix=settings.api_prefix)
 app.include_router(companies.router, prefix=settings.api_prefix)
 app.include_router(files.router, prefix=settings.api_prefix)
+app.include_router(quotes.router, prefix=settings.api_prefix)
 app.include_router(analysis.router, prefix=settings.api_prefix)
 app.include_router(results.router, prefix=settings.api_prefix)
 app.include_router(events.router, prefix=settings.api_prefix)

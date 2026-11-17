@@ -1,4 +1,6 @@
-from sqlalchemy import JSON, ForeignKey, String, Text
+from datetime import datetime
+
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -37,6 +39,26 @@ class ComparisonEvidence(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     # 重跑企业组合时保留旧证据用于追溯，只将 is_current 置为 False
     is_current: Mapped[bool] = mapped_column(default=True, nullable=False, index=True)
+
+    # ---- 证据聚类（线索） ----
+    # 同一段落的多处命中合成一条线索。cluster_id 由文本块对决定，重跑后可复现；
+    # lead 是代表该线索的那一条证据（严重度最高、命中字数最多）。
+    cluster_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    cluster_size: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    cluster_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cluster_lead_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # exact_chunk_pair | adjacent_continuation
+    cluster_rule: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+
+    # ---- 审核分派 ----
+    assignee_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ---- 二审流程（与 review_status 正交：status 是最新结论，stage 是流程位置） ----
+    # 0 未审 / 1 一审完成待二审 / 2 终审
+    review_stage: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
+    first_reviewer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    first_review_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     pair = relationship("ComparisonPair", back_populates="evidences")
     participants = relationship(

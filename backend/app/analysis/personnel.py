@@ -34,7 +34,11 @@ ROLES = (
     "项目组成员",
 )
 
-_ROLE_ALT = "|".join(ROLES)
+# 岗位（角色）在文本里可能以更短的称谓出现，例如「项目经理」写成「项目负责人」，
+# 或「技术负责人」写作「技术总工」。岗位关键词本身不参与筛选（见 roles 参数），
+# 这里保留一份更宽的词表把人物抽取出来，再由调用方按关键岗位范围过滤。
+_ROLE_ALIASES = ("总工", "技术总监", "安全负责人", "质量负责人", "副总", "负责人")
+_ROLE_ALT = "|".join(sorted({*ROLES, *_ROLE_ALIASES}, key=len, reverse=True))
 _AFTER_ROLE = re.compile(
     rf"({_ROLE_ALT})(?:（[^）]{{0,12}}）)?[ \t]*(?:姓名)?[ \t]*[:：为是]?[ \t]*"
     r"([一-龥]{2,4})(?=\s|$|[,，。；;、）)（(]|\d)"
@@ -96,13 +100,31 @@ def _valid_name(name: str) -> bool:
     return name[0] in _SURNAMES
 
 
-def extract_people(blocks: list[BlockRef]) -> list[PersonOccurrence]:
+def extract_people(
+    blocks: list[BlockRef], key_positions: list[str] | None = None
+) -> list[PersonOccurrence]:
+    """抽取人员出现位置。
+
+    ``key_positions`` 非空时只保留岗位命中这些关键词的人员（子串匹配，例如
+    「项目负责人」命中「负责人」）。它对应规则页的「关键岗位范围」参数——
+    此前该参数只记录不生效，这里把它接到检测引擎。
+    """
+    positions = [p for p in (key_positions or []) if p]
+
+    def role_allowed(role: str) -> bool:
+        if not positions:
+            return True
+        if role == "未标注岗位":
+            # 没标注岗位的姓名无法判断是否属于关键岗位，保守保留
+            return True
+        return any(position in role or role in position for position in positions)
+
     occurrences: list[PersonOccurrence] = []
     seen: set[tuple[str, str, str]] = set()
     for block in blocks:
         for match in _AFTER_ROLE.finditer(block.content):
             role, name = match.group(1), match.group(2)
-            if not _valid_name(name):
+            if not _valid_name(name) or not role_allowed(role):
                 continue
             key = (name, role, block.block_id)
             if key in seen:
@@ -113,7 +135,7 @@ def extract_people(blocks: list[BlockRef]) -> list[PersonOccurrence]:
             )
         for match in _BEFORE_ROLE.finditer(block.content):
             name, role = match.group(1), match.group(2)
-            if not _valid_name(name):
+            if not _valid_name(name) or not role_allowed(role):
                 continue
             key = (name, role, block.block_id)
             if key in seen:

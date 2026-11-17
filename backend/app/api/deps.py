@@ -15,11 +15,21 @@ def _user_from_token(token: str | None, db: Session) -> User:
             headers={"WWW-Authenticate": "Bearer"},
         )
     payload = decode_access_token(token)
-    if not payload or not payload.get("sub"):
+    if (
+        not payload
+        or not payload.get("sub")
+        # scope_ticket 只有限定用途，不能当作登录凭证使用
+        or payload.get("typ") not in (None, "access")
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的登录凭证")
     user = db.get(User, payload["sub"])
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用")
+    # 令牌版本号对不上说明用户已退出登录 / 重置密码 / 被禁用过：旧令牌立即作废
+    if int(payload.get("tv") or 0) != int(user.token_version or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录"
+        )
     return user
 
 
@@ -45,12 +55,12 @@ def get_file_access_user(
     """
     if authorization and authorization.lower().startswith("bearer "):
         return _user_from_token(authorization[7:].strip(), db)
-    subject = decode_scoped_ticket(ticket, "file", file_id)
-    if not subject:
+    payload = decode_scoped_ticket(ticket, "file", file_id)
+    if not payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="访问票据无效或已过期"
         )
-    return _load_active_user(db, subject)
+    return _load_active_user(db, payload["sub"], payload.get("tv"))
 
 
 def get_stream_user(
@@ -58,28 +68,27 @@ def get_stream_user(
     ticket: str | None = Query(default=None, description="SSE 的短期访问票据"),
 ) -> User:
     """SSE 认证：校验限定到项目的短期票据，校验完立即释放数据库连接。"""
-    subject = decode_scoped_ticket(ticket, "events", project_id)
-    if not subject:
+    payload = decode_scoped_ticket(ticket, "events", project_id)
+    if not payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="访问票据无效或已过期"
         )
     db = SessionLocal()
     try:
-        user = db.get(User, subject)
-        if not user or not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用"
-            )
-        return user
+        return _load_active_user(db, payload["sub"], payload.get("tv"))
     finally:
         db.close()
 
 
-def _load_active_user(db: Session, subject: str) -> User:
+def _load_active_user(db: Session, subject: str, token_version=None) -> User:
     user = db.get(User, subject)
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或已禁用"
+        )
+    if token_version is not None and int(token_version) != int(user.token_version or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="访问票据无效或已过期"
         )
     return user
 

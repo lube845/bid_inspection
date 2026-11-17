@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
@@ -32,6 +33,7 @@ from app.analysis.shingling import (
     shingle_set,
 )
 from app.analysis.sources import BlockRef
+from app.analysis.template import TemplateProfile
 from app.analysis.thresholds import text_thresholds
 from app.core.config import settings
 from app.models.enums import EvidenceType, RiskLevel
@@ -45,9 +47,12 @@ _MIN_BLOCK_CONTAINMENT = 0.2
 _MIN_LONG_MATCH_CHARS = 100
 
 ALGORITHM_NAME = "minhash_lsh+jaccard+sequence_matcher"
+# 规范化版本：规则一变，分数就不再与旧规则下的结果同口径，必须升版本区分。
 # norm-v3：忽略字符集补齐纯排版符号（货币、百分号、公式、表格竖线等）。
-# 规范化规则变了，分数就不再与旧规则下的结果同口径，必须升版本区分。
-NORMALIZATION_VERSION = "norm-v3"
+# norm-v4：丢弃零宽/格式控制字符（U+200B 等）与组合标记，并把西里尔/希腊
+#          同形字母映射回拉丁字母——这是「插几个不可见字符绕过查重」的入口
+#          对抗层，文字层与渲染结果在这之后才可比。
+NORMALIZATION_VERSION = "norm-v4"
 
 
 @dataclass
@@ -279,6 +284,8 @@ def match_chunks(
     similarity_floor = float(rules["text_similarity"])
     tender_hashes = tender.hashes if tender else set()
 
+    cross_type_guard = int(rules["text_cross_type_guard_chars"])
+
     shingle_cache: dict[int, set[int]] = {}
     matches: list[TextMatch] = []
     stats = {
@@ -286,7 +293,23 @@ def match_chunks(
         "local_match_count": 0,
         "result_count": 0,
         "block_level_count": 0,
+        # 跨章节类型（如技术标 vs 商务标）的零散命中被判定为噪声而不成证据
+        "cross_type_skipped": 0,
     }
+
+    def cross_type_noise(chunk_a: TextChunk, chunk_b: TextChunk, matched: int) -> bool:
+        """跨章节类型的命中是否需要「长段」才成立。
+
+        同一段套话同时出现在甲公司技术标和乙公司商务标里，多数是通用表述，
+        不是可举证的同源编写；但真正整段搬家（≥ cross_type_guard 字）的情形
+        仍然保留——那反而说明两家连章节归属都抄错了。
+        """
+        if chunk_a.content_type == chunk_b.content_type:
+            return False
+        # 任一侧未能归类时按「同类型」处理，避免因为分类失败而丢证据
+        if "general" in (chunk_a.content_type, chunk_b.content_type):
+            return False
+        return matched < cross_type_guard
 
     for chunk_a, chunk_b, _votes in candidates:
         if len(chunk_a.normalized) < minimum_block or len(chunk_b.normalized) < minimum_block:
@@ -314,6 +337,9 @@ def match_chunks(
                     and similarity.containment < _MIN_BLOCK_CONTAINMENT
                     and matched < _MIN_LONG_MATCH_CHARS
                 ):
+                    continue
+                if cross_type_noise(chunk_a, chunk_b, matched):
+                    stats["cross_type_skipped"] += 1
                     continue
                 stats["local_match_count"] += 1
                 text = chunk_a.normalized[a_start:a_end]
@@ -355,7 +381,11 @@ def match_chunks(
             or similarity.effective_containment >= 0.8
         )
         block_matched = min(len(chunk_a.normalized), len(chunk_b.normalized))
-        if full_pass and block_matched >= int(rules["text_min_match_chars"]):
+        if (
+            full_pass
+            and block_matched >= int(rules["text_min_match_chars"])
+            and not cross_type_noise(chunk_a, chunk_b, block_matched)
+        ):
             text = chunk_a.normalized
             baseline_ratio = tender.coverage_ratio(text) if tender else 0.0
             stats["block_level_count"] += 1
@@ -435,6 +465,34 @@ def _severity(matched: int, local_ratio: float) -> str:
     return RiskLevel.LOW.value
 
 
+# 封面/目录类文本：项目名称、投标人名称、日期、编制人这些都是每家都要写的
+# 通用字段，雷同本身没有信息量。判断口径是「标签堆砌 + 没有成句正文」：
+# 封面由多个字段标签与日期组成，几乎没有句末标点；正文段落则相反。
+_COVER_FIELD_PATTERN = re.compile(
+    r"投标文件|投标人|投标单位|项目名称|工程名称|采购项目|招标编号|项目编号"
+    r"|编制单位|编制人|日期|年月日|正本|副本|标段|包号|封面|投标函|目录"
+)
+_DATE_PATTERN = re.compile(r"[0-9０-９]{2,4}\s*[年．./-]\s*[0-9０-９]{1,2}")
+_SENTENCE_END = re.compile(r"[。！？；]")
+_COVER_MARKER_MIN = 3
+
+
+def _cover_only(text: str) -> bool:
+    """文本是否是封面/目录字段的堆砌（而非成句正文）。"""
+    if not text:
+        return False
+    # 有成句正文的段落不是封面，即使顺带提到了「投标人」「项目名称」
+    if len(_SENTENCE_END.findall(text)) >= 2:
+        return False
+    markers = len(set(_COVER_FIELD_PATTERN.findall(text)))
+    if markers < _COVER_MARKER_MIN:
+        return False
+    # 去掉标签、日期与数字后，剩下的「实质内容」很少
+    stripped = _DATE_PATTERN.sub("", _COVER_FIELD_PATTERN.sub("", text))
+    stripped = re.sub(r"[0-9０-９\s:：\-—_.．、（）()]", "", stripped)
+    return len(stripped) <= 20
+
+
 def _original_intervals(
     chunk: TextChunk, intervals: list[tuple[int, int]]
 ) -> list[dict]:
@@ -462,10 +520,16 @@ def build_text_evidences(
     tender: set[int] | TenderBaseline | None,
     *,
     thresholds: dict | None = None,
+    template: "TemplateProfile | None" = None,
+    library=None,
+    library_ratio: float = 0.8,
 ) -> list[EvidenceDraft]:
     rules = text_thresholds(thresholds)
     baseline = _ensure_baseline(tender, int(rules["text_shingle_size"]))
     exclusion_ratio = float(rules["tender_exclusion_ratio"])
+    template_min_companies = int(rules["template_min_companies"])
+    template_max_info = float(rules["template_max_informativeness"])
+    template_max_chars = int(rules["template_max_chars_guard"])
     num_perm = int(rules["text_minhash_num_perm"])
     lsh_threshold = float(rules["text_lsh_threshold"])
     bands, rows = optimal_bands(num_perm, lsh_threshold)
@@ -520,9 +584,44 @@ def build_text_evidences(
                 )
 
         effective_chars = int(round(match.matched_chars * (1 - local_coverage)))
+        # 批次共同模板：两家以上企业都从行业范本照抄的段落。它既不是招标文件
+        # 公共内容，也不是可证明的串通线索，单独标记为 excluded_by_template，
+        # 与招标对减分开计数，审核人能看到「为什么这条不算数」。
+        excluded_by_template = bool(
+            template is not None
+            and template.is_template(
+                match.chunk_a.chunk_id,
+                match.chunk_b.chunk_id,
+                match.matched_chars,
+                min_companies=template_min_companies,
+                max_informativeness=template_max_info,
+                max_chars_guard=template_max_chars,
+            )
+        )
+        # 经验模板库：审核人确认过的片段。与批次共现是「或」的关系，但同样受
+        # 长段豁免约束（matched_chars >= 200 的整段雷同不能被模板吞掉）。
+        template_source = "batch" if excluded_by_template else ""
+        template_fragment_id = None
+        template_ratio = None
+        if library is not None and match.matched_chars < template_max_chars:
+            # 双侧都要求命中：一侧是套话、另一侧是新内容时不能豁免
+            hit = library.matches(match.text)
+            if hit is not None:
+                other = library.matches(match.chunk_b.normalized[match.b_start:match.b_end])
+                if other is None:
+                    hit = None
+            if hit is not None:
+                template_fragment_id, template_ratio = hit
+                excluded_by_template = True
+                template_source = "library"
         severity = _severity(effective_chars, match.local_ratio)
-        if excluded and severity == RiskLevel.HIGH.value:
+        if (excluded or excluded_by_template) and severity == RiskLevel.HIGH.value:
             severity = RiskLevel.MEDIUM.value
+        # 封面/目录字段（项目名称、投标人、日期…）每家都要写，雷同没有信息量：
+        # 只作为提示保留，不参与风险等级判定。
+        cover_only = _cover_only(local_text) and _cover_only(local_text_b)
+        if cover_only:
+            severity = RiskLevel.LOW.value
 
         summary = (
             f"{match.chunk_a.company_name}《{match.chunk_a.file_name}》"
@@ -560,6 +659,9 @@ def build_text_evidences(
                     "evidence_length": match.a_end - match.a_start,
                     "matched_text": source_a.get("snippet"),
                     "matched_text_b": source_b.get("snippet"),
+                    # 命中片段的规范化全文（snippet 只截 300 字且保留原文标点），
+                    # 「记为模板」需要完整、可复现的文本，否则学到的片段会被截断。
+                    "matched_normalized": match.text,
                     "localization_status": match.localization_status,
                     # 相似区间（原文坐标）：界面据此区分「相似」与「差异」
                     "match_intervals_a": match_intervals_a,
@@ -574,9 +676,32 @@ def build_text_evidences(
                     "excluded_ranges_b": excluded_ranges_b,
                     "excluded_by_tender": excluded,
                     "exclusion_ratio": round(local_coverage, 4),
+                    # 封面/目录字段雷同：提示级，不计入风险
+                    "cover_only": cover_only,
+                    # 批次共同模板：非招标公共内容、但多家都照抄的范本段落
+                    "excluded_by_template": excluded_by_template,
+                    "template_source": template_source,
+                    "template_fragment_id": template_fragment_id,
+                    "template_ratio": template_ratio,
+                    "template_presence": (
+                        template.presence.get(match.chunk_a.chunk_id, 1)
+                        if template is not None
+                        else None
+                    ),
                     # 结构定位
                     "chunk_a_id": match.chunk_a.chunk_id,
                     "chunk_b_id": match.chunk_b.chunk_id,
+                    # 块序号与命中区间端点：聚类判断「相邻续接」需要
+                    "chunk_index_a": match.chunk_a.chunk_index,
+                    "chunk_index_b": match.chunk_b.chunk_index,
+                    "a_start": match.a_start,
+                    "a_end": match.a_end,
+                    "b_start": match.b_start,
+                    "b_end": match.b_end,
+                    "chunk_len_a": len(match.chunk_a.normalized),
+                    "chunk_len_b": len(match.chunk_b.normalized),
+                    "file_a_id": match.chunk_a.file_id,
+                    "file_b_id": match.chunk_b.file_id,
                     "block_a_id": match.chunk_a.first_block.block_id,
                     "block_b_id": match.chunk_b.first_block.block_id,
                     "chapter_a": match.chunk_a.chapter,

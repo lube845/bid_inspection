@@ -212,9 +212,38 @@ def _parse_pdf(path: Path, ocr_provider: OCRProvider | None = None) -> ParsedDoc
     return ParsedDocument(pages=pages)
 
 
+def _table_to_text(table) -> str:
+    """把 DOCX 表格转成「一行一条、单元格用制表符分隔」的文本。
+
+    报价表常以表格形式给出，而 python-docx 的 ``document.paragraphs`` 不包含
+    表格内容——直接读段落会把整张报价表丢掉，价格维度只能靠正文里的落款句
+    兜底。转成文本后，既进入文本相似度比较，也让报价正则有机会从表格里抽到
+    总价（「投标总报价 | 9986000」这类一行一条的写法）。
+
+    合并单元格在 python-docx 里会对同一格返回多次，这里按首次出现去重，
+    避免把「序号/项目名称」这类跨列表头重复拼成噪声。
+    """
+    lines: list[str] = []
+    for row in table.rows:
+        cells: list[str] = []
+        seen: set[str] = set()
+        for cell in row.cells:
+            value = re.sub(r"\s+", " ", cell.text or "").strip()
+            # 同一行里重复的单元格文本来自横向合并，只保留一份
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            cells.append(value)
+        if cells:
+            lines.append("\t".join(cells))
+    return "\n".join(lines)
+
+
 def _parse_docx(path: Path) -> ParsedDocument:
     try:
         from docx import Document
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
     except ImportError as exc:  # pragma: no cover
         raise ParseError("缺少 DOCX 解析依赖 python-docx") from exc
 
@@ -223,8 +252,23 @@ def _parse_docx(path: Path) -> ParsedDocument:
     except Exception as exc:
         raise ParseError(f"DOCX 无法打开: {exc}") from exc
 
-    paragraphs = [p.text for p in document.paragraphs if p.text and p.text.strip()]
-    if not paragraphs:
+    # 按 body 顺序遍历段落与表格：表格必须留在原来的位置，
+    # 否则「表头在前、报价表在后」的文档会被打乱语境。
+    pieces: list[str] = []
+    table_count = 0
+    for child in document.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            text = Paragraph(child, document).text
+            if text and text.strip():
+                pieces.append(text)
+        elif tag == "tbl":
+            table_text = _table_to_text(Table(child, document))
+            if table_text:
+                table_count += 1
+                pieces.append(table_text)
+
+    if not pieces:
         return ParsedDocument(
             pages=[
                 ParsedPage(
@@ -237,14 +281,17 @@ def _parse_docx(path: Path) -> ParsedDocument:
             ]
         )
 
-    text = "\n".join(paragraphs)
+    text = "\n".join(pieces)
+    note = "DOCX 按单页组织；如需精确页码映射，建议上传 PDF"
+    if table_count:
+        note += f"；已提取 {table_count} 个表格"
     return ParsedDocument(
         pages=[
             ParsedPage(
                 page_index=1,
                 page_text=text,
                 extraction_method=ExtractionMethod.NATIVE.value,
-                note="DOCX 按单页组织；如需精确页码映射，建议上传 PDF",
+                note=note,
                 blocks=_split_blocks(text),
             )
         ]

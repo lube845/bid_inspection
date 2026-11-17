@@ -341,34 +341,6 @@ def _classify_line(
     return None
 
 
-def detect_heading(content: str, block_type: str = "paragraph") -> tuple[str, str] | None:
-    """识别章节标题。返回 (level, 标题文本)，level 为 chapter/section。
-
-    保留这个函数是为了兼容「整块就是一个标题」的旧调用方式；正文标题识别
-    走的是逐行的 :func:`_classify_line`。这里没有上下文可参考时，对
-    ``3.1 xxx`` 这类编号标题采取更宽松的判定。
-    """
-    lines = [line for line in (content or "").splitlines() if line.strip()]
-    if not lines:
-        return None
-    heading = _classify_line(
-        lines[0], lines[1] if len(lines) > 1 else None, block_type
-    )
-    if heading is not None:
-        return heading.level, heading.label
-    # 无上下文时，形态明确的编号标题仍然判定为小节标题
-    stripped = lines[0].strip()
-    normalized, _ = normalize_with_map(stripped)
-    if (
-        normalized
-        and len(normalized) <= _MAX_NUMBERED_HEADING_CHARS
-        and not _looks_like_sentence(normalized)
-        and _LEVEL2.match(stripped)
-    ):
-        return "section", stripped
-    return None
-
-
 def classify_content(chapter: str, section: str) -> str:
     text = f"{chapter}{section}"
     for content_type, keywords in _TYPE_KEYWORDS:

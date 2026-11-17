@@ -73,7 +73,13 @@ def create_company(
 ) -> dict:
     project = _get_project(db, project_id)
     company = company_service.create_company(
-        db, project, payload.company_name, payload.credit_code, payload.remark, user
+        db,
+        project,
+        payload.company_name,
+        payload.credit_code,
+        payload.remark,
+        user,
+        credit_code_type=payload.credit_code_type,
     )
     return project_service.company_summary(company, [])
 

@@ -59,12 +59,6 @@ class MinHasher:
         return permuted.min(axis=1).astype(np.uint64)
 
 
-def estimate_jaccard(signature_a: np.ndarray, signature_b: np.ndarray) -> float:
-    if len(signature_a) == 0:
-        return 0.0
-    return float(np.mean(signature_a == signature_b))
-
-
 def optimal_bands(num_perm: int, threshold: float) -> tuple[int, int]:
     """选择 bands/rows 组合。
 

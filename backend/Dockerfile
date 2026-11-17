@@ -14,6 +14,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --retries 10 --index-url "${PIP_INDEX_URL}" -r requirements.txt
 
 COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 

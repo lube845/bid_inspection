@@ -132,6 +132,22 @@ def project_stats(db: Session, project: Project) -> dict:
         },
     }
 
+    # 待审核口径与结果页一致：只看最新任务、尚未审核的证据；没有任务时为 None
+    pending_review_count = None
+    if last_task is not None:
+        pending_review_count = (
+            db.scalar(
+                select(func.count())
+                .select_from(ComparisonEvidence)
+                .where(
+                    ComparisonEvidence.analysis_task_id == last_task.id,
+                    ComparisonEvidence.is_current.is_(True),
+                    ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
+                )
+            )
+            or 0
+        )
+
     todo = summarize_todo(
         {
             "companies": companies,
@@ -149,7 +165,15 @@ def project_stats(db: Session, project: Project) -> dict:
         "file_count": len(bid_files),
         "parsed_file_count": len(parsed_files),
         "analyzable_company_count": len(analyzable_companies),
+        # 「待处理」拆成两个互不重叠的口径，避免与结果页的「待审核」数字互相矛盾：
+        # - pending_issue_count：资料层面的问题（解析失败/部分成功、企业资料异常）
+        # - pending_review_count：最新任务中尚待人工审核的证据条数
         "pending_issue_count": len(problem_files) + len(abnormal_companies),
+        "pending_review_count": pending_review_count,
+        "pending_issue_breakdown": {
+            "files": len(problem_files),
+            "companies": len(abnormal_companies),
+        },
         "tender_file_count": len(tender_files),
         "todo": todo,
         "stages": stages,
@@ -210,7 +234,7 @@ def collect_todos(db: Session, project: Project, ctx: dict | None = None) -> lis
     | parse_partial     | 部分解析成功   | 有有效投标文件部分成功                                      | ?tab=parse    |
     | confirm_scope     | 未确认分析范围 | ≥2 家企业文件已可用但未确认，且没有运行中的分析任务          | ?tab=files    |
     | analysis_failed   | 分析任务失败   | 最近一个分析任务失败                                        | ?tab=task     |
-    | pending_review    | 证据待审核     | 项目内存在待审核证据                                        | 风险管理页    |
+    | pending_review    | 证据待审核     | 项目内存在待审核证据                                        | ?tab=review   |
     | report_not_exported | 报告未导出   | 有已完成任务但没有导出过报告                                | ?tab=report   |
     """
     if ctx is None:
@@ -302,10 +326,33 @@ def collect_todos(db: Session, project: Project, ctx: dict | None = None) -> lis
             "pending_review",
             "证据待审核",
             f"{pending_review} 条异常证据待审核",
-            "请到风险管理页集中处理",
+            "请到项目内的「审核」页集中处理",
             "medium",
-            f"#/risks?project_id={project.id}&review_status=pending",
+            f"#/projects/{project.id}?tab=review&review_queue=pending_first",
             created_at=ctx.get("pending_review_at"),
+        )
+
+    awaiting_second = ctx.get("awaiting_second_review_count") or 0
+    if awaiting_second:
+        item(
+            "awaiting_second_review",
+            "证据待二审",
+            f"{awaiting_second} 条证据已完成一审，等待第二位审核人复核",
+            "请到项目内的「审核」页处理待二审队列",
+            "medium",
+            f"#/projects/{project.id}?tab=review&review_queue=awaiting_second",
+        )
+
+    reappeared = ctx.get("reappeared_evidence_count") or 0
+    if reappeared:
+        item(
+            "evidence_reappeared",
+            "结论需复核",
+            f"上次已排除的 {reappeared} 条证据在最近一次分析中重新出现",
+            "文件或规则变更后结论发生了变化，请复核",
+            "high",
+            f"#/projects/{project.id}?tab=results",
+            created_at=(last_task.finished_at or last_task.created_at) if last_task else None,
         )
 
     finished = last_task is not None and last_task.status in FINISHED_TASK_STATUSES
@@ -332,22 +379,36 @@ def _todo_context(db: Session, project: Project) -> dict:
         .order_by(AnalysisTask.created_at.desc())
         .limit(1)
     ).first()
+    # 待办只统计最新任务的证据，历史任务的证据不再进入审核队列（见 task_scope）
+    latest_task_id = last_task.id if last_task is not None else None
     pending_review = db.scalar(
         select(func.count())
         .select_from(ComparisonEvidence)
         .where(
             ComparisonEvidence.project_id == project.id,
             ComparisonEvidence.is_current.is_(True),
-            ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
+            ComparisonEvidence.analysis_task_id == latest_task_id,
+            ComparisonEvidence.review_stage == 0,
         )
     ) or 0
     pending_review_at = db.scalar(
         select(func.max(ComparisonEvidence.created_at)).where(
             ComparisonEvidence.project_id == project.id,
             ComparisonEvidence.is_current.is_(True),
-            ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
+            ComparisonEvidence.analysis_task_id == latest_task_id,
+            ComparisonEvidence.review_stage == 0,
         )
     )
+    awaiting_second = db.scalar(
+        select(func.count())
+        .select_from(ComparisonEvidence)
+        .where(
+            ComparisonEvidence.project_id == project.id,
+            ComparisonEvidence.is_current.is_(True),
+            ComparisonEvidence.analysis_task_id == latest_task_id,
+            ComparisonEvidence.review_stage == 1,
+        )
+    ) or 0
     exported = bool(
         db.scalar(
             select(func.count())
@@ -355,6 +416,17 @@ def _todo_context(db: Session, project: Project) -> dict:
             .where(AuditLog.action == "report.export", AuditLog.entity_id == project.id)
         )
     )
+    reappeared = 0
+    if last_task is not None and last_task.status in FINISHED_TASK_STATUSES:
+        # 只在有历史任务时计算；task_diff 只读，失败不影响待办生成
+        from app.services import results_service
+
+        try:
+            diff = results_service.task_diff(db, project, last_task.id)
+            reappeared = len(diff["evidences"]["reappeared"])
+        except Exception:
+            reappeared = 0
+
     return {
         "failed_files": [
             f for f in bid_files if f.parse_status == FileParseStatus.FAILED.value
@@ -375,8 +447,28 @@ def _todo_context(db: Session, project: Project) -> dict:
         "last_task": last_task,
         "pending_review_count": pending_review,
         "pending_review_at": pending_review_at,
+        "awaiting_second_review_count": awaiting_second,
+        "reappeared_evidence_count": reappeared,
         "exported": exported,
     }
+
+
+def _analysis_coverage_incomplete(task: AnalysisTask) -> bool:
+    """任务是否「跑完了但某个维度没有完整覆盖」。
+
+    目前只有价格维度存在这种情形：没识别到任何报价（no_quote）或部分企业
+    未识别（recognized < expected）。文本/人员维度的进度有 total/done，
+    部分失败会体现在任务状态 partial 上，不需要在这里重复判断。
+    """
+    progress = task.progress or {}
+    coverage = ((progress.get("price") or {}).get("coverage")) or {}
+    if not coverage:
+        return False
+    expected = int(coverage.get("expected") or 0)
+    recognized = int(coverage.get("recognized") or 0)
+    if coverage.get("status") == "no_quote":
+        return True
+    return expected > 0 and recognized < expected
 
 
 def refresh_project_status(db: Session, project: Project) -> str:
@@ -409,7 +501,11 @@ def refresh_project_status(db: Session, project: Project) -> str:
             for f in bid_files
         )
         if not changed_after_analysis:
-            project.status = ProjectStatus.ANALYZED.value
+            project.status = (
+                ProjectStatus.ANALYZED_PARTIAL.value
+                if _analysis_coverage_incomplete(latest_finished)
+                else ProjectStatus.ANALYZED.value
+            )
             return project.status
 
     ready_companies = sum(
@@ -465,6 +561,7 @@ def company_summary(company: Company, files: list[OriginalFile]) -> dict:
         "project_id": company.project_id,
         "company_name": company.company_name,
         "credit_code": company.credit_code,
+        "credit_code_type": company.credit_code_type or "uscc",
         "remark": company.remark,
         "status": company.status,
         "participate_analysis": company.participate_analysis,

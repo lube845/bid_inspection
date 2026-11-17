@@ -4,8 +4,9 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models import AnalysisTask, ComparisonPair, Project, User
+from app.models.enums import Dimension
 from app.schemas.analysis import StartAnalysisRequest
-from app.services import analysis_service, audit, results_service
+from app.services import analysis_service, audit, project_service, results_service
 from app.workers import dispatch
 
 router = APIRouter(tags=["analysis"])
@@ -45,6 +46,42 @@ def start_analysis(
 ) -> dict:
     project = _get_project(db, project_id)
     task = analysis_service.create_task(db, project, payload, user)
+    dispatch.enqueue_analysis(task.id)
+    db.expire_all()
+    task = _get_task(db, task.id)
+    return analysis_service.task_detail(db, task)
+
+
+@router.post("/projects/{project_id}/analysis/rerun", status_code=201)
+def rerun_analysis(
+    project_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """按当前报价与文件重新发起一次完整分析。
+
+    用于「报价在任务启动后被修改」「文件替换后需要重算」这类场景：前端只需
+    一个按钮，不必再让用户重新选择企业与维度。
+    """
+    project = _get_project(db, project_id)
+    companies = [
+        company.id
+        for company in project_service.active_companies(db, project.id)
+        if company.participate_analysis
+    ]
+    if len(companies) < 2:
+        raise HTTPException(400, "至少需要 2 家参与分析的投标企业")
+    request = StartAnalysisRequest(
+        company_ids=companies,
+        dimensions=[
+            Dimension.TEXT.value,
+            Dimension.PERSONNEL.value,
+            Dimension.PRICE.value,
+        ],
+        exclude_tender_public_content=True,
+        confirm_partial=True,
+    )
+    task = analysis_service.create_task(db, project, request, user)
     dispatch.enqueue_analysis(task.id)
     db.expire_all()
     task = _get_task(db, task.id)

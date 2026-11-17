@@ -9,7 +9,7 @@ from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models import AnalysisTask, ComparisonEvidence, ComparisonPair, Project, User
 from app.schemas.analysis import ReviewRequest
-from app.services import audit, results_service
+from app.services import audit, results_service, template_service
 
 router = APIRouter(tags=["results"])
 
@@ -32,6 +32,21 @@ def results_overview(
     return results_service.overview(db, project, task_id)
 
 
+@router.get("/projects/{project_id}/tasks/{task_id}/diff")
+def task_diff(
+    project_id: str,
+    task_id: str,
+    against: str | None = Query(default=None, description="对比的上一次任务 id，缺省取上一任务"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    project = _get_project(db, project_id)
+    try:
+        return results_service.task_diff(db, project, task_id, against)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @router.get("/pairs/{pair_id}")
 def pair_detail(
     pair_id: str,
@@ -51,6 +66,9 @@ def pair_evidences(
     review_status: str | None = None,
     severity: str | None = None,
     tender: str | None = None,
+    cluster_lead_only: bool = False,
+    min_cluster_size: int | None = Query(default=None, ge=1),
+    review_queue: str | None = Query(default=None, pattern="^(pending_first|awaiting_second|final)$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     before: int = Query(default=100, ge=0, le=2000),
@@ -72,6 +90,9 @@ def pair_evidences(
         review_status=review_status,
         severity=severity,
         tender=tender,
+        cluster_lead_only=cluster_lead_only,
+        min_cluster_size=min_cluster_size,
+        review_queue=review_queue,
         page=page,
         page_size=page_size,
         before=before,
@@ -120,7 +141,33 @@ def review_evidence(
     evidence = db.get(ComparisonEvidence, evidence_id)
     if not evidence:
         raise HTTPException(404, "证据不存在")
-    results_service.apply_review(db, evidence, payload.status, payload.comment, user)
+    template_fragment_id = None
+    if payload.learn_as_template:
+        if payload.status != "excluded":
+            raise HTTPException(400, "只有「正常 / 排除」的结论才能同时记为模板")
+        if payload.template_scope == "global" and user.role != "admin":
+            raise HTTPException(403, "全局模板只能由系统管理员维护")
+        try:
+            fragment = template_service.learn_from_evidence(
+                db,
+                evidence,
+                user,
+                scope=payload.template_scope,
+            )
+        except template_service.TemplateError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
+        template_fragment_id = fragment.id
+    try:
+        results_service.apply_review(
+            db,
+            evidence,
+            payload.status,
+            payload.comment,
+            user,
+            template_fragment_id=template_fragment_id,
+        )
+    except results_service.ReviewConflict as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return results_service.evidence_detail(db, evidence)
 
 

@@ -6,6 +6,7 @@ from app.models import Company, Project, User
 from app.models.base import utcnow
 from app.models.enums import CompanyStatus, TaskStatus
 from app.services import audit, project_service
+from app.utils.credit_code import credit_code_error, normalize_credit_code
 
 
 class CompanyError(Exception):
@@ -15,10 +16,18 @@ class CompanyError(Exception):
 def create_company(
     db: Session, project: Project, company_name: str, credit_code: str | None, remark: str | None,
     actor: User | None = None,
+    credit_code_type: str = "uscc",
 ) -> Company:
     name = company_name.strip()
     if not name:
         raise CompanyError("企业名称不能为空")
+    credit_code = normalize_credit_code(credit_code)
+    # 只有显式选择「统一社会信用代码」时才做格式与校验位检查；
+    # 外国企业等其他证件类型由 credit_code_type 单独选择，而不是静默跳过校验。
+    if credit_code_type != "other":
+        problem = credit_code_error(credit_code)
+        if problem:
+            raise CompanyError(problem)
     count = db.scalar(
         select(func.count())
         .select_from(Company)
@@ -45,6 +54,7 @@ def create_company(
         project_id=project.id,
         company_name=name,
         credit_code=credit_code,
+        credit_code_type=credit_code_type,
         remark=remark,
         sort_order=(max_order or 0) + 1,
         status=CompanyStatus.INCOMPLETE.value,
@@ -76,6 +86,15 @@ def update_company(db: Session, company: Company, payload, actor: User | None = 
         if duplicate:
             raise CompanyError("同一项目内企业名称不能重复")
         data["company_name"] = name
+    if "credit_code" in data or "credit_code_type" in data:
+        data["credit_code"] = normalize_credit_code(
+            data.get("credit_code", company.credit_code)
+        )
+        code_type = data.get("credit_code_type") or company.credit_code_type or "uscc"
+        if code_type != "other":
+            problem = credit_code_error(data["credit_code"])
+            if problem:
+                raise CompanyError(problem)
     for key, value in data.items():
         setattr(company, key, value)
     audit.log_audit(db, "company.update", "company", company.id, actor, data)

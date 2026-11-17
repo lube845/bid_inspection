@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -18,6 +18,10 @@ class Project(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("app_user.id"), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 结论需要两人复核时才终审。只影响开启之后发起的审核，不追溯已终审证据。
+    requires_second_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     companies = relationship(
         "Company", back_populates="project", cascade="all, delete-orphan", order_by="Company.sort_order"

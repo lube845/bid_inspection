@@ -6,11 +6,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import DocumentPage, OriginalFile
-from app.utils.text import compact_snippet, normalize_with_map
+from app.utils.text import compact_snippet
 
-LOCATOR_PRECISION_PAGE = "page"
 LOCATOR_PRECISION_BLOCK = "block"
-LOCATOR_PRECISION_COORDINATE = "coordinate"
 
 
 @dataclass
@@ -112,15 +110,3 @@ def load_company_blocks(
             if len(refs) >= limit:
                 return refs
     return refs
-
-
-def normalized_slice(block: BlockRef, start: int, end: int) -> tuple[int, int, str]:
-    """把规范化文本上的偏移量还原为原文偏移量。"""
-    _, index_map = normalize_with_map(block.content)
-    if not index_map:
-        return 0, len(block.content), ""
-    norm_start = max(0, min(start, len(index_map) - 1))
-    norm_end = max(norm_start, min(end, len(index_map)))
-    orig_start = index_map[norm_start]
-    orig_end = index_map[norm_end - 1] + 1
-    return orig_start, orig_end, block.content[orig_start:orig_end]

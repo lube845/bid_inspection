@@ -65,7 +65,21 @@ def text_thresholds(thresholds: dict | None) -> dict:
         "max_matches_per_pair": threshold(
             thresholds, "max_matches_per_pair", settings.max_matches_per_pair
         ),
+        # 跨章节类型（技术标/商务标等）的命中需要达到的长度才成证据
+        "text_cross_type_guard_chars": threshold(
+            thresholds, "text_cross_type_guard_chars", 120
+        ),
         "tender_exclusion_ratio": threshold(thresholds, "tender_exclusion_ratio", 0.9),
+        # 批次共同模板：至少几家企业共现 + 信息量上限 + 长段豁免
+        "template_min_companies": threshold(
+            thresholds, "template_min_companies", 3
+        ),
+        "template_max_informativeness": threshold(
+            thresholds, "template_max_informativeness", 0.12
+        ),
+        "template_max_chars_guard": threshold(
+            thresholds, "template_max_chars_guard", 200
+        ),
     }
 
 
@@ -79,6 +93,31 @@ def price_thresholds(thresholds: dict | None) -> dict:
         "price_sequence_tolerance": threshold(
             thresholds, "price_sequence_tolerance", settings.price_sequence_tolerance
         ),
+        # 逐项单价雷同：共同分项数 / 完全相同条数 / 相同比例三条门槛
+        "price_line_item_min_shared": threshold(
+            thresholds, "price_line_item_min_shared", 5
+        ),
+        "price_line_item_min_identical": threshold(
+            thresholds, "price_line_item_min_identical", 4
+        ),
+        "price_line_item_min_ratio": threshold(
+            thresholds, "price_line_item_min_ratio", 0.6
+        ),
+        # 尾数特征：特殊尾数取值与尾数集中的最少家数
+        "special_tail": threshold(
+            thresholds, "special_tail", ["888", "999", "998"]
+        ),
+        "tail_concentration_min_count": threshold(
+            thresholds, "tail_concentration_min_count", 3
+        ),
+        # 常见的取整尾数（整数万元等）默认忽略，避免整批报价都被报「尾数集中」
+        "common_tail_values": threshold(
+            thresholds, "common_tail_values", ["000", "500"]
+        ),
+        # 单家大小写金额一致性检查（质量项，不计入组合价格风险）
+        "price_amount_case_consistency": threshold(
+            thresholds, "price_amount_case_consistency", True
+        ),
     }
 
 
@@ -86,4 +125,7 @@ def personnel_thresholds(thresholds: dict | None) -> dict:
     """人员重复维度使用的阈值集合。"""
     return {
         "similar_name_ratio": threshold(thresholds, "similar_name_ratio", 0.85),
+        # 关键岗位范围：为空表示不按岗位筛选，全部岗位都参与比对。
+        # 非空时只保留岗位命中这些关键词（子串匹配）的人员。
+        "key_positions": threshold(thresholds, "key_positions", []) or [],
     }

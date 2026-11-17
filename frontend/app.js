@@ -8,14 +8,20 @@ const state = {
 };
 
 /* 项目状态文案：优先使用服务端下发的 status_label，这里仅作兜底 */
-const PROJECT_STATUS = { pending: "准备中", ready: "待分析", analyzing: "分析中", analyzed: "分析完成", archived: "已归档" };
+const PROJECT_STATUS = { pending: "准备中", ready: "待分析", analyzing: "分析中", analyzed: "分析完成", analyzed_partial: "分析完成（部分维度未覆盖）", archived: "已归档" };
 const LOGICAL_STATUS = { not_generated: "未生成", generated: "已生成", outdated: "待更新" };
 const COMPANY_STATUS = { incomplete: "待完善", pending_parse: "待解析", parsing: "解析中", pending_confirm: "待确认", analyzable: "可分析", abnormal: "资料异常" };
 const FILE_STATUS = { uploading: "上传中", pending: "待解析", parsing: "解析中", success: "解析成功", partial: "部分成功", failed: "解析失败", superseded: "已失效" };
 const TASK_STATUS = { queued: "排队中", running: "执行中", partial: "部分完成", completed: "已完成", failed: "执行失败", cancelled: "已取消" };
 const RISK = { high: "高", medium: "中", low: "低", none: "无" };
 const REVIEW = { pending: "待审核", confirmed: "确认异常线索", excluded: "正常/排除", undecided: "暂不判断" };
-const TYPE = { text: "文本相似", personnel: "人员重复", price: "价格异常" };
+const TYPE = {
+  text: "文本相似",
+  personnel: "人员重复",
+  price: "价格异常",
+  file: "文件指纹",
+  metadata: "文档元数据",
+};
 const DIM = { text: "文本相似分析", personnel: "人员重复分析", price: "价格异常分析" };
 const SUBTYPE = {
   text_similarity: "文本相似",
@@ -26,9 +32,20 @@ const SUBTYPE = {
   arithmetic_sequence: "等差分布",
   special_tail: "特殊尾数",
   tail_concentration: "尾数集中",
+  identical_file: "同一份文件",
+  shared_metadata: "元数据同源",
+  shared_image: "相同图片",
+  shared_rsid: "修订标识同源",
+  shared_contact: "共用联系方式",
+  unusual_duration_match: "非常规工期一致",
+  role_roster_match: "项目班子一致",
+  line_item_duplicate: "逐项单价雷同",
+  structure_similarity: "文档结构相似",
+  shared_anomaly: "同一处非规范写法",
+  amount_case_mismatch: "大小写金额不一致",
+  quote_needs_confirmation: "自动识别金额待确认",
 };
 const subtypeLabel = (value) => SUBTYPE[value] || value;
-const ROLE = { a: "企业A", b: "企业B" };
 
 /* 系统级模块用到的标签 */
 const USER_ROLE = { admin: "系统管理员", analyst: "项目分析人员", reviewer: "风险审核人员" };
@@ -37,10 +54,22 @@ const RULE_DIM = { text: "文本相似", personnel: "人员重复", price: "价�
 let pollTimer = null;
 let eventSource = null;
 let projectListState = { q: "", status: "", include_archived: false };
+// 审核页已收进项目内（?tab=review），筛选状态不再跨项目保留：
+// 每次进入项目都把 project_id 钉死，避免带着上一个项目的筛选串味。
 let riskListState = {
+  include_history: "",
   project_id: "", company_id: "", evidence_type: "", severity: "",
-  review_status: "", reviewer_id: "", date_from: "", date_to: "", page: 1, page_size: 20,
+  review_status: "", reviewer_id: "", assignee_id: "", review_queue: "",
+  date_from: "", date_to: "", page: 1, page_size: 20,
 };
+function resetRiskListState(projectId) {
+  riskListState = {
+    include_history: "",
+    project_id: projectId || "", company_id: "", evidence_type: "", severity: "",
+    review_status: "", reviewer_id: "", assignee_id: "", review_queue: "",
+    date_from: "", date_to: "", page: 1, page_size: 20,
+  };
+}
 let systemTab = "rules";
 let logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "", page: 1, page_size: 50 };
 let selectedCompanyByProject = {};
@@ -161,13 +190,31 @@ async function withBusy(button, task, label = "处理中…") {
     button.innerHTML = original;
   }
 }
-/* 统计卡片：图标 + 标签 + 数值，保持数据看板的一致节奏 */
-function statCard(label, value, iconName = "activity", tone = "", sub = "") {
-  return `<div class="stat">
-    <div class="stat-head"><span class="stat-icon ${tone}">${icon(iconName)}</span><span class="label">${esc(label)}</span></div>
+/* 文本证据数量口径：识别数 = 招标公共内容排除 + 共同模板排除 + 有效数。
+   结果页、报告页、统计卡共用这一个函数，避免同一批结果在不同页面出现
+   15 / 11 / 3 / 4 这类互相矛盾的数字（验收报告 F-3）。 */
+function textCountNote(stats) {
+  const identified = num(stats.text_evidence_count);
+  const effective = num(stats.effective_text_count);
+  const templateCount = num(stats.template_text_count);
+  const coverCount = num(stats.cover_text_count);
+  const tenderCount = Math.max(0, identified - effective - templateCount - coverCount);
+  if (!identified) return "暂无文本证据";
+  const parts = [`有效 ${effective}`];
+  if (tenderCount) parts.push(`招标公共内容已排除 ${tenderCount}`);
+  if (templateCount) parts.push(`共同模板 ${templateCount}`);
+  if (coverCount) parts.push(`封面字段 ${coverCount}`);
+  return parts.join(" · ");
+}
+
+/* 统计卡片：图标 + 标签 + 数值，保持数据看板的一致节奏。
+   link 为空渲染为静态卡片；有值时整卡可点，跳转到对应的工作清单。 */
+function statCard(label, value, iconName = "activity", tone = "", sub = "", link = "") {
+  const body = `<div class="stat-head"><span class="stat-icon ${tone}">${icon(iconName)}</span><span class="label">${esc(label)}</span></div>
     <div class="value">${value}</div>
-    ${sub ? `<div class="stat-sub">${sub}</div>` : ""}
-  </div>`;
+    ${sub ? `<div class="stat-sub">${sub}</div>` : ""}`;
+  if (!link) return `<div class="stat">${body}</div>`;
+  return `<a class="stat stat-link" href="${esc(link)}">${body}</a>`;
 }
 
 function fmtDate(value) {
@@ -357,10 +404,15 @@ function showApp() {
   const mobile = $("#mobile-user");
   if (mobile) mobile.textContent = name;
 }
+let loggingOut = false;
 function logout() {
-  /* 先记录退出登录的审计日志，再清除令牌 */
+  /* 先吊销服务端令牌（递增 token_version），再清除本地登录态。
+     即使请求失败也继续退出，但此时旧令牌仍有效，下一次请求会 401 并再次回到登录页。 */
+  if (loggingOut) return;
+  loggingOut = true;
   if (state.token) api("/auth/logout", { method: "POST" }).catch(() => {});
   closeEventStream();
+  closeActiveModal();
   const modalRoot = $("#modal-root");
   if (modalRoot) modalRoot.innerHTML = "";
   document.body.classList.remove("modal-open");
@@ -376,6 +428,9 @@ function logout() {
   localStorage.removeItem("bid_token");
   localStorage.removeItem("bid_user");
   showLogin();
+  loggingOut = false;
+  /* 退出登录在路由中不做 401 二次处理：login 页的 401 不应再触发退出 */
+  state.token = "";
 }
 function navigate(hash) {
   if (location.hash === hash) route();
@@ -394,12 +449,23 @@ async function route() {
   clearTimeout(pollTimer);
   pollTimer = null;
   closeEventStream();
+  /* 路由切换（含弹窗内的跳转链接）必须先关掉旧弹窗：
+     否则详情弹窗会继续盖在新页面上，用户还得再手动关一次。
+     用 closeActiveModal 走完整关闭流程，焦点与滚动锁一并清理。 */
+  closeActiveModal();
   setDrawer(false);
-  if (!state.token) { showLogin(); return; }
-  showApp();
   const raw = (location.hash || "#/workbench").slice(1);
   const [path, queryString] = raw.split("?");
   const params = new URLSearchParams(queryString || "");
+  /* #/login 不是页面路由：未登录时本来就在登录视图；已登录时视为「回首页」。
+     否则登录成功后地址栏停在 #/login，主区域显示「页面不存在」。 */
+  if (path === "/login") {
+    if (!state.token) { showLogin(); return; }
+    location.replace("#/workbench");
+    return;
+  }
+  if (!state.token) { showLogin(); return; }
+  showApp();
   const main = $("#main");
   if (!main) return;
   try {
@@ -408,8 +474,22 @@ async function route() {
       setNav("workbench");
       await renderWorkbench();
     } else if (path === "/risks") {
-      setNav("risks");
-      await renderRisks(params);
+      /* 旧的一级菜单「风险管理 / 审核队列」已收进项目内：
+         带 project_id 的旧链接直接转到该项目的审核页，否则回项目列表。 */
+      const legacyProject = params.get("project_id");
+      setNav("projects");
+      if (legacyProject) {
+        const search = new URLSearchParams();
+        search.set("tab", "review");
+        const queue = params.get("review_queue");
+        if (queue) search.set("review_queue", queue);
+        const status = params.get("review_status");
+        if (status) search.set("review_status", status);
+        location.replace(`#/projects/${legacyProject}?${search.toString()}`);
+      } else {
+        location.replace("#/projects");
+      }
+      return;
     } else if (path === "/system") {
       setNav("system");
       await renderSystem(params);
@@ -422,11 +502,16 @@ async function route() {
     } else if ((match = path.match(/^\/projects\/([^/]+)$/))) {
       const tab = params.get("tab") || "overview";
       setNav("projects");
-      /* 人工审核已并入比对分析，旧的 ?tab=review 链接自动转到比对分析 */
-      let target = tab === "review" ? "analysis" : tab;
+      /* 「审核」是项目内的独立标签页（原为系统级风险管理/审核队列） */
+      let target = tab;
       /* 分析任务与启动已独立成「分析任务」标签页，旧的 ?tab=analysis&task= 链接自动转到分析任务 */
       if (target === "analysis" && params.get("task")) target = "task";
-      await renderProject(match[1], target, { pairId: params.get("pair"), evidenceId: params.get("evidence") });
+      await renderProject(match[1], target, {
+        pairId: params.get("pair"),
+        evidenceId: params.get("evidence"),
+        reviewQueue: params.get("review_queue"),
+        reviewStatus: params.get("review_status"),
+      });
     } else {
       main.innerHTML = errorPageHtml("页面不存在。");
     }
@@ -439,6 +524,15 @@ async function route() {
 }
 
 /* ---------- modal ---------- */
+/* 当前打开的弹窗关闭器；路由切换时用它走完整关闭流程 */
+let activeModalClose = null;
+/* 关闭当前弹窗（若有）。导航、退出登录等场景调用。 */
+function closeActiveModal() {
+  if (typeof activeModalClose === "function") {
+    activeModalClose();
+  }
+}
+
 function openModal({ title, body, footer = "", wide = false, onClose = null }) {
   const root = $("#modal-root");
   const previousFocus = document.activeElement;
@@ -464,12 +558,14 @@ function openModal({ title, body, footer = "", wide = false, onClose = null }) {
   const close = () => {
     if (closed) return;
     closed = true;
+    if (activeModalClose === close) activeModalClose = null;
     document.removeEventListener("keydown", onKey, true);
     root.innerHTML = "";
     document.body.classList.remove("modal-open");
     if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus({ preventScroll: true });
     if (typeof onClose === "function") onClose();
   };
+  activeModalClose = close;
   const onKey = (event) => {
     if (event.key === "Escape") { event.preventDefault(); close(); return; }
     if (event.key !== "Tab") return;
@@ -646,7 +742,8 @@ async function renderProject(projectId, tab, options = {}) {
   const project = await api(`/projects/${projectId}`);
   const tabs = [
     ["overview", "项目概览"], ["files", "文件管理"], ["parse", "解析中心"],
-    ["task", "分析任务"], ["analysis", "比对分析"], ["results", "比对结果"], ["report", "分析报告"],
+    ["task", "分析任务"], ["analysis", "比对分析"], ["review", "审核"],
+    ["results", "比对结果"], ["quotes", "报价清单"], ["report", "分析报告"],
   ];
   $("#main").innerHTML = `
     <div class="page-head">
@@ -685,7 +782,16 @@ async function renderProject(projectId, tab, options = {}) {
   else if (tab === "parse") await renderParseCenter(content, project);
   else if (tab === "task") await renderTaskPage(content, project);
   else if (tab === "analysis") await renderCompare(content, project, { pairId: options.pairId, evidenceId: options.evidenceId });
+  else if (tab === "review") {
+    /* 每次进入审核页都从干净筛选开始，避免带到下一个项目；
+       页面内的重渲染（rerender）不经过这里，所以筛选不会被清掉。 */
+    resetRiskListState(project.id);
+    if (options.reviewQueue) riskListState.review_queue = options.reviewQueue;
+    if (options.reviewStatus) riskListState.review_status = options.reviewStatus;
+    await renderProjectReview(content, project);
+  }
   else if (tab === "results") await renderResults(content, project);
+  else if (tab === "quotes") await renderQuotes(content, project);
   else if (tab === "report") await renderReport(content, project);
   else content.innerHTML = `<div class="empty">未知页面</div>`;
 }
@@ -697,6 +803,13 @@ function openEditProject(project) {
       <div class="form-row"><label for="edit-name">项目名称 *</label><input id="edit-name" name="project_name" required maxlength="255" value="${esc(project.project_name)}" /></div>
       <div class="form-row"><label for="edit-code">项目编号</label><input id="edit-code" name="project_code" maxlength="128" value="${esc(project.project_code || "")}" /></div>
       <div class="form-row"><label for="edit-desc">项目说明</label><textarea id="edit-desc" name="description">${esc(project.description || "")}</textarea></div>
+      <div class="form-row">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="edit-second-review" name="requires_second_review" ${project.requires_second_review ? "checked" : ""} />
+          结论需要两位审核人复核（一审完成后再由另一人终审）
+        </label>
+        <div class="small muted" style="margin-top:4px">只影响开启之后发起的审核，已终审的证据不追溯。</div>
+      </div>
     </form>`,
     footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="edit-submit">保存</button>`,
   });
@@ -712,6 +825,8 @@ function openEditProject(project) {
     const data = Object.fromEntries(new FormData(form).entries());
     data.project_code = data.project_code || null;
     data.description = data.description || null;
+    // 复选框未勾选时 FormData 里没有该键，需要显式转成布尔值
+    data.requires_second_review = $("#edit-second-review", modal.root)?.checked ?? false;
     try {
       await api(`/projects/${project.id}`, { method: "PATCH", body: data });
       modal.close(); toast("项目已更新", "success"); renderProject(project.id, "overview");
@@ -745,12 +860,27 @@ async function renderOverview(container, project) {
     </tr>`).join("");
 
   container.innerHTML = `
-    <div class="grid cols-5">
+    <div class="grid cols-auto">
       ${statCard("投标企业", `${num(stats.company_count)} <small>/ ${num(stats.company_limit, 20)}</small>`, "users")}
       ${statCard("原始文件（不含招标）", num(stats.file_count), "file")}
       ${statCard("已解析文件", `${num(stats.parsed_file_count)} <small>/ ${num(stats.file_count)}</small>`, "scan")}
       ${statCard("可参与分析企业", num(stats.analyzable_company_count), "shield", "ok")}
-      ${statCard("待处理异常", num(stats.pending_issue_count), "alert", num(stats.pending_issue_count) ? "high" : "")}
+      ${statCard(
+        "待处理异常",
+        num(stats.pending_issue_count),
+        "alert",
+        num(stats.pending_issue_count) ? "high" : "",
+        `解析问题 ${num(stats.pending_issue_breakdown?.files)} · 资料异常 ${num(stats.pending_issue_breakdown?.companies)}`
+      )}
+      ${statCard(
+        "证据待审核",
+        stats.pending_review_count == null ? "—" : num(stats.pending_review_count),
+        "clock",
+        num(stats.pending_review_count) ? "high" : "",
+        stats.pending_review_count == null ? "暂无分析结果" : "与结果页同口径（最新任务）",
+        /* 直接进本项目的审核页（项目内 tab），不经由全局页面 */
+        num(stats.pending_review_count) ? `#/projects/${project.id}?tab=review&review_queue=pending_first` : ""
+      )}
     </div>
     <div class="next-step">
       <div class="next-step-body">
@@ -1004,8 +1134,12 @@ function companyDetailHtml(company, project) {
         <div>
           <h2 style="margin:0">${esc(company.company_name)}</h2>
           <div class="small muted">${company.file_count} 份文件 · ${company.total_pages} 页 · 逻辑标书 ${company.logical_document_status === "generated" ? `v${company.logical_document?.version_no || 1} 已生成` : "待生成"}</div>
+          <div class="small muted" style="margin-top:4px">
+            ${company.credit_code_type === "other" ? "其他证件" : "统一社会信用代码"}：${esc(company.credit_code || "未填写")}
+          </div>
         </div>
         <div class="row">
+          <button class="btn small" id="edit-company">${icon("edit")}编辑资料</button>
           <button class="btn small" id="company-file-upload">${icon("upload")}上传文件</button>
           ${!company.confirmed && company.file_count > 0 ? `<button class="btn primary small" id="confirm-company">${icon("check")}确认企业资料</button>` : ""}
           <button class="btn small" id="preview-logical">${icon("layers")}预览逻辑标书</button>
@@ -1029,6 +1163,7 @@ function bindCompanyDetail(container, company, project) {
     catch (error) { toast(error.message, "error"); }
   }, "确认中…"));
   $("#preview-logical", container)?.addEventListener("click", () => previewLogical(company));
+  $("#edit-company", container)?.addEventListener("click", () => openEditCompany(company, refresh));
   $$("[data-parse]", container).forEach((btn) => btn.addEventListener("click", () => parseFile(btn.dataset.parse, refresh)));
   $$("[data-delete-file]", container).forEach((btn) => btn.addEventListener("click", async () => {
     const ok = await confirmDialog({
@@ -1095,7 +1230,13 @@ function openAddCompany(project, container) {
     title: "添加投标企业",
     body: `<form id="company-form">
       <div class="form-row"><label for="company-name">企业名称 *</label><input id="company-name" name="company_name" required maxlength="255" /></div>
-      <div class="form-row"><label for="company-credit">统一社会信用代码</label><input id="company-credit" name="credit_code" maxlength="64" /></div>
+      <div class="form-row"><label for="company-credit-type">证件类型</label>
+        <select id="company-credit-type" name="credit_code_type">
+          <option value="uscc">统一社会信用代码（18 位，自动校验）</option>
+          <option value="other">其他证件（外国企业等）</option>
+        </select>
+      </div>
+      <div class="form-row"><label for="company-credit">证件编号</label><input id="company-credit" name="credit_code" maxlength="64" placeholder="选择「其他证件」时可不按 18 位格式填写" /></div>
       <div class="form-row"><label for="company-remark">备注</label><textarea id="company-remark" name="remark"></textarea></div>
     </form>`,
     footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="company-submit">添加并进入文件管理</button>`,
@@ -1118,6 +1259,37 @@ function openAddCompany(project, container) {
       modal.close(); toast("企业已添加", "success"); renderFiles(container, project);
     } catch (error) { toast(error.message, "error"); }
   }, "添加中…"));
+}
+
+function openEditCompany(company, onDone) {
+  const modal = openModal({
+    title: `编辑企业资料 · ${company.company_name}`,
+    body: `<form id="edit-company-form">
+      <div class="form-row"><label for="edit-company-name">企业名称 *</label><input id="edit-company-name" name="company_name" required maxlength="255" value="${esc(company.company_name)}" /></div>
+      <div class="form-row"><label for="edit-company-credit-type">证件类型</label>
+        <select id="edit-company-credit-type" name="credit_code_type">
+          <option value="uscc" ${company.credit_code_type !== "other" ? "selected" : ""}>统一社会信用代码（18 位，自动校验）</option>
+          <option value="other" ${company.credit_code_type === "other" ? "selected" : ""}>其他证件（外国企业等）</option>
+        </select>
+      </div>
+      <div class="form-row"><label for="edit-company-credit">证件编号</label><input id="edit-company-credit" name="credit_code" maxlength="64" value="${esc(company.credit_code || "")}" /></div>
+      <div class="form-row"><label for="edit-company-remark">备注</label><textarea id="edit-company-remark" name="remark" maxlength="2000">${esc(company.remark || "")}</textarea></div>
+    </form>`,
+    footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="edit-company-submit">保存</button>`,
+  });
+  const submit = $("#edit-company-submit", modal.root);
+  submit.addEventListener("click", () => withBusy(submit, async () => {
+    const data = Object.fromEntries(new FormData($("#edit-company-form", modal.root)).entries());
+    if (!data.company_name.trim()) { toast("请填写企业名称", "error"); return; }
+    data.credit_code = data.credit_code.trim() || null;
+    data.remark = data.remark.trim() || null;
+    try {
+      await api(`/companies/${company.id}`, { method: "PATCH", body: data });
+      modal.close();
+      toast("企业资料已更新", "success");
+      onDone?.();
+    } catch (error) { toast(error.message, "error"); }
+  }, "保存中…"));
 }
 
 async function previewLogical(company) {
@@ -1177,6 +1349,14 @@ async function renderParseCenter(container, project) {
       ${statCard("失败", num(counts.failed), "alert", "high")}
     </div>
     ${ocrHint}
+    ${data.analysis?.stale_tender_baseline ? `<div class="warn-box" style="margin-bottom:14px" role="alert">
+      <strong>招标基准已变化：</strong>${esc(data.analysis.stale_tender_baseline.message)}
+      <div class="row small" style="margin-top:6px">
+        <span>重新解析不会自动重跑分析；旧结果中的公共内容排除已不再准确。</span>
+        <span class="spacer"></span>
+        <button class="btn small primary" id="parse-rerun">按新招标文件重新分析</button>
+      </div>
+    </div>` : ""}
     <div class="card">
       <div class="row" style="margin-bottom:12px">
         <h2 style="margin:0">文件解析</h2>
@@ -1195,6 +1375,14 @@ async function renderParseCenter(container, project) {
     try { const result = await api(`/projects/${project.id}/parse`, { method: "POST" }); toast(result.message, "success"); setTimeout(() => renderParseCenter(container, project), 1000); }
     catch (error) { toast(error.message, "error"); }
   }, "提交中…"));
+  const rerunBtn = $("#parse-rerun", container);
+  rerunBtn?.addEventListener("click", () => withBusy(rerunBtn, async () => {
+    try {
+      const next = await api(`/projects/${project.id}/analysis/rerun`, { method: "POST" });
+      toast("已按新招标文件发起分析", "success");
+      location.hash = `#/projects/${project.id}?tab=task&task=${next.id}`;
+    } catch (error) { toast(error.message, "error"); }
+  }, "发起中…"));
   $$("[data-retry]").forEach((btn) => btn.addEventListener("click", () => parseFile(btn.dataset.retry, () => renderParseCenter(container, project))));
   $$("[data-pages]").forEach((btn) => btn.addEventListener("click", () => openPagesModal(btn.dataset.pages, btn.dataset.name)));
   if (Object.keys(counts).some((key) => ["pending", "parsing", "uploading"].includes(key) && counts[key] > 0)) {
@@ -1287,7 +1475,13 @@ async function renderCompare(container, project, options = {}) {
     const pair = pairs.find((item) => item.pair_id === pairId);
     $("#cmp-risk", container).innerHTML = pair ? `综合风险 ${riskPill(pair.overall_risk)}` : "";
     $("#cmp-hint", container).textContent = pair
-      ? `文本证据 ${pair.text_count} 条 · 人员重复 ${pair.personnel_count} 条 · 价格异常 ${pair.price_count} 条`
+      ? [
+          `文本证据 ${pair.text_count} 条`,
+          `人员重复 ${pair.personnel_count} 条`,
+          `价格异常 ${pair.price_count} 条`,
+          pair.file_count ? `文件指纹 ${pair.file_count} 条` : "",
+          pair.metadata_count ? `元数据 ${pair.metadata_count} 条` : "",
+        ].filter(Boolean).join(" · ")
       : "";
     if (!pairId) {
       viewerEl.innerHTML = `<div class="card"><div class="empty">请选择两家企业。</div></div>`;
@@ -1404,10 +1598,49 @@ async function renderTaskDetail(container, project, taskId) {
   const priceCoverage = task.progress?.price?.coverage || {};
   const priceMissing = priceCoverage.expected > 0 ? Math.max(0, num(priceCoverage.expected) - num(priceCoverage.recognized)) : 0;
   const priceMissingNames = (priceCoverage.missing_companies || []).slice(0, 5).join("、");
+  const priceSourceNote = [
+    num(priceCoverage.manual_count) ? `人工录入 ${num(priceCoverage.manual_count)} 家` : "",
+    num(priceCoverage.auto_count) ? `正文识别 ${num(priceCoverage.auto_count)} 家` : "",
+  ].filter(Boolean).join("、");
   const priceCoverageHtml = priceMissing ? `
     <div class="warn-box" style="margin-top:14px" role="alert">
       <strong>价格维度未完全覆盖：</strong>${num(priceCoverage.expected)} 家企业中 ${priceMissing} 家未识别到投标总报价
       ${priceMissingNames ? `（${esc(priceMissingNames)}）` : ""}，这些企业不参与价格异常判断。
+      <div class="row small" style="margin-top:6px">
+        <span>可在「报价清单」补录或批量导入后重新分析。</span>
+        <span class="spacer"></span>
+        <a class="btn small" href="#/projects/${task.project_id}?tab=quotes">前往报价清单</a>
+      </div>
+    </div>` : (priceSourceNote ? `<div class="info-box small" style="margin-top:14px">报价来源：${priceSourceNote}。</div>` : "");
+  /* 招标文件在任务启动后被重新解析（典型：扫描件 OCR 重试成功）：
+     公共内容排除已失效，必须提示并按新基准重新分析。 */
+  const staleTender = task.stale_tender_baseline;
+  const staleTenderHtml = staleTender ? `
+    <div class="warn-box" style="margin-top:14px" role="alert">
+      <strong>招标文件基准已变化：</strong>${esc(staleTender.message)}
+      <div class="row small" style="margin-top:8px">
+        <span>重新分析后历史结论仍会保留。</span>
+        <span class="spacer"></span>
+        <button class="btn small primary" id="rerun-stale-tender">按新招标文件重新分析</button>
+      </div>
+    </div>` : "";
+  /* 报价在任务启动后被改过：本次结论用的是旧报价，必须显著提示并提供一键重跑 */
+  const staleQuotes = task.stale_price_quotes || [];
+  const staleHtml = staleQuotes.length ? `
+    <div class="warn-box" style="margin-top:14px" role="alert">
+      <strong>本次结论基于过期报价：</strong>任务启动后 ${staleQuotes.length} 家企业的报价被修改、删除或补录。
+      ${staleQuotes.slice(0, 5).map((item) => `<div class="small" style="margin-top:4px">${esc(item.company_name || item.company_id)}：${
+        item.reason === "deleted" ? "报价已删除"
+          : item.reason === "added" || item.reason === "manual_added" ? "新增人工报价"
+          : `报价版本 ${num(item.snapshot_version)} → ${num(item.current_version)}`
+      }</div>`).join("")}
+      ${staleQuotes.length > 5 ? `<div class="small muted" style="margin-top:4px">等 ${staleQuotes.length} 家</div>` : ""}
+      <div class="row small" style="margin-top:8px">
+        <span>按最新报价重新分析后，历史任务仍会保留旧结论。</span>
+        <span class="spacer"></span>
+        <a class="btn small" href="#/projects/${task.project_id}?tab=quotes">查看报价清单</a>
+        <button class="btn small primary" id="rerun-stale-quotes">按最新报价重新分析</button>
+      </div>
     </div>` : "";
   const failedPairs = (task.pairs || []).filter((pair) => pair.status === "failed");
   const failedHtml = failedPairs.length ? `
@@ -1431,6 +1664,8 @@ async function renderTaskDetail(container, project, taskId) {
       <div class="small muted" id="live-task-counts" aria-live="polite" style="margin:8px 0 14px">算法版本 ${esc(task.algorithm_version)} · 企业组合 ${task.pair_count} 组 · 完成 ${task.completed_pair_count} 组 · 失败 ${task.failed_pair_count} 组</div>
       <div class="small muted" style="margin:-8px 0 14px">规则版本：${esc(ruleVersionLabel(task.analysis_config))}</div>
       ${task.error_message ? `<div class="warn-box">${esc(task.error_message)}</div>` : ""}
+      ${staleTenderHtml}
+      ${staleHtml}
       ${progressRows || `<div class="empty">暂无进度</div>`}
       ${priceCoverageHtml}
       ${failedHtml}
@@ -1453,6 +1688,24 @@ async function renderTaskDetail(container, project, taskId) {
       catch (error) { toast(error.message, "error"); }
     }, "取消中…");
   });
+  /* 过期原因不同（报价 / 招标基准），重跑入口是同一个 */
+  const startRerun = (button) => withBusy(button, async () => {
+    const ok = await confirmDialog({
+      title: "重新分析",
+      message: "将基于当前报价、文件与招标基准新建一个分析任务；当前任务的证据与审核记录会完整保留。",
+      confirmLabel: "重新分析",
+    });
+    if (!ok) return;
+    try {
+      const next = await api(`/projects/${project.id}/analysis/rerun`, { method: "POST" });
+      toast("已发起新的分析任务", "success");
+      location.hash = `#/projects/${project.id}?tab=task&task=${next.id}`;
+    } catch (error) { toast(error.message, "error"); }
+  }, "发起中…");
+  const rerunBtn = $("#rerun-stale-quotes", container);
+  rerunBtn?.addEventListener("click", () => startRerun(rerunBtn));
+  const rerunTenderBtn = $("#rerun-stale-tender", container);
+  rerunTenderBtn?.addEventListener("click", () => startRerun(rerunTenderBtn));
   $$("[data-retry-pair]", container).forEach((button) => button.addEventListener("click", async () => {
     button.disabled = true;
     try {
@@ -1520,12 +1773,16 @@ async function renderResults(container, project) {
   const priceCoverage = stats.price_coverage || {};
   const priceMissing = priceCoverage.expected > 0 ? Math.max(0, num(priceCoverage.expected) - num(priceCoverage.recognized)) : 0;
   const missingNames = (priceCoverage.missing_companies || []).slice(0, 5).join("、");
-  const excludedText = Math.max(0, num(stats.text_evidence_count) - num(stats.effective_text_count));
+  const priceNote = priceMissing
+    ? `未识别 ${priceMissing} 家，可在报价清单补录`
+    : [num(priceCoverage.manual_count) ? `人工 ${num(priceCoverage.manual_count)} 家` : "", num(priceCoverage.auto_count) ? `识别 ${num(priceCoverage.auto_count)} 家` : ""].filter(Boolean).join(" · ");
+  const excludedNote = textCountNote(stats);
   const pairRows = data.pairs.map((pair) => `
     <tr>
       <td class="cell-main"><a href="#/projects/${project.id}?tab=analysis&pair=${pair.pair_id}">${esc(pair.company_a)} ↔ ${esc(pair.company_b)}</a></td>
       <td class="num">${pair.text_count}</td><td class="num">${pair.personnel_count}</td><td class="num">${pair.price_count}</td>
-      <td class="col-secondary">${riskPill(pair.text_risk)}</td><td class="col-secondary">${riskPill(pair.personnel_risk)}</td><td class="col-secondary">${riskPill(pair.price_risk)}</td>
+      <td class="num">${pair.file_count || 0}</td><td class="num">${pair.metadata_count || 0}</td>
+      <td class="col-secondary">${riskPill(pair.text_risk)}</td><td class="col-secondary">${riskPill(pair.personnel_risk)}</td><td class="col-secondary">${riskPill(pair.price_risk)}</td><td class="col-secondary">${riskPill(pair.forensic_risk)}</td>
       <td>${riskPill(pair.overall_risk)}</td>
       <td><a class="btn small" href="#/projects/${project.id}?tab=analysis&pair=${pair.pair_id}">三栏查看</a></td>
     </tr>`).join("");
@@ -1535,7 +1792,7 @@ async function renderResults(container, project) {
         <span class="small muted">${TYPE[evidence.evidence_type] || evidence.evidence_type} · ${esc(evidence.companies.join("、"))}</span>
         <span class="spacer"></span><span class="pill">${REVIEW[evidence.review_status] || evidence.review_status}</span></div>
       <div class="summary">${esc(evidence.summary)}</div>
-      <div class="meta">${evidence.pair_id ? `<a href="#/projects/${project.id}?tab=analysis&pair=${evidence.pair_id}&evidence=${evidence.id}">进入三栏复核 →</a>` : `项目级价格异常证据`}</div>
+      <div class="meta">${evidence.pair_id ? `<a href="#/projects/${project.id}?tab=analysis&pair=${evidence.pair_id}&evidence=${evidence.id}">进入三栏复核 →</a>` : `<button type="button" class="link-btn" data-evidence-detail="${esc(evidence.id)}">查看详情与审核 →</button>`}</div>
     </div>`).join("") || `<div class="empty">暂无证据</div>`;
 
   const priceWarning = priceMissing > 0 ? `
@@ -1549,11 +1806,21 @@ async function renderResults(container, project) {
     <div class="grid cols-5">
       ${statCard("参与企业", stats.participant_count, "users")}
       ${statCard("比对组合", stats.pair_count, "layers")}
-      ${statCard("文本相似证据", stats.text_evidence_count, "file", "medium", `有效 ${num(stats.effective_text_count)} · 命中招标公共内容已排除 ${excludedText}`)}
+      ${statCard("文本相似证据", stats.text_evidence_count, "file", "medium", excludedNote)}
       ${statCard("重复人员", stats.personnel_duplicate_count, "user", "medium")}
-      ${statCard("价格异常企业", stats.price_abnormal_company_count, "coins", "high", priceCoverage.expected ? `已识别报价 ${num(priceCoverage.recognized)} / ${num(priceCoverage.expected)} 家` : "")}
+      ${statCard("价格异常企业", stats.price_abnormal_company_count, "coins", "high", priceCoverage.expected ? `已识别报价 ${num(priceCoverage.recognized)} / ${num(priceCoverage.expected)} 家${priceNote ? ` · ${priceNote}` : ""}` : "")}
     </div>
     ${priceWarning}
+    ${(data.tasks || []).length > 1 ? `<div class="card" style="margin-top:16px" id="task-diff-card">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <h2 style="margin:0">与上次分析对比</h2>
+          <div class="small muted" style="margin-top:4px">同一项目多次分析时，看看结论发生了什么变化（输入文件、证据增减、风险等级与审核结论）。</div>
+        </div>
+        <button class="btn" id="task-diff-open">查看变化</button>
+      </div>
+      <div id="task-diff-body" style="margin-top:12px"></div>
+    </div>` : ""}
     <div class="card" style="margin-top:16px">
       <div class="row" style="justify-content:space-between">
         <h2 style="margin:0">企业组合矩阵</h2>
@@ -1563,23 +1830,274 @@ async function renderResults(container, project) {
         ${data.matrix.map((pair) => `
           <a class="matrix-cell" href="#/projects/${project.id}?tab=analysis&pair=${pair.pair_id}" aria-label="查看 ${esc(pair.company_a)} 与 ${esc(pair.company_b)} 的比对证据">
             <div class="pair">${esc(pair.company_a)} ↔ ${esc(pair.company_b)}</div>
-            <div class="meta">文本 ${pair.text_count} · 人员 ${pair.personnel_count} · 价格 ${pair.price_count}</div>
+            <div class="meta">${[
+              `文本 ${pair.text_count}`,
+              `人员 ${pair.personnel_count}`,
+              `价格 ${pair.price_count}`,
+              pair.file_count ? `文件指纹 ${pair.file_count}` : "",
+              pair.metadata_count ? `元数据 ${pair.metadata_count}` : "",
+            ].filter(Boolean).map((part) => `<span class="meta-chip">${esc(part)}</span>`).join("")}</div>
             <div style="margin-top:6px">${riskPill(pair.overall_risk)}</div>
           </a>`).join("") || `<div class="empty">暂无组合</div>`}
       </div>
     </div>
     <div class="card">
       <h2>企业组合列表</h2>
-      <table><thead><tr><th>企业组合</th><th class="num">文本证据</th><th class="num">人员重复</th><th class="num">价格异常</th><th class="col-secondary">文本风险</th><th class="col-secondary">人员风险</th><th class="col-secondary">价格风险</th><th>综合风险</th><th>操作</th></tr></thead>
-        <tbody>${pairRows || `<tr><td colspan="9"><div class="empty">暂无结果</div></td></tr>`}</tbody></table>
+      <table><thead><tr><th>企业组合</th><th class="num">文本证据</th><th class="num">人员重复</th><th class="num">价格异常</th><th class="num">文件指纹</th><th class="num">元数据</th><th class="col-secondary">文本风险</th><th class="col-secondary">人员风险</th><th class="col-secondary">价格风险</th><th class="col-secondary">取证风险</th><th>综合风险</th><th>操作</th></tr></thead>
+        <tbody>${pairRows || `<tr><td colspan="12"><div class="empty">暂无结果</div></td></tr>`}</tbody></table>
     </div>
     <div class="card">
       <div class="row" style="justify-content:space-between"><h2 style="margin:0">重点异常证据</h2><span class="small muted">待审核 ${stats.pending_review_count} 条</span></div>
       <div class="evidence-list" style="margin-top:10px">${top}</div>
     </div>`;
+
+  $("#task-diff-open")?.addEventListener("click", () => openTaskDiff(project, data.task.id));
+  $$("[data-evidence-detail]", container).forEach((button) => button.addEventListener("click", () => {
+    openRiskDetail(button.dataset.evidenceDetail, () => renderResults(container, project));
+  }));
+}
+
+/* 与上次分析对比：输入变化 / 证据增减 / 风险变化 / 上次已排除本次重现 */
+async function openTaskDiff(project, taskId) {
+  const body = $("#task-diff-body");
+  if (body) body.innerHTML = skeletonBlock(4);
+  let diff;
+  try {
+    diff = await api(`/projects/${project.id}/tasks/${taskId}/diff`);
+  } catch (error) {
+    if (body) body.innerHTML = `<div class="warn-box small">${esc(error.message)}</div>`;
+    return;
+  }
+  const summary = diff.summary || {};
+  const inputs = diff.inputs || {};
+  const list = (items, render) => (items && items.length
+    ? `<ul class="small" style="margin:0;padding-left:18px">${items.slice(0, 12).map(render).join("")}</ul>`
+    : `<div class="small muted">无变化</div>`);
+  const html = `
+    <div class="row small" style="gap:12px;margin-bottom:8px">
+      <span>对比：任务 #${num(diff.previous.task_no)} → #${num(diff.current.task_no)}</span>
+      <span class="pill">新增 ${num(summary.added)}</span>
+      <span class="pill">减少 ${num(summary.removed)}</span>
+      <span class="pill">变化 ${num(summary.changed)}</span>
+      <span class="pill ${summary.reappeared ? "warn" : ""}">上次已排除本次重现 ${num(summary.reappeared)}</span>
+      <span class="pill">风险等级变化 ${num(summary.risk_changes)} 组</span>
+    </div>
+    <div class="grid cols-2">
+      <section>
+        <h3>输入变化</h3>
+        ${list(inputs.files_changed, (f) => `<li>${esc(f.company_name)}《${esc(f.file_name)}》版本 ${num(f.old_version)} → ${num(f.new_version)}</li>`)}
+        ${inputs.files_added.length ? list(inputs.files_added, (f) => `<li>新增文件：${esc(f.company_name)}《${esc(f.file_name)}》</li>`) : ""}
+        ${inputs.files_removed.length ? list(inputs.files_removed, (f) => `<li>移除文件：${esc(f.company_name)}《${esc(f.file_name)}》</li>`) : ""}
+        ${inputs.rule_changes.length ? list(inputs.rule_changes, (r) => `<li>规则 ${esc(r.dimension)} 版本 ${num(r.old_version)} → ${num(r.new_version)}</li>`) : ""}
+      </section>
+      <section>
+        <h3>风险等级变化</h3>
+        ${list(diff.risks, (r) => `<li>${riskPill(r.old_risk)} → ${riskPill(r.new_risk)}</li>`)}
+      </section>
+    </div>
+    <section style="margin-top:12px"><h3>新增证据</h3>
+      ${list(diff.evidences.added, (e) => `<li><span class="pill ${esc(e.severity)}">${RISK[e.severity] || "无"}</span> ${esc(e.label)} · ${esc(e.summary)}</li>`)}
+    </section>
+    <section style="margin-top:12px"><h3>减少的证据</h3>
+      ${list(diff.evidences.removed, (e) => `<li>${esc(e.label)} · ${esc(e.summary)}</li>`)}
+    </section>
+    ${diff.evidences.reappeared.length ? `<section style="margin-top:12px"><h3>上次已排除、本次重新出现</h3>
+      ${list(diff.evidences.reappeared, (e) => `<li>${esc(e.label)} · ${esc(e.summary)}</li>`)}
+    </section>` : ""}`;
+  if (body) body.innerHTML = html;
 }
 
 /* ---------- report ---------- */
+/* ---------- 报价清单：人工导入 / 补录 ---------- */
+
+const QUOTE_SOURCE = { manual: "手工补录", import: "批量导入", auto: "自动识别" };
+
+async function renderQuotes(container, project) {
+  const data = await api(`/projects/${project.id}/quotes`);
+  const money = (value) => Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 2 });
+  const rows = (data.items || []).map((item) => {
+    const quote = item.quote;
+    const detected = item.detected;
+    /* 自动识别值只读展示：没有人工报价时它是实际生效的金额，必须能复核；
+       有矛盾候选（金额不一致）时要醒目提示，而不是静默采用。 */
+    const amountCell = quote
+      ? `<span>${money(quote.amount)}</span>${detected && Math.abs(detected.amount - quote.amount) > 0.01
+          ? `<div class="small muted">自动识别：${money(detected.amount)}</div>` : ""}`
+      : detected
+        ? `<span>${money(detected.amount)}</span><div class="small muted">自动识别，未人工确认</div>`
+        : `<span class="muted">未识别</span>`;
+    const sourceCell = quote
+      ? `<span class="pill ${quote.source_kind === "auto" ? "" : "low"}">${QUOTE_SOURCE[quote.source_kind] || quote.source_kind}</span>`
+      : detected
+        ? `<span class="pill">自动识别</span>`
+        : "—";
+    const warnCell = detected?.needs_confirmation
+      ? `<div class="warn-box small" style="margin-top:4px">识别到多个合计金额（${(detected.alternative_amounts || []).map(money).join("、")} 元），需人工确认</div>`
+      : "";
+    return `
+      <tr>
+        <td>${esc(item.company_name)}</td>
+        <td class="small muted">${esc(item.credit_code || "—")}</td>
+        <td class="num">${amountCell}${warnCell}</td>
+        <td class="small">${esc(quote?.amount_upper || detected?.amount_upper || "—")}</td>
+        <td>${sourceCell}</td>
+        <td class="small muted">${quote ? `v${num(quote.version_no)} · ${fmtDate(quote.updated_at)}` : "—"}</td>
+        <td class="row" style="gap:6px;justify-content:flex-end">
+          <button type="button" class="btn small" data-edit-quote="${item.company_id}" data-company-name="${esc(item.company_name)}" data-amount="${quote ? quote.amount : (detected ? detected.amount : "")}" data-upper="${esc(quote?.amount_upper || detected?.amount_upper || "")}">${quote ? "修改" : detected ? "确认为人工报价" : "补录"}</button>
+          ${quote ? `<button type="button" class="btn small ghost" data-delete-quote="${item.company_id}">删除</button>` : ""}
+        </td>
+      </tr>`;
+  }).join("");
+
+  container.innerHTML = `
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:flex-start">
+        <div>
+          <h2 style="margin:0">报价清单</h2>
+          <div class="small muted" style="margin-top:4px">
+            价格维度优先使用人工确认的报价；未录入时使用最新分析任务自动识别的金额（只读）。
+            分析任务启动时会固化当时的报价，之后再修改报价不影响历史任务。
+          </div>
+        </div>
+        <div class="row" style="gap:8px">
+          <a class="btn" href="${API}/projects/${project.id}/quotes/template" id="quote-template">下载模板</a>
+          <button class="btn" id="quote-import">${icon("upload")}批量导入</button>
+        </div>
+      </div>
+      <div class="table-scroll" style="margin-top:12px">
+        <table>
+          <thead><tr><th>企业</th><th>统一社会信用代码</th><th class="num">投标总报价（元）</th><th>大写金额</th><th>来源</th><th>版本</th><th></th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="7"><div class="empty">还没有投标企业。</div></td></tr>`}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  $("#quote-template").addEventListener("click", async (event) => {
+    event.preventDefault();
+    const button = event.currentTarget;
+    await withBusy(button, async () => {
+      try {
+        const blob = await api(`/projects/${project.id}/quotes/template`, { blob: true });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "报价单模板.xlsx";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      } catch (error) { toast(error.message, "error"); }
+    });
+  });
+  $("#quote-import").addEventListener("click", () => openQuoteImport(project, () => renderQuotes(container, project)));
+  $$("[data-edit-quote]").forEach((btn) => btn.addEventListener("click", () => openQuoteEdit({
+    companyId: btn.dataset.editQuote,
+    companyName: btn.dataset.companyName,
+    amount: btn.dataset.amount,
+    amountUpper: btn.dataset.upper,
+  }, () => renderQuotes(container, project))));
+  $$("[data-delete-quote]").forEach((btn) => btn.addEventListener("click", async () => {
+    const ok = await confirmDialog({ title: "删除报价", message: "删除后价格维度将回退到从正文自动识别。历史任务仍使用启动时固化的报价。", confirmLabel: "删除", danger: true });
+    if (!ok) return;
+    try { await api(`/companies/${btn.dataset.deleteQuote}/quote`, { method: "DELETE" }); toast("已删除报价", "success"); renderQuotes(container, project); }
+    catch (error) { toast(error.message, "error"); }
+  }));
+}
+
+function openQuoteEdit({ companyId, companyName, amount, amountUpper }, onDone) {
+  const modal = openModal({
+    title: `${amount ? "修改" : "补录"}报价 · ${companyName}`,
+    body: `<form id="quote-form">
+      <div class="form-row"><label for="quote-amount">投标总报价（元）*</label><input id="quote-amount" name="amount" type="number" step="0.01" min="0.01" required value="${esc(amount)}" /></div>
+      <div class="form-row"><label for="quote-upper">大写金额</label><input id="quote-upper" name="amount_upper" maxlength="128" value="${esc(amountUpper)}" placeholder="可选，用于校验大小写是否一致" /></div>
+      <div class="form-row"><label for="quote-remark">备注</label><textarea id="quote-remark" name="remark" maxlength="2000" placeholder="来源、报价文件页码等"></textarea></div>
+    </form>`,
+    footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="quote-submit">保存</button>`,
+  });
+  $("#quote-submit", modal.root).addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    await withBusy(button, async () => {
+      const form = $("#quote-form", modal.root);
+      const data = Object.fromEntries(new FormData(form).entries());
+      if (!data.amount || Number(data.amount) <= 0) { toast("请填写大于 0 的报价", "error"); return; }
+      try {
+        await api(`/companies/${companyId}/quote`, { method: "PUT", body: {
+          amount: Number(data.amount),
+          amount_upper: data.amount_upper || null,
+          remark: data.remark || null,
+        } });
+        modal.close();
+        toast("报价已保存", "success");
+        onDone?.();
+      } catch (error) { toast(error.message, "error"); }
+    });
+  });
+}
+
+async function openQuoteImport(project, onDone) {
+  const modal = openModal({
+    title: "批量导入报价",
+    wide: true,
+    body: `
+      <div class="info-box small">按模板填写后上传。支持 .xlsx / .csv；企业名称或统一社会信用代码任一匹配即可。
+        导入先做校验预览，确认无误后再写入。</div>
+      <div class="form-row" style="margin-top:12px"><label for="quote-file">报价单文件</label>
+        <input type="file" id="quote-file" accept=".xlsx,.csv" /></div>
+      <div id="quote-preview" style="margin-top:12px"></div>`,
+    footer: `<button class="btn" data-close>取消</button>
+      <button class="btn" id="quote-validate">校验预览</button>
+      <button class="btn primary" id="quote-commit" disabled>确认导入</button>`,
+  });
+  const fileInput = $("#quote-file", modal.root);
+  const preview = $("#quote-preview", modal.root);
+  const commitBtn = $("#quote-commit", modal.root);
+
+  const upload = async (dryRun) => {
+    const file = fileInput.files[0];
+    if (!file) { toast("请选择报价单文件", "error"); return null; }
+    const form = new FormData();
+    form.append("file", file);
+    return api(`/projects/${project.id}/quotes/import?dry_run=${dryRun ? "true" : "false"}`, { method: "POST", body: form });
+  };
+
+  const renderPreview = (result) => {
+    const issues = [...(result.errors || []).map((item) => ({ ...item, level: "error" })), ...(result.warnings || []).map((item) => ({ ...item, level: "warning" }))];
+    preview.innerHTML = `
+      <div class="row small" style="gap:12px">
+        <span>可导入 <strong>${num(result.summary.total)}</strong> 条</span>
+        <span class="${result.summary.error_count ? "danger" : ""}">错误 ${num(result.summary.error_count)}</span>
+        <span class="muted">提示 ${num(result.summary.warning_count)}</span>
+      </div>
+      ${issues.length ? `<div class="warn-box" style="margin-top:8px" role="alert"><ul class="small" style="margin:0;padding-left:18px">
+        ${issues.slice(0, 30).map((item) => `<li>${item.row ? `第 ${item.row} 行：` : ""}${esc(item.message)}</li>`).join("")}
+      </ul></div>` : ""}
+      ${result.rows.length ? `<div class="table-scroll" style="margin-top:8px"><table class="small">
+        <thead><tr><th>行</th><th>企业</th><th class="num">投标总报价</th><th>大写金额</th></tr></thead>
+        <tbody>${result.rows.map((row) => `<tr><td>${row.row}</td><td>${esc(row.company_name)}</td><td class="num">${Number(row.amount).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td class="small">${esc(row.amount_upper || "—")}</td></tr>`).join("")}</tbody>
+      </table></div>` : ""}`;
+    commitBtn.disabled = !result.rows.length || result.summary.error_count > 0;
+  };
+
+  $("#quote-validate", modal.root).addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    await withBusy(button, async () => {
+      try { const result = await upload(true); if (result) renderPreview(result); }
+      catch (error) { toast(error.message, "error"); }
+    });
+  });
+  commitBtn.addEventListener("click", async () => {
+    await withBusy(commitBtn, async () => {
+      try {
+        const result = await upload(false);
+        if (!result) return;
+        modal.close();
+        toast(`已导入 ${result.summary.total} 家报价`, "success");
+        onDone?.();
+      } catch (error) { toast(error.message, "error"); }
+    });
+  });
+}
+
 async function renderReport(container, project) {
   const data = await api(`/projects/${project.id}/results/overview`);
   const stats = data.stats || {};
@@ -1589,12 +2107,12 @@ async function renderReport(container, project) {
   container.innerHTML = `
     <div class="card">
       <h2>分析报告</h2>
-      ${task ? `<div class="info-box">当前报告基于任务 #${task.task_no}（${TASK_STATUS[task.status] || task.status}）生成，算法版本 ${esc(task.algorithm_version)}。报告包含 4 个工作表。</div>` : `<div class="warn-box">项目还没有可导出的分析结果。</div>`}
+      ${task ? `<div class="info-box">当前报告基于任务 #${task.task_no}（${TASK_STATUS[task.status] || task.status}）生成，算法版本 ${esc(task.algorithm_version)}。报告包含 6～7 个工作表（审核记录表在有审核数据时出现）。</div>` : `<div class="warn-box">项目还没有可导出的分析结果。</div>`}
       ${priceMissing ? `<div class="warn-box" style="margin-top:12px" role="alert"><strong>价格维度未完全覆盖：</strong>${priceMissing} 家企业未识别到投标总报价，报告中价格异常表不包含这些企业。</div>` : ""}
       <div class="grid cols-4">
         ${statCard("参与企业", num(stats.participant_count), "users")}
         ${statCard("比对组合", num(stats.pair_count), "layers")}
-        ${statCard("文本相似证据", num(stats.text_evidence_count), "file", "medium", `有效 ${num(stats.effective_text_count)} 条`)}
+        ${statCard("文本相似证据", num(stats.text_evidence_count), "file", "medium", textCountNote(stats))}
         ${statCard("待审核", num(stats.pending_review_count), "clock", num(stats.pending_review_count) ? "high" : "")}
       </div>
       <div class="grid cols-2" style="margin-top:16px">
@@ -1604,7 +2122,10 @@ async function renderReport(container, project) {
             <li>投标人比对概览：企业组合、各维度统计和风险提示</li>
             <li>文本雷同汇总表：匹配文本、双方文件页码、相似字数、排除状态</li>
             <li>人员姓名重复表：重复姓名、企业、岗位、文件、页码、出现次数</li>
+            <li>报价汇总表：全部参与企业的报价、来源页码、识别原文与待确认标记（无论是否触发异常）</li>
             <li>价格异常分析表：总报价、大写金额、偏差率、异常类型、风险提示</li>
+            <li>文件取证表：文件指纹（同一份文件被两家提交）与文档元数据同源字段</li>
+            <li>审核记录表：每条证据的审核人、环节、结论与说明（有审核数据时生成）</li>
           </ul>
         </div>
         <div>
@@ -1635,7 +2156,7 @@ async function renderReport(container, project) {
 
 /* ---------- 三栏证据查看器：左中两列展示证据片段，右列展示分析信息 ---------- */
 /* 证据筛选条件提到模块级：切换企业组合后仍保留，避免审核员每组重设一次 */
-let evidenceFilterState = { review: "", severity: "", tender: "" };
+let evidenceFilterState = { review: "", severity: "", tender: "", clusterLeadOnly: false, queue: "" };
 
 /* 上下文展示参数：与后端 app/services/evidence_context.py 保持一致 */
 const CONTEXT_DEFAULT = { before: 100, after: 100 };
@@ -1695,6 +2216,16 @@ function evidenceCardHtml(item, side, index, fallbackName, activeId) {
   const contextState = item.context_state?.[side] || {};
   const expanded = (contextState.before || CONTEXT_DEFAULT.before) > CONTEXT_DEFAULT.before
     || (contextState.after || CONTEXT_DEFAULT.after) > CONTEXT_DEFAULT.after;
+  // 文件指纹与元数据证据只描述文件本身，没有「片段」可对照。
+  // 这里换一句说明，避免右侧明明是「完全相同」，左中两列却写「没有提供原文位置」。
+  const fileLevel = item.evidence_type === "file" || item.evidence_type === "metadata";
+  const bodyHtml = fileLevel
+    ? `<div class="muted small">${item.evidence_type === "file"
+        ? "该类证据比对的是整份文件的字节内容，无需逐段定位。"
+        : item.subtype === "structure_similarity"
+          ? "该类证据比对的是章节树、表格与图片顺序，没有对应的正文片段。"
+          : "该类证据比对的是文档属性，没有对应的正文片段。"}</div>`
+    : sideSegmentsHtml(payload);
   return `
     <article class="ev-card${item.id === activeId ? " active" : ""}" data-evidence-id="${esc(item.id)}" data-side="${side}">
       <header class="ev-card-head">
@@ -1704,7 +2235,7 @@ function evidenceCardHtml(item, side, index, fallbackName, activeId) {
         <span class="pill ${esc(item.severity)}">${RISK[item.severity] || "无"}</span>
       </header>
       <div class="ev-source small muted">${sideSourceLine(payload, fallbackName)}</div>
-      ${sideSegmentsHtml(payload)}
+      ${bodyHtml}
       <div class="ev-actions">
         <button type="button" class="btn tiny" data-expand="before"${payload?.has_more_before ? "" : " disabled"}>展开更多前文</button>
         <button type="button" class="btn tiny" data-expand="after"${payload?.has_more_after ? "" : " disabled"}>展开更多后文</button>
@@ -1722,6 +2253,8 @@ async function mountPairViewer(container, pairId, evidenceId) {
     review: evidenceFilterState.review,
     severity: evidenceFilterState.severity,
     tender: evidenceFilterState.tender,
+    clusterLeadOnly: evidenceFilterState.clusterLeadOnly,
+    queue: evidenceFilterState.queue,
     page: 1,
     pageSize: 20,
     total: 0,
@@ -1751,14 +2284,25 @@ async function mountPairViewer(container, pairId, evidenceId) {
         <select id="ev-filter-tender" aria-label="按招标文件命中情况筛选">
           <option value="">全部内容</option>
           <option value="hit" ${view.tender === "hit" ? "selected" : ""}>命中招标说明</option>
-          <option value="effective" ${view.tender === "effective" ? "selected" : ""}>未命中招标说明</option>
+          <option value="template" ${view.tender === "template" ? "selected" : ""}>批次共同模板</option>
+          <option value="effective" ${view.tender === "effective" ? "selected" : ""}>有效内容（两类都不命中）</option>
         </select>
+        <select id="ev-filter-queue" aria-label="按审核流程筛选证据">
+          <option value="">全部流程状态</option>
+          <option value="pending_first" ${view.queue === "pending_first" ? "selected" : ""}>待审核（一审）</option>
+          <option value="awaiting_second" ${view.queue === "awaiting_second" ? "selected" : ""}>待二审</option>
+          <option value="final" ${view.queue === "final" ? "selected" : ""}>已终审</option>
+        </select>
+        <label class="small" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="ev-cluster-lead" ${view.clusterLeadOnly ? "checked" : ""} /> 按线索折叠
+        </label>
         <button type="button" class="btn small" id="viewer-focus" aria-pressed="false" title="隐藏右栏证据清单，让两侧原文更宽">专注阅读</button>
       </div>
       <div class="small muted" id="count-note" style="margin-top:8px" aria-live="polite"></div>
       <div class="small muted" style="margin-top:8px">
         左列与中列只展示命中片段及其前后必要上下文，完整原文按需打开；<span class="flag-inline tender">命中招标说明</span>
-        表示内容命中招标文件公共内容（已排除，但仍保留识别记录）。筛选条件只影响清单展示，不影响原始识别结果。
+        表示内容命中招标文件公共内容，<span class="flag-inline tender">批次共同模板</span> 表示多家企业共有的行业范本套话——
+        两者都已从风险计数中排除，但仍保留识别记录。筛选条件只影响清单展示，不影响原始识别结果。
       </div>
     </div>
     <div class="tabs" id="evidence-tabs" role="tablist" aria-label="证据类型">
@@ -1808,8 +2352,11 @@ async function mountPairViewer(container, pairId, evidenceId) {
           <span class="small muted">${esc(subtypeLabel(item.subtype))}</span><span class="spacer"></span>
           <span class="pill">${REVIEW[item.review_status] || item.review_status}</span></div>
         ${item.excluded_by_tender ? `<div class="flag tender">命中招标说明 · 公共内容已排除</div>` : ""}
+        ${item.excluded_by_template ? `<div class="flag tender">${item.template_source === "library" ? "经验模板" : "批次共同模板"} · 不计入风险${item.template_source === "library" ? "" : `（${num(item.template_presence)} 家企业共现）`}</div>` : ""}
         <div class="summary">${esc(item.summary)}</div>
-        ${item.group_size > 1 ? `<div class="meta">第 ${item.group_index}/${item.group_size} 处相似片段</div>` : ""}
+        ${item.cluster_size > 1 ? `<div class="meta"><span class="flag">线索 · ${num(item.cluster_size)} 处命中</span>${item.cluster_index ? ` 第 ${num(item.cluster_index)}/${num(item.cluster_size)}` : ""}</div>` : ""}
+        ${item.review_stage === 1 ? `<div class="meta"><span class="flag">一审完成 · 待二审</span></div>` : ""}
+        ${item.review_conflict ? `<div class="meta"><span class="flag tender">一审与终审结论不同</span></div>` : ""}
       </div>`).join("") || `<div class="empty" style="padding:18px">没有符合筛选条件的证据</div>`;
     if (view.items.length < view.total) {
       const more = document.createElement("button");
@@ -1926,12 +2473,26 @@ async function mountPairViewer(container, pairId, evidenceId) {
   };
 
   const renderDetail = (evidence) => {
-    detailEl.innerHTML = evidenceDetailHtml(evidence) + reviewFormHtml(evidence);
+    detailEl.innerHTML = evidenceDetailHtml(evidence) + clusterMembersHtml(evidence) + reviewFormHtml(evidence);
+    bindClusterReview(detailEl, evidence, {
+      select: (id) => selectEvidence(id),
+      refresh: async () => {
+        await loadItems(true);
+        const refreshed = await api(`/evidences/${evidence.id}`);
+        renderDetail(refreshed);
+      },
+    });
     bindReviewForm(detailEl, evidence, async () => {
       const refreshed = await api(`/evidences/${evidence.id}`);
       const index = view.items.findIndex((item) => item.id === refreshed.id);
       if (index >= 0) {
-        view.items[index] = { ...view.items[index], review_status: refreshed.review_status };
+        view.items[index] = {
+          ...view.items[index],
+          review_status: refreshed.review_status,
+          review_stage: refreshed.review_stage,
+          first_review_status: refreshed.first_review?.status,
+          review_conflict: refreshed.review_conflict,
+        };
       }
       renderList();
       renderTabs();
@@ -2058,6 +2619,8 @@ async function mountPairViewer(container, pairId, evidenceId) {
     if (view.review) params.set("review_status", view.review);
     if (view.severity) params.set("severity", view.severity);
     if (view.tender) params.set("tender", view.tender);
+    if (view.clusterLeadOnly) params.set("cluster_lead_only", "true");
+    if (view.queue) params.set("review_queue", view.queue);
     const button = $("#ev-load-more", listEl);
     if (button) {
       button.disabled = true;
@@ -2071,9 +2634,14 @@ async function mountPairViewer(container, pairId, evidenceId) {
       const note = $("#count-note", container);
       if (note) {
         const breakdown = view.breakdown?.[view.type];
-        note.textContent = breakdown
-          ? `本组合${TYPE[view.type] || view.type}：识别 ${breakdown.identified} 条，命中招标公共内容已排除 ${breakdown.excluded_by_tender} 条，有效 ${breakdown.effective} 条；当前筛选显示 ${view.total} 条。`
-          : `本组合${TYPE[view.type] || view.type}：共 ${view.total} 条。`;
+        if (breakdown) {
+          const templatePart = breakdown.excluded_by_template
+            ? `，批次共同模板 ${breakdown.excluded_by_template} 条`
+            : "";
+          note.textContent = `本组合${TYPE[view.type] || view.type}：识别 ${breakdown.identified} 条，命中招标公共内容已排除 ${breakdown.excluded_by_tender} 条${templatePart}，有效 ${breakdown.effective} 条；当前筛选显示 ${view.total} 条。`;
+        } else {
+          note.textContent = `本组合${TYPE[view.type] || view.type}：共 ${view.total} 条。`;
+        }
       }
       renderTabs();
       renderList();
@@ -2091,7 +2659,12 @@ async function mountPairViewer(container, pairId, evidenceId) {
     view.review = $("#ev-filter-review", container).value;
     view.severity = $("#ev-filter-severity", container).value;
     view.tender = $("#ev-filter-tender", container).value;
-    evidenceFilterState = { review: view.review, severity: view.severity, tender: view.tender };
+    view.queue = $("#ev-filter-queue", container).value;
+    view.clusterLeadOnly = $("#ev-cluster-lead", container).checked;
+    evidenceFilterState = {
+      review: view.review, severity: view.severity, tender: view.tender,
+      queue: view.queue, clusterLeadOnly: view.clusterLeadOnly,
+    };
     view.page = 1;
     await loadItems(true);
     if (view.currentId && !view.items.some((item) => item.id === view.currentId)) {
@@ -2103,6 +2676,8 @@ async function mountPairViewer(container, pairId, evidenceId) {
   $("#ev-filter-review", container).addEventListener("change", applyFilters);
   $("#ev-filter-severity", container).addEventListener("change", applyFilters);
   $("#ev-filter-tender", container).addEventListener("change", applyFilters);
+  $("#ev-filter-queue", container).addEventListener("change", applyFilters);
+  $("#ev-cluster-lead", container).addEventListener("change", applyFilters);
 
   /* 专注阅读：隐藏右栏，把宽度让给两侧原文 */
   const focusBtn = $("#viewer-focus", container);
@@ -2200,6 +2775,10 @@ function evidenceDetailHtml(evidence) {
       <dt>来源定位</dt><dd class="small">A：${sideSourceLine(sideA, evidence.company_a) || "—"}<br>B：${sideSourceLine(sideB, evidence.company_b) || "—"}</dd>
       <dt>章节定位</dt><dd class="small">A：${esc(chapterA || "—")}<br>B：${esc(chapterB || "—")}</dd>
       <dt>公共内容排除</dt><dd>${data.excluded_by_tender ? `<span class="pill warn">命中招标文件公共内容</span> 排除比例 ${num(data.exclusion_ratio)}` : "否"}</dd>
+      <dt>其他提示</dt><dd>${[
+        data.excluded_by_template ? `<span class="pill">批次共同模板</span>` : "",
+        data.cover_only ? `<span class="pill">封面字段雷同（不计入风险）</span>` : "",
+      ].filter(Boolean).join(" ") || "—"}</dd>
       <dt>匹配文本</dt><dd><div class="marker" style="max-height:160px; overflow:auto">${esc(data.matched_text || "")}</div></dd>`;
   } else if (evidence.evidence_type === "personnel") {
     const occurrences = [...(data.occurrences_a || []), ...(data.occurrences_b || [])];
@@ -2210,16 +2789,77 @@ function evidenceDetailHtml(evidence) {
       <dt>出现位置</dt><dd>${occurrences.map((occ) => `<div class="small">${esc(occ.company_name || "")} · ${esc(occ.role || "")} · ${esc(occ.file_name || "")} 第${occ.page_index}页</div>`).join("") || "—"}</dd>
       <dt>说明</dt><dd class="small muted">${esc(data.note || "同名不代表同一人，需要结合证件号码、资格证书等进一步核实。")}</dd>`;
   } else if (evidence.evidence_type === "price") {
-    const quotes = data.quotes || [];
+    if (evidence.evidence_subtype === "line_item_duplicate") {
+      /* 逐项单价雷同用的是 items，而不是 quotes；两套结构必须分开渲染 */
+      const items = data.items || [];
+      fields = `
+        <dt>异常规则</dt><dd>${esc(data.rule_label || "逐项单价雷同")}</dd>
+        <dt>共同分项</dt><dd>${num(data.shared_count)} 项，其中完全相同 <strong>${num(data.identical_count)}</strong> 项（${(num(data.identical_ratio) * 100).toFixed(1)}%）</dd>
+        <dt>分项明细</dt><dd>
+          <table class="small"><thead><tr><th>分项</th><th>A 单价</th><th>B 单价</th><th>差异</th></tr></thead><tbody>
+          ${items.map((item) => `<tr><td>${esc(item.name)}</td><td class="num">${Number(item.unit_price_a || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td class="num">${Number(item.unit_price_b || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td>${item.same_price ? "相同" : `${(num(item.relative_diff) * 100).toFixed(2)}%`}</td></tr>`).join("")}
+          </tbody></table></dd>
+        <dt>说明</dt><dd class="small muted">${esc(data.note || "")}</dd>`;
+    } else {
+      const quotes = data.quotes || [];
+      const quality = !!data.quality_only;
+      fields = `
+        <dt>异常规则</dt><dd>${esc(data.rule_label || evidence.evidence_subtype)}${quality ? ` <span class="pill">单家质量提示 · 不计入组合风险</span>` : ""}</dd>
+        <dt>平均报价</dt><dd>${Number(data.mean || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })} 元</dd>
+        <dt>参与企业</dt><dd>${quotes.length} 家</dd>
+        <dt>报价明细</dt><dd>
+          <table class="small"><thead><tr><th>企业</th><th>总报价</th><th>偏差率</th><th>来源</th></tr></thead><tbody>
+          ${quotes.map((quote) => `<tr><td>${esc(quote.company_name)}</td><td>${Number(quote.amount || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td>${(num(quote.deviation_rate) * 100).toFixed(2)}%</td>
+            <td>${quote.source?.file_id ? `<button type="button" class="link-btn" data-open-file="${esc(quote.source.file_id)}" data-page="${num(quote.source.page_index)}">${esc(quote.source.file_name)} 第${quote.source.page_index}页</button>` : `<span class="small muted">${quote.origin === "auto" ? "正文识别" : "人工录入"}</span>`}</td></tr>`).join("")}
+          </tbody></table></dd>
+        <dt>说明</dt><dd class="small muted">${esc(data.note || "")}</dd>`;
+    }
+  } else if (evidence.evidence_type === "file") {
     fields = `
-      <dt>异常规则</dt><dd>${esc(data.rule_label || evidence.evidence_subtype)}</dd>
-      <dt>平均报价</dt><dd>${Number(data.mean || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })} 元</dd>
-      <dt>参与企业</dt><dd>${quotes.length} 家</dd>
-      <dt>报价明细</dt><dd>
-        <table class="small"><thead><tr><th>企业</th><th>总报价</th><th>偏差率</th><th>原文</th></tr></thead><tbody>
-        ${quotes.map((quote) => `<tr><td>${esc(quote.company_name)}</td><td>${Number(quote.amount || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td>${(num(quote.deviation_rate) * 100).toFixed(2)}%</td>
-          <td>${quote.source?.file_id ? `<button type="button" class="link-btn" data-open-file="${esc(quote.source.file_id)}" data-page="${num(quote.source.page_index)}">${esc(quote.source.file_name)} 第${quote.source.page_index}页</button>` : "—"}</td></tr>`).join("")}
-        </tbody></table></dd>
+      <dt>文件指纹</dt><dd class="mono small">${esc(data.file_hash || "—")}</dd>
+      <dt>完全相同</dt><dd>A：${esc(data.file_a_name || "—")}<br>B：${esc(data.file_b_name || "—")}</dd>
+      <dt>说明</dt><dd class="small muted">${esc(data.note || "")}</dd>`;
+  } else if (evidence.evidence_type === "metadata" || evidence.subtype === "shared_anomaly") {
+    const shared = data.shared_fields || {};
+    const labels = data.shared_field_labels || {};
+    const keys = Object.keys(shared);
+    /* 取证类证据的 subtype 不同，展示的重点也不同：
+       shared_metadata 看共同字段；shared_image 看图片；shared_rsid 看修订标识；
+       shared_contact / unusual_duration_match / role_roster_match 看具体事实值。 */
+    let detailBlock = "";
+    if (keys.length) {
+      detailBlock = `<dt>共同字段</dt><dd><table class="small"><thead><tr><th>字段</th><th>值</th></tr></thead><tbody>
+        ${keys.map((key) => `<tr><td>${esc(labels[key] || key)}</td><td class="mono">${esc(shared[key])}</td></tr>`).join("")}
+        </tbody></table></dd>`;
+    } else if (evidence.subtype === "shared_image") {
+      detailBlock = `<dt>匹配图片</dt><dd>${num(data.match_count)} 张（其中完全相同 ${num(data.identical_count)} 张）</dd>`;
+    } else if (evidence.subtype === "shared_rsid") {
+      detailBlock = `<dt>修订标识</dt><dd>共同 ${num(data.shared_count)} 个，其中真实编辑痕迹 ${num(data.shared_trace_count)} 个</dd>`;
+    } else if (evidence.subtype === "shared_contact") {
+      detailBlock = `<dt>共用${esc(data.fact === "email" ? "邮箱" : "联系方式")}</dt><dd class="mono">${esc(data.value || "—")}</dd>`;
+    } else if (evidence.subtype === "unusual_duration_match") {
+      detailBlock = `<dt>相同工期</dt><dd class="mono">${esc(data.value || "—")}</dd>`;
+    } else if (evidence.subtype === "role_roster_match") {
+      const roster = data.roster || {};
+      detailBlock = `<dt>一致岗位</dt><dd>${Object.entries(roster).map(([role, name]) => `${esc(role)}：${esc(name)}`).join("<br>") || "—"}</dd>`;
+    } else if (evidence.subtype === "shared_anomaly") {
+      detailBlock = `
+        <dt>非规范写法</dt><dd><strong>${esc(data.term || "—")}</strong> <span class="muted">（应为「${esc(data.correction || "")}」）</span></dd>
+        <dt>相同上下文</dt><dd class="mono small">${esc(data.context || "—")}</dd>
+        <dt>出现次数</dt><dd>A 侧 ${num(data.occurrences_a)} 处 · B 侧 ${num(data.occurrences_b)} 处</dd>
+        ${data.batch_common ? `<dt>批次共性</dt><dd class="small">该写法在本批次多家文件中出现，按行业通病处理，不计入风险</dd>` : ""}`;
+    } else if (evidence.subtype === "structure_similarity") {
+      const comparison = data.comparison || {};
+      const samples = (comparison.title_samples || []).map((title) => `<li>${esc(title)}</li>`).join("");
+      detailBlock = `
+        <dt>章节标题</dt><dd>${num(comparison.title_common)} 个标题按相同顺序一致（A 侧共 ${num(comparison.title_total_a)}、B 侧共 ${num(comparison.title_total_b)} 个非公共标题）</dd>
+        <dt>相似标题</dt><dd class="small">${samples ? `<ul style="margin:0;padding-left:18px">${samples}</ul>` : "—"}</dd>
+        <dt>表格结构</dt><dd>${num(comparison.table_pairs)} 张表格列数与表头一致</dd>
+        <dt>图片顺序</dt><dd>${num(comparison.image_run)} 张图片按相同顺序出现</dd>`;
+    }
+    fields = `
+      ${detailBlock}
+      ${evidence.subtype === "shared_anomaly" ? "" : `<dt>涉及文件</dt><dd class="small">A：${esc(data.file_a_name || "—")}<br>B：${esc(data.file_b_name || "—")}</dd>`}
       <dt>说明</dt><dd class="small muted">${esc(data.note || "")}</dd>`;
   }
 
@@ -2233,10 +2873,72 @@ function evidenceDetailHtml(evidence) {
     ${renderHistory(evidence.review_records || [])}`;
 }
 
+const REVIEW_STAGE = { 0: "撤回", 1: "一审", 2: "终审" };
+
+/* 线索成员：同一段落的多处命中合并成一条线索后，成员清单可折叠查看 */
+function clusterMembersHtml(evidence) {
+  const members = evidence.cluster_members || [];
+  if (members.length <= 1) return "";
+  const rows = members.map((member) => `
+    <div class="row small" style="padding:4px 0;border-top:1px solid var(--line)">
+      <span class="muted">第 ${num(member.cluster_index)} 处</span>
+      <span class="pill ${esc(member.severity)}">${RISK[member.severity] || "无"}</span>
+      ${member.page_index ? `<span class="muted">第 ${num(member.page_index)} 页</span>` : ""}
+      <span class="spacer"></span>
+      <span class="pill">${REVIEW[member.review_status] || member.review_status}</span>
+      <button type="button" class="btn small ghost" data-cluster-jump="${esc(member.id)}">定位</button>
+    </div>`).join("");
+  return `<details class="detail-block">
+    <summary class="small" style="font-weight:600;cursor:pointer">线索成员 ${members.length} 处（同一段落的多处命中）</summary>
+    <div style="margin-top:6px">${rows}</div>
+    <div class="row small" style="margin-top:8px">
+      <span class="muted">按线索审核会一次性覆盖全部成员，各自留一条审核记录。</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn small primary" data-cluster-review="confirmed">整条线索确认</button>
+      <button type="button" class="btn small" data-cluster-review="excluded">整条线索排除</button>
+    </div>
+  </details>`;
+}
+
+function bindClusterReview(root, evidence, view) {
+  $$("[data-cluster-jump]", root).forEach((button) => button.addEventListener("click", () => {
+    const id = button.dataset.clusterJump;
+    if (typeof view.select === "function") view.select(id);
+  }));
+  $$("[data-cluster-review]", root).forEach((button) => button.addEventListener("click", async () => {
+    const status = button.dataset.clusterReview;
+    const members = evidence.cluster_members || [];
+    const ids = members.map((member) => member.id);
+    if (!ids.length) return;
+    const comment = $("#review-comment", root)?.value?.trim() || "";
+    if (status === "confirmed" && !comment) {
+      toast("整条线索确认前请在审核说明里写清判断依据", "error");
+      return;
+    }
+    const ok = await confirmDialog({
+      title: "按线索审核",
+      message: `将把整条线索的 ${ids.length} 处命中一并标记为「${status === "confirmed" ? "确认异常线索" : "正常 / 排除"}」。每条成员都会留一条审核记录，可随时撤回。`,
+      confirmLabel: "一并处理",
+      danger: status === "confirmed",
+    });
+    if (!ok) return;
+    await withBusy(button, async () => {
+      try {
+        const result = await api("/risks/cluster-review", {
+          method: "POST",
+          body: { evidence_ids: ids, status, comment: comment || null, skip_reviewed: false },
+        });
+        toast(`已处理 ${result.updated} 处命中`, "success");
+        if (typeof view.refresh === "function") await view.refresh();
+      } catch (error) { toast(error.message, "error"); }
+    }, "处理中…");
+  }));
+}
+
 function renderHistory(records) {
   if (!records.length) return "";
   return `<div class="review-history"><div class="small" style="font-weight:600; margin-bottom:6px">审核记录</div>
-    ${records.map((record) => `<div class="item"><strong>${esc(record.reviewer_name)}</strong> · ${fmtDate(record.created_at)} · ${REVIEW[record.old_status] || record.old_status} → ${REVIEW[record.new_status] || record.new_status}
+    ${records.map((record) => `<div class="item"><strong>${esc(record.reviewer_name)}</strong> · ${fmtDate(record.created_at)} · <span class="muted">${REVIEW_STAGE[record.stage] || "一审"}</span> · ${REVIEW[record.old_status] || record.old_status} → ${REVIEW[record.new_status] || record.new_status}
       ${record.comment ? `<div class="muted">${esc(record.comment)}</div>` : ""}</div>`).join("")}</div>`;
 }
 
@@ -2249,10 +2951,18 @@ function reviewFormHtml(evidence) {
   const revoke = last
     ? `<button class="btn small" data-review-revoke="1" title="以一条新的审核记录把状态改回待审核，历史记录保留">撤回本次审核</button>`
     : "";
+  const stage = evidence.review_stage || 0;
   const label = status === "pending" ? "尚未审核" : `当前结论：${REVIEW[status] || status}`;
+  const stageNote = stage === 1
+    ? `<div class="flag" style="margin-bottom:6px">一审已由 ${esc(evidence.review_records.find((r) => r.stage === 1)?.reviewer_name || "其他审核人")} 完成，当前结论仍是「${REVIEW[status] || status}」，需要另一位审核人复核后终审。</div>`
+    : evidence.review_conflict
+      ? `<div class="warn-box small" style="margin-bottom:6px">一审与终审结论不同：一审为「${REVIEW[evidence.first_review_status] || evidence.first_review_status}」，终审为「${REVIEW[status] || status}」。</div>`
+      : "";
+  const nextLabel = stage === 1 ? "下一条待二审 →" : "下一条待审核 →";
   return `<div class="detail-block">
     <div class="small" style="font-weight:600">人工审核</div>
     <div class="small muted" style="margin:4px 0 8px">${esc(label)}${last ? ` · 最近一位审核人 ${esc(last.reviewer_name)} · ${fmtDate(last.created_at)}` : ""}</div>
+    ${stageNote}
     <label class="small">审核说明<span class="muted">（确认异常线索时必填，将写入导出报告）</span>
       <textarea id="review-comment" placeholder="写清判断依据，例如：已核对纸质原件，两份技术标第 4.2 节为同一底稿"></textarea>
     </label>
@@ -2263,8 +2973,12 @@ function reviewFormHtml(evidence) {
       <button class="btn small" data-review-status="undecided">暂不判断</button>
       ${revoke}
     </div>
+    <label class="small" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
+      <input type="checkbox" id="review-learn-template" />
+      同时把命中片段记为行业模板（下次同类雷同自动标记为「经验模板」，不抬高风险）
+    </label>
     <div class="review-actions">
-      <button class="btn small" id="review-next" type="button" disabled>下一条待审核 →</button>
+      <button class="btn small" id="review-next" type="button" disabled>${nextLabel}</button>
     </div>
     <div class="small muted" style="margin-top:6px">审核记录只追加保存，不覆盖历史；原始识别结果始终保留。</div>
   </div>`;
@@ -2280,8 +2994,20 @@ function bindReviewForm(root, evidence, refresh) {
   const submit = async (button, status, comment) => {
     await withBusy(button, async () => {
       try {
-        await api(`/evidences/${evidence.id}/review`, { method: "POST", body: { status, comment: comment || null } });
-        toast(status === "pending" ? "审核结论已撤回" : "审核结论已保存", "success");
+        const learn = status === "excluded" && $("#review-learn-template", root)?.checked;
+        await api(`/evidences/${evidence.id}/review`, {
+          method: "POST",
+          body: {
+            status,
+            comment: comment || null,
+            learn_as_template: Boolean(learn),
+            template_scope: "project",
+          },
+        });
+        toast(
+          learn ? "已保存并记为模板" : status === "pending" ? "审核结论已撤回" : "审核结论已保存",
+          "success",
+        );
         await refresh();
       } catch (error) { toast(error.message, "error"); }
     }, "保存中…");
@@ -2309,12 +3035,14 @@ function bindReviewForm(root, evidence, refresh) {
 }
 
 /* ---------- 工作台（PRD 4.1） ---------- */
+/* 审核队列已收进项目内：工作台的证据类指标都落到「审核进度」卡片，
+   该卡片里按项目列出待审条数，点进哪个项目就审哪个项目的。 */
 const WORKBENCH_STAT_LINKS = {
   project_total: "#/projects",
   project_active: "#/projects",
   task_completed: "#recent-tasks",
-  evidence_total: "#/risks",
-  evidence_pending_review: "#/risks?review_status=pending",
+  evidence_total: "#review-progress",
+  evidence_pending_review: "#review-progress",
 };
 
 async function renderWorkbench() {
@@ -2334,6 +3062,11 @@ async function renderWorkbench() {
       <td><a class="btn small" href="${esc(todo.link)}">去处理</a></td>
     </tr>`).join("");
 
+  /* 审核入口已收进项目内：取待审最多的项目作为「去处理」的落点 */
+  const firstPendingProject = (data.recent_projects || [])
+    .filter((project) => num(project.pending_review_count) > 0)
+    .sort((a, b) => num(b.pending_review_count) - num(a.pending_review_count))[0] || null;
+
   const projectRows = (data.recent_projects || []).map((project) => `
     <tr>
       <td><a href="#/projects/${esc(project.id)}"><strong>${esc(project.project_name)}</strong></a>
@@ -2341,7 +3074,9 @@ async function renderWorkbench() {
       <td>${pill(project.status, projectStatusLabel(project))}</td>
       <td class="col-secondary">${num(project.company_count)}</td>
       <td class="col-secondary">${fmtDate(project.last_analysis_at)}</td>
-      <td>${num(project.pending_review_count)}</td>
+      <td>${num(project.pending_review_count)
+        ? `<a href="#/projects/${esc(project.id)}?tab=review&review_queue=pending_first" title="打开本项目的审核页">${num(project.pending_review_count)}</a>`
+        : "0"}</td>
       <td><a class="btn small" href="#/projects/${esc(project.id)}">进入</a></td>
     </tr>`).join("");
 
@@ -2358,7 +3093,7 @@ async function renderWorkbench() {
       <td><a class="btn small" href="${esc(task.link)}">查看</a></td>
     </tr>`).join("");
 
-  const typeIcons = { text: "file", personnel: "user", price: "coins" };
+  const typeIcons = { text: "file", personnel: "user", price: "coins", file: "shield", metadata: "database" };
 
   /* 风险分布：不再用 11 张等大卡片平铺，改为一条可读的分布条 + 明细。
      分布条让「风险集中在哪」一眼可见，卡片墙只能让人逐个相加。 */
@@ -2439,7 +3174,7 @@ async function renderWorkbench() {
         ${typeRows || `<div class="muted small">暂无数据</div>`}
       </div>
       <div class="card">
-        <div class="card-head"><h2>审核进度</h2><span class="small muted">已审 ${reviewedCount} / ${reviewTotal}</span></div>
+        <div class="card-head" id="review-progress"><h2>审核进度</h2><span class="small muted">已审 ${reviewedCount} / ${reviewTotal}</span></div>
         <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="${reviewTotal}" aria-valuenow="${reviewedCount}" aria-label="证据审核进度">
           <div class="progress-fill" style="width:${reviewedPercent}%"></div>
         </div>
@@ -2447,7 +3182,11 @@ async function renderWorkbench() {
           ${reviewOrder.map((key) => `<span class="dist-legend"><i class="dot seg-${key}"></i>${REVIEW[key]} <b>${num(byReview[key])}</b></span>`).join("")}
         </div>
         <div class="small muted" style="margin-top:12px">
-          ${num(byReview.pending) ? `还有 ${num(byReview.pending)} 条证据没有结论，<a href="#/risks?review_status=pending">去逐条处理 →</a>` : "所有证据都已给出结论。"}
+          ${num(byReview.pending)
+            ? `还有 ${num(byReview.pending)} 条证据没有结论。${firstPendingProject
+                ? `<a href="#/projects/${esc(firstPendingProject.id)}?tab=review&review_queue=pending_first">去「${esc(firstPendingProject.project_name)}」的审核页处理 →</a>`
+                : `<a href="#/projects">进入项目审核 →</a>`}`
+            : "所有证据都已给出结论。"}
         </div>
       </div>
     </div>
@@ -2474,7 +3213,13 @@ async function renderWorkbench() {
   refreshBtn.addEventListener("click", () => withBusy(refreshBtn, renderWorkbench, "刷新中…"));
 }
 
-/* ---------- 风险管理（PRD 4.11） ---------- */
+/* ---------- 项目内「审核」页（PRD 4.11） ---------- */
+function assigneeName(filters, assigneeId) {
+  if (!assigneeId) return "—";
+  const person = (filters.assignees || []).find((item) => item.id === assigneeId);
+  return person ? person.display_name : "—";
+}
+
 function riskQueryString() {
   const params = new URLSearchParams();
   Object.entries(riskListState).forEach(([key, value]) => {
@@ -2487,14 +3232,12 @@ function riskQueryString() {
   return params.toString();
 }
 
-async function renderRisks(params) {
-  const main = $("#main");
-  /* 工作台统计卡片跳进来时带上筛选条件 */
-  if (params) {
-    ["project_id", "company_id", "evidence_type", "severity", "review_status", "reviewer_id", "date_from", "date_to"]
-      .forEach((key) => { if (params.get(key)) riskListState[key] = params.get(key); });
-  }
-  main.innerHTML = skeletonPage(4);
+/* 项目内「审核」页：本项目全部企业组合的证据清单，在一个页面里完成
+   逐条审核、分派、批量标记与导出，不必先选企业组合再进三栏。 */
+async function renderProjectReview(container, project) {
+  /* 筛选状态由路由进入时初始化（见 renderProject 的 review 分支）：
+     本函数也会被页内筛选变更重复调用，不能在这里重置，否则筛选一改就丢。 */
+  container.innerHTML = skeletonPage(4);
   const [filters, data] = await Promise.all([
     api("/risks/filters"),
     api(`/risks?${riskQueryString()}`),
@@ -2506,41 +3249,35 @@ async function renderRisks(params) {
     <tr>
       <td><input type="checkbox" data-evidence-check="${esc(item.id)}" data-review-status="${esc(item.review_status)}" aria-label="选择证据 ${esc(item.evidence_code)}"></td>
       <td class="mono small nowrap">${esc(item.evidence_code)}</td>
-      <td class="risk-project"><a href="#/projects/${esc(item.project_id)}">${esc(item.project_name)}</a></td>
       <td class="col-secondary">#${num(item.task_no)}</td>
       <td>${pill(item.evidence_type, item.evidence_type_label)}</td>
       <td class="risk-companies">${esc((item.companies || []).join("、"))}</td>
       <td>${riskPill(item.severity)}</td>
       <td class="col-secondary">${fmtDate(item.created_at)}</td>
-      <td>${pill(item.review_status, item.review_status_label)}</td>
+      <td>${pill(item.review_status, item.review_status_label)}${item.review_stage === 1 ? ` <span class="pill warn">待二审</span>` : ""}</td>
       <td class="col-secondary">${esc(item.reviewer_name || "—")}</td>
+      <td class="col-secondary">${esc(assigneeName(filters, item.assignee_id))}</td>
+      <td class="col-secondary">${item.cluster_size > 1 ? `<span class="pill">线索 ${num(item.cluster_size)} 处</span>` : "—"}</td>
       <td class="nowrap">
-        <button class="btn small" data-risk-detail="${esc(item.id)}">详情</button>
-        <a class="btn small" href="${esc(item.viewer_link)}">三栏比对</a>
+        <button class="btn small primary" data-risk-detail="${esc(item.id)}">${item.review_status === "pending" ? "审核" : "查看"}</button>
+        ${item.pair_id ? `<a class="btn small" href="${esc(item.viewer_link)}">三栏原文</a>` : ""}
       </td>
     </tr>`).join("");
 
   const totalPages = Math.max(1, Math.ceil((num(data.total)) / (riskListState.page_size || 20)));
-  const activeFilterCount = ["project_id", "company_id", "evidence_type", "severity", "review_status", "reviewer_id", "date_from", "date_to"]
+  const activeFilterCount = ["company_id", "evidence_type", "severity", "review_status",
+    "reviewer_id", "assignee_id", "review_queue", "date_from", "date_to", "include_history"]
     .filter((key) => riskListState[key]).length;
 
-  main.innerHTML = `
-    <div class="page-head">
-      <div>
-        <h1>风险管理</h1>
-        <div class="sub">汇总全部项目的异常证据，共 ${num(data.total)} 条${activeFilterCount ? ` · 已应用 ${activeFilterCount} 个筛选条件` : ""} · 系统输出的是疑似异常线索，不构成违规认定</div>
-      </div>
-    </div>
-
+  container.innerHTML = `
     <div class="card">
+      <div class="row" style="align-items:baseline;margin-bottom:4px">
+        <strong>本项目审核清单</strong>
+        <span class="small muted">共 ${num(data.total)} 条疑似异常证据${activeFilterCount ? ` · 已应用 ${activeFilterCount} 个筛选条件` : ""}${riskListState.include_history ? " · 含历史任务" : " · 仅最新任务"}</span>
+        <span class="spacer"></span>
+        <span class="small muted">系统输出仅为线索，不构成违规认定</span>
+      </div>
       <div class="filter-bar filter-bar--risk">
-        <div class="filter-field filter-field--select filter-field--wide">
-          <label for="risk-project">所属项目</label>
-          <select id="risk-project" aria-label="按项目筛选">
-            <option value="">全部项目</option>
-            ${filters.projects.map((project) => `<option value="${esc(project.id)}" ${riskListState.project_id === project.id ? "selected" : ""}>${esc(project.project_name)}</option>`).join("")}
-          </select>
-        </div>
         <div class="filter-field filter-field--select filter-field--wide">
           <label for="risk-company">涉及企业</label>
           <select id="risk-company" aria-label="按企业筛选">
@@ -2576,6 +3313,29 @@ async function renderRisks(params) {
             ${(filters.reviewers || []).map((reviewer) => `<option value="${esc(reviewer.id)}" ${riskListState.reviewer_id === reviewer.id ? "selected" : ""}>${esc(reviewer.name)}</option>`).join("")}
           </select>
         </div>
+        <div class="filter-field filter-field--select">
+          <label for="risk-queue">审核流程</label>
+          <select id="risk-queue" aria-label="按审核流程筛选">
+            <option value="">全部流程</option>
+            <option value="pending_first" ${riskListState.review_queue === "pending_first" ? "selected" : ""}>待审核（一审）</option>
+            <option value="awaiting_second" ${riskListState.review_queue === "awaiting_second" ? "selected" : ""}>待二审</option>
+            <option value="final" ${riskListState.review_queue === "final" ? "selected" : ""}>已终审</option>
+          </select>
+        </div>
+        <div class="filter-field filter-field--select">
+          <label for="risk-history">数据范围</label>
+          <select id="risk-history" aria-label="选择数据范围">
+            <option value="" ${!riskListState.include_history ? "selected" : ""}>仅最新任务</option>
+            <option value="true" ${riskListState.include_history === "true" ? "selected" : ""}>含历史任务（只读）</option>
+          </select>
+        </div>
+        <div class="filter-field filter-field--select">
+          <label for="risk-assignee">分派给</label>
+          <select id="risk-assignee" aria-label="按分派审核人筛选">
+            <option value="">全部分派</option>
+            ${(filters.assignees || []).map((person) => `<option value="${esc(person.id)}" ${riskListState.assignee_id === person.id ? "selected" : ""}>${esc(person.display_name)}</option>`).join("")}
+          </select>
+        </div>
         <div class="filter-field filter-field--date">
           <label for="risk-from">发现时间</label>
           <div class="filter-date-range">
@@ -2592,20 +3352,28 @@ async function renderRisks(params) {
     </div>
 
     <div class="card">
+      ${riskListState.include_history ? `<div class="warn-box small" style="margin-bottom:12px" role="status">
+        当前显示<b>含历史任务</b>的证据：重复分析产生的旧任务证据也会列出，其中部分可能已被新任务取代，仅供追溯，不应作为当前待办处理。
+      </div>` : ""}
       <div class="row" style="margin-bottom:12px">
         <label class="small muted"><input type="checkbox" id="risk-select-all"> 全选本页</label>
         <span class="small muted" id="risk-selected">已选 0 条</span>
         <span class="spacer"></span>
-        <span class="small muted">V1.0 仅支持批量标记为「待进一步核查」；确认异常/排除请逐条审核</span>
+        <span class="small muted">证据较多时可按维度筛选后逐条审核；需要对照原文时点行内「三栏原文」</span>
+        <select id="risk-assign-select" aria-label="选择分派审核人" class="small">
+          <option value="">分派给…</option>
+          ${(filters.assignees || []).map((person) => `<option value="${esc(person.id)}">${esc(person.display_name)}</option>`).join("")}
+        </select>
+        <button class="btn small" id="risk-assign" disabled>分派所选</button>
         <button class="btn small primary" id="risk-batch" disabled>批量标记为待进一步核查</button>
-        <button class="btn small" id="risk-export">${icon("download")}导出当前筛选结果</button>
+        <button class="btn small" id="risk-export">${icon("download")}导出本页筛选结果</button>
       </div>
       <div class="small muted" style="margin:-4px 0 12px">
         批量确认 / 批量排除按审计要求不提供：每条证据的结论必须逐条给出并写明依据。
       </div>
       ${rows ? `<div class="table-scroll"><table><thead><tr>
-          <th style="width:32px"></th><th>证据编号</th><th>所属项目</th><th class="col-secondary">任务</th><th>证据类型</th>
-          <th>涉及企业</th><th>风险等级</th><th class="col-secondary">发现时间</th><th>审核状态</th><th class="col-secondary">审核人</th><th>操作</th>
+          <th style="width:32px"></th><th>证据编号</th><th class="col-secondary">任务</th><th>证据类型</th>
+          <th>涉及企业</th><th>风险等级</th><th class="col-secondary">发现时间</th><th>审核状态</th><th class="col-secondary">审核人</th><th class="col-secondary">分派给</th><th class="col-secondary">线索</th><th>操作</th>
         </tr></thead><tbody>${rows}</tbody></table></div>`
         : `<div class="empty">没有符合条件的证据。</div>`}
       <div class="row" style="margin-top:12px">
@@ -2616,33 +3384,50 @@ async function renderRisks(params) {
       </div>
     </div>`;
 
-  const rerender = () => renderRisks(null);
+  /* 重渲染只刷新本页内容，不动项目外壳 */
+  const rerender = () => renderProjectReview(container, project);
   const bind = (selector, key) => {
     const element = $(selector);
     if (element) element.addEventListener("change", () => {
+      /* 历史任务是只读视图：开关状态要立即同步回列表状态，避免筛选串味 */
       riskListState[key] = element.value;
-      /* 切换项目后，原先选中的企业可能不属于新项目，一并清空 */
-      if (key === "project_id") riskListState.company_id = "";
       riskListState.page = 1;
       rerender();
     });
   };
-  bind("#risk-project", "project_id");
   bind("#risk-company", "company_id");
   bind("#risk-type", "evidence_type");
   bind("#risk-severity", "severity");
   bind("#risk-review", "review_status");
   bind("#risk-reviewer", "reviewer_id");
+  bind("#risk-queue", "review_queue");
+  bind("#risk-history", "include_history");
+  bind("#risk-assignee", "assignee_id");
   $("#risk-from")?.addEventListener("change", (event) => { riskListState.date_from = event.target.value; riskListState.page = 1; rerender(); });
   $("#risk-to")?.addEventListener("change", (event) => { riskListState.date_to = event.target.value; riskListState.page = 1; rerender(); });
   $("#risk-query")?.addEventListener("click", rerender);
   $("#risk-reset")?.addEventListener("click", () => {
-    riskListState = { project_id: "", company_id: "", evidence_type: "", severity: "", review_status: "", reviewer_id: "", date_from: "", date_to: "", page: 1, page_size: 20 };
+    /* 重置只清筛选，项目归属不变 */
+    resetRiskListState(project.id);
     rerender();
   });
 
   $("#risk-prev")?.addEventListener("click", () => { riskListState.page = Math.max(1, riskListState.page - 1); rerender(); });
   $("#risk-next")?.addEventListener("click", () => { riskListState.page = riskListState.page + 1; rerender(); });
+
+  $("#risk-assign")?.addEventListener("click", async () => {
+    const ids = $$("[data-evidence-check]").filter((box) => box.checked).map((box) => box.dataset.evidenceCheck);
+    if (!ids.length) return;
+    const assigneeId = $("#risk-assign-select")?.value || "";
+    try {
+      const result = await api("/risks/batch-assign", {
+        method: "POST",
+        body: { evidence_ids: ids, assignee_id: assigneeId || null },
+      });
+      toast(assigneeId ? `已分派 ${result.updated} 条证据` : `已取消分派 ${result.updated} 条证据`, "success");
+      rerender();
+    } catch (error) { toast(error.message, "error"); }
+  });
 
   const updateSelection = () => {
     const checked = $$("[data-evidence-check]").filter((box) => box.checked);
@@ -2651,6 +3436,8 @@ async function renderRisks(params) {
       ? `已选 ${checked.length} 条（其中 ${reviewed.length} 条已有审核结论）`
       : `已选 ${checked.length} 条`;
     $("#risk-batch").disabled = checked.length === 0;
+    const assignBtn = $("#risk-assign");
+    if (assignBtn) assignBtn.disabled = checked.length === 0;
   };
   $$("[data-evidence-check]").forEach((box) => box.addEventListener("change", updateSelection));
   $("#risk-select-all")?.addEventListener("change", (event) => {
@@ -2697,18 +3484,13 @@ async function renderRisks(params) {
     });
   });
 
-  $$("[data-risk-detail]").forEach((button) => button.addEventListener("click", () => openRiskDetail(button.dataset.riskDetail)));
+  /* 审核完成后刷新列表，让「待审核」计数与行内状态立即反映最新结论 */
+  $$("[data-risk-detail]").forEach((button) => button.addEventListener("click", () => openRiskDetail(button.dataset.riskDetail, rerender)));
 
-  /* 导出：后端报告是项目级的，先让用户确认导出哪个项目，
-     避免导出一个「看不出筛选口径」的文件。 */
+  /* 导出：后端报告是项目级的。这里已是项目页内，直接导出本项目，
+     并说明当前筛选只影响清单展示、报告仍是项目级汇总。 */
   const exportBtn = $("#risk-export");
   exportBtn?.addEventListener("click", () => {
-    const projectId = riskListState.project_id;
-    if (!projectId) {
-      toast("请先在上方选择「所属项目」再导出：报告按项目生成。", "error");
-      return;
-    }
-    const projectName = (filters.projects || []).find((project) => project.id === projectId)?.project_name || "项目";
     const scope = [
       riskListState.evidence_type && `类型：${TYPE[riskListState.evidence_type] || riskListState.evidence_type}`,
       riskListState.severity && `等级：${RISK[riskListState.severity] || riskListState.severity}`,
@@ -2716,14 +3498,14 @@ async function renderRisks(params) {
       riskListState.company_id && "已限定企业",
       (riskListState.date_from || riskListState.date_to) && `时间：${riskListState.date_from || "不限"} 至 ${riskListState.date_to || "不限"}`,
     ].filter(Boolean).join("；") || "全部证据";
-    if (!confirm(`将导出「${projectName}」的项目分析报告（含当前任务的全部证据）。\n\n当前筛选：${scope}\n\n报告为项目级汇总，不会只包含被筛出的条目。确认导出？`)) return;
+    if (!confirm(`将导出「${project.project_name}」的项目分析报告（含当前任务的全部证据）。\n\n当前筛选：${scope}\n\n报告为项目级汇总，不会只包含被筛出的条目。确认导出？`)) return;
     withBusy(exportBtn, async () => {
       try {
-        const blob = await api(`/projects/${projectId}/reports/excel`, { blob: true });
+        const blob = await api(`/projects/${project.id}/reports/excel`, { blob: true });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = `${projectName}-分析报告.xlsx`;
+        link.download = `${project.project_name}-分析报告.xlsx`;
         document.body.appendChild(link); link.click(); link.remove();
         URL.revokeObjectURL(url);
         toast("报告已导出", "success");
@@ -2732,15 +3514,21 @@ async function renderRisks(params) {
   });
 }
 
-async function openRiskDetail(evidenceId) {
+async function openRiskDetail(evidenceId, onReviewed = null) {
   let detail;
   try {
     detail = await api(`/risks/${evidenceId}`);
   } catch (error) { toast(error.message, "error"); return; }
+  /* 本页是项目内的审核清单：弹窗直接给出审核表单（省去先选企业组合），
+     需要对照原文时走「三栏原文」。两类证据共用同一套审核组件。 */
+  const projectLevel = !detail.pair_id;
   const files = (detail.files || []).map((file) => `
-    <div class="small">${esc(file.company_name || "")} · ${esc(file.file_name || "")} 第 ${num(file.page_index)} 页</div>`).join("") || "—";
+    <div class="small">${esc(file.company_name || "")} · ${esc(file.file_name || "")} ${file.page_index ? `第 ${num(file.page_index)} 页` : ""}</div>`).join("") || "—";
+  const browserLink = projectLevel
+    ? `<a class="btn small" href="#/projects/${esc(detail.project_id)}?tab=quotes">前往报价清单核对</a>`
+    : `<a class="btn small" id="risk-detail-viewer" href="${esc(detail.viewer_link)}">在三栏中查看原文</a>`;
   const modal = openModal({
-    title: `风险详情 · ${detail.evidence_code}`,
+    title: `证据详情 · ${detail.evidence_code}`,
     wide: true,
     body: `
       <dl class="kv">
@@ -2753,16 +3541,34 @@ async function openRiskDetail(evidenceId) {
         <dt>发现时间</dt><dd>${fmtDate(detail.created_at)}</dd>
         <dt>审核状态</dt><dd>${pill(detail.review_status, REVIEW[detail.review_status])}</dd>
         <dt>审核人</dt><dd>${esc(detail.reviewer_name || "—")}</dd>
+        <dt>分派给</dt><dd>${esc(detail.assignee_name || "—")}</dd>
         <dt>相关文件</dt><dd>${files}</dd>
         <dt>原始证据</dt><dd>${esc(detail.summary || "")}</dd>
       </dl>
       ${detail.source_a ? `<div class="detail-block"><div class="small" style="font-weight:600">原始文本</div>
         <div class="viewer-text">${esc(detail.source_a.snippet || "")}</div></div>` : ""}
-      ${renderHistory(detail.review_records || [])}
-      <div class="review-actions">
-        <a class="btn small primary" href="${esc(detail.viewer_link)}">进入三栏比对</a>
-      </div>`,
+      <div id="risk-detail-history">${renderHistory(detail.review_records || [])}</div>
+      <div id="risk-detail-review"></div>
+      <div class="review-actions">${browserLink}</div>`,
   });
+  const historyHost = $("#risk-detail-history", modal.root);
+  const refresh = async () => {
+    try {
+      detail = await api(`/risks/${evidenceId}`);
+    } catch (error) { toast(error.message, "error"); return; }
+    renderReview();
+    if (typeof onReviewed === "function") onReviewed();
+  };
+  const renderReview = () => {
+    const host = $("#risk-detail-review", modal.root);
+    if (!host) return;
+    host.innerHTML = reviewFormHtml(detail);
+    bindReviewForm(host, detail, refresh);
+    if (historyHost) historyHost.innerHTML = renderHistory(detail.review_records || []);
+  };
+  renderReview();
+  /* 跳出弹窗的链接必须先关闭弹窗，否则旧弹窗会盖在新页面上 */
+  $("#risk-detail-viewer", modal.root)?.addEventListener("click", () => modal.close());
   return modal;
 }
 
@@ -2811,6 +3617,7 @@ const RULE_PARAM_GROUPS = {
     { title: "文本分块", keys: ["text_chunk_target_min", "text_chunk_target_max", "text_chunk_max_chars", "text_chunk_min_chars"] },
     { title: "算法参数", keys: ["text_shingle_size", "text_minhash_num_perm", "text_lsh_threshold", "max_candidate_pairs", "max_matches_per_pair"] },
     { title: "风险分级", keys: ["risk_text_high_count", "risk_text_high_similarity", "risk_text_medium_count", "risk_text_medium_similarity"] },
+    { title: "文档结构指纹", keys: ["structure_min_titles", "structure_title_ratio", "structure_table_min"] },
   ],
   personnel: [
     { title: "姓名匹配", keys: ["similar_name_ratio", "name_match_modes", "key_positions"] },
@@ -2819,6 +3626,8 @@ const RULE_PARAM_GROUPS = {
   price: [
     { title: "报价偏差", keys: ["price_cv", "price_close_deviation", "price_sequence_tolerance"] },
     { title: "尾数特征", keys: ["special_tail", "tail_concentration_min_count"] },
+    { title: "逐项单价", keys: ["price_line_item_min_shared", "price_line_item_min_identical", "price_line_item_min_ratio"] },
+    { title: "报价文件质量", keys: ["price_amount_case_consistency"] },
   ],
   ocr: [
     { title: "百度 OCR 凭据", keys: ["baidu_api_key", "baidu_secret_key"] },
@@ -2845,9 +3654,12 @@ const RULE_PARAM_HINTS = {
   risk_text_high_similarity: "同时满足该相似度才判为高风险",
   risk_text_medium_count: "达到该条数判为中风险",
   risk_text_medium_similarity: "同时满足该相似度才判为中风险",
+  structure_min_titles: "至少几个非公共标题按相同顺序命中",
+  structure_title_ratio: "命中标题占各自标题的最低比例",
+  structure_table_min: "列数与表头一致的表格最少张数",
   similar_name_ratio: "姓名相似度达到该值视为疑似同名",
   name_match_modes: "姓名匹配方式",
-  key_positions: "纳入比对的关键岗位",
+  key_positions: "纳入比对的关键岗位；留空表示不按岗位筛选，所有岗位都参与比对",
   risk_personnel_high_count: "重复人数达到该值判为高风险",
   risk_personnel_medium_count: "重复人数达到该值判为中风险",
   price_cv: "报价变异系数阈值",
@@ -2913,7 +3725,7 @@ function ruleParamLabel(key) {
     risk_text_medium_similarity: "文本中风险相似度阈值",
     similar_name_ratio: "近名相似度阈值",
     name_match_modes: "姓名匹配方式",
-    key_positions: "关键岗位范围",
+    key_positions: "关键岗位范围（留空 = 不筛选）",
     risk_personnel_high_count: "人员高风险人数阈值",
     risk_personnel_medium_count: "人员中风险人数阈值",
     price_cv: "变异系数阈值",
@@ -2921,7 +3733,10 @@ function ruleParamLabel(key) {
     price_sequence_tolerance: "等差数列误差阈值",
     special_tail: "特殊尾数取值",
     tail_concentration_min_count: "尾数集中最少家数",
-    amount_case_consistency: "大小写金额一致性规则",
+    price_line_item_min_shared: "逐项单价雷同的最少共同分项数",
+    price_line_item_min_identical: "逐项单价完全相同的最少条数",
+    price_line_item_min_ratio: "逐项单价相同的占比阈值",
+    price_amount_case_consistency: "大小写金额一致性检查",
     id_card_match: "身份证号匹配规则",
     certificate_match: "证书编号匹配规则",
     title_filter: "常见称谓过滤规则",
@@ -2978,6 +3793,12 @@ const RULE_PARAM_BOUND = {
   risk_personnel_high_count: { min: 0, max: 1000, step: 1 },
   risk_personnel_medium_count: { min: 0, max: 1000, step: 1 },
   tail_concentration_min_count: { min: 0, max: 100, step: 1 },
+  price_line_item_min_shared: { min: 1, max: 1000, step: 1 },
+  price_line_item_min_identical: { min: 1, max: 1000, step: 1 },
+  price_line_item_min_ratio: { min: 0, max: 1, step: 0.01 },
+  structure_min_titles: { min: 1, max: 50, step: 1 },
+  structure_title_ratio: { min: 0, max: 1, step: 0.01 },
+  structure_table_min: { min: 1, max: 50, step: 1 },
 };
 
 function ruleParamBound(key, value) {
@@ -3551,8 +4372,15 @@ $("#login-form").addEventListener("submit", async (event) => {
       localStorage.setItem("bid_token", state.token);
       localStorage.setItem("bid_user", JSON.stringify(state.user));
       showApp();
-      if (!location.hash) location.hash = "#/workbench";
+      /* 登录成功后统一回到工作台：地址栏残留的 #/login 或退出前的旧路由
+         都可能指向登录页/不存在页，因此这里显式重置。 */
+      if (!location.hash || /^#\/login(\?|$)/.test(location.hash)) {
+        location.hash = "#/workbench";
+      }
       await route();
+      if (result.user?.warn_default_password) {
+        toast("当前仍在使用部署配置的初始管理员口令，请在「系统管理 → 用户管理」中立即修改密码。", "error");
+      }
     } catch (error) {
       if (errorBox) {
         errorBox.hidden = false;

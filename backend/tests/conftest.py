@@ -10,6 +10,8 @@ os.environ.update(
         "STORAGE_ROOT": f"{_TEST_ROOT}/storage",
         "SYNC_TASKS": "true",
         "SEED_DEMO": "false",
+        # 测试直接按模型建表，不跑迁移脚本（迁移正确性由 test_migrations.py 单独校验）
+        "SCHEMA_MANAGEMENT": "create_all",
         "SECRET_KEY": "test-secret",
         "ADMIN_USERNAME": "admin",
         "ADMIN_PASSWORD": "admin123",

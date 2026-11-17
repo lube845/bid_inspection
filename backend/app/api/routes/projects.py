@@ -40,6 +40,7 @@ def _project_payload(project: Project, stats: dict | None = None) -> dict:
         "description": project.description,
         "status": project.status,
         "status_label": PROJECT_STATUS_LABELS.get(project.status, project.status),
+        "requires_second_review": bool(project.requires_second_review),
         "created_at": project.created_at,
         "updated_at": project.updated_at,
     }

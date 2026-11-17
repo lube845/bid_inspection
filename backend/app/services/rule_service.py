@@ -39,6 +39,16 @@ TEXT_PARAMS = {
     "max_matches_per_pair": 200,
     # 招标文件公共内容排除：命中招标文件的指纹占比阈值
     "tender_exclusion_ratio": 0.9,
+    # 批次共同模板：至少几家企业共现、信息量上限、长段豁免长度
+    "template_min_companies": 3,
+    "template_max_informativeness": 0.12,
+    "template_max_chars_guard": 200,
+    # 跨章节类型命中（技术标 vs 商务标等）需达到的长度才成证据
+    "text_cross_type_guard_chars": 120,
+    # 结构指纹：至少几个非公共标题按同序命中、占各自标题的比例、表格门槛
+    "structure_min_titles": 3,
+    "structure_title_ratio": 0.5,
+    "structure_table_min": 3,
     # 风险等级分级阈值（PRD 4.10.8：等级必须可解释、可配置）
     "risk_text_high_count": 5,
     "risk_text_high_similarity": 0.95,
@@ -49,15 +59,9 @@ TEXT_PARAMS = {
 PERSONNEL_PARAMS = {
     "similar_name_ratio": 0.85,
     "name_match_modes": ["exact", "similar"],
-    "key_positions": [
-        "项目负责人",
-        "项目经理",
-        "技术负责人",
-        "授权代表",
-        "造价人员",
-        "施工人员",
-        "设计负责人",
-    ],
+    # 关键岗位范围：空列表 = 不按岗位筛选（全部岗位参与比对）。
+    # 填写后只比对岗位命中这些关键词的人员；改动会在下一次分析任务中生效。
+    "key_positions": [],
     "risk_personnel_high_count": 3,
     "risk_personnel_medium_count": 1,
 }
@@ -68,6 +72,14 @@ PRICE_PARAMS = {
     "price_sequence_tolerance": 0.005,
     "special_tail": ["888", "999", "998"],
     "tail_concentration_min_count": 3,
+    # 整数万元/整数百元这类取整尾数在采购中很常见，默认不作为「尾数集中」信号
+    "common_tail_values": ["000", "500"],
+    # 逐项单价雷同（清单明细）：三条门槛同时满足才报
+    "price_line_item_min_shared": 5,
+    "price_line_item_min_identical": 4,
+    "price_line_item_min_ratio": 0.6,
+    # 单家大小写金额一致性（质量项）
+    "price_amount_case_consistency": True,
 }
 
 # OCR 识别属于解析期设置，不参与比对判定，但同样走规则版本管理：
@@ -103,10 +115,7 @@ DIMENSION_LABELS = {
 }
 
 # 这些参数在 V1.0 只存储与展示，尚未接入检测引擎。
-NOT_ENFORCED_PARAMS = {
-    "personnel": {"key_positions"},
-    "price": {"amount_case_consistency"},
-}
+NOT_ENFORCED_PARAMS: dict[str, set[str]] = {}
 
 # 敏感参数：对外只返回脱敏占位符，只有管理员能读写真实值
 SENSITIVE_PARAMS = {"baidu_api_key", "baidu_secret_key"}
@@ -134,6 +143,14 @@ def default_params(dimension: str) -> dict:
             "max_candidate_pairs": settings.max_candidate_pairs,
             "max_matches_per_pair": settings.max_matches_per_pair,
             "tender_exclusion_ratio": 0.9,
+            "template_min_companies": 3,
+            "template_max_informativeness": 0.12,
+            "template_max_chars_guard": 200,
+            "text_cross_type_guard_chars": 120,
+            # 结构指纹：仅标题一致不成立证据，表格/图片信号才计入
+            "structure_min_titles": 3,
+            "structure_title_ratio": 0.5,
+            "structure_table_min": 3,
             "risk_text_high_count": 5,
             "risk_text_high_similarity": 0.95,
             "risk_text_medium_count": 2,
@@ -146,6 +163,10 @@ def default_params(dimension: str) -> dict:
             "price_sequence_tolerance": settings.price_sequence_tolerance,
             "special_tail": ["888", "999", "998"],
             "tail_concentration_min_count": 3,
+            "price_line_item_min_shared": 5,
+            "price_line_item_min_identical": 4,
+            "price_line_item_min_ratio": 0.6,
+            "price_amount_case_consistency": True,
         }
     if dimension == "ocr":
         return {
@@ -199,6 +220,143 @@ def ensure_engine_version(db: Session, actor: User | None = None) -> DetectionRu
         activate=True,
     )
     return record
+
+
+def ensure_missing_text_params(db: Session, actor: User | None = None) -> DetectionRuleVersion | None:
+    """给生效中的文本规则补齐新引入的参数键（幂等）。
+
+    检测引擎新增参数（例如批次共同模板的三个阈值）后，旧的生效版本里没有这些键：
+    阈值回落机制会让它们按默认值生效，但管理员在规则页看不到、也改不了。
+    这里补一个版本把缺的键带上并生效，**已存在的键保持原值**——不覆盖管理员
+    调过的参数。缺省值取自 ``default_params``，与回落默认值同源。
+    """
+    active = active_version(db, "text")
+    if active is None:
+        return None
+    params = dict(active.params or {})
+    factory = default_params("text")
+    missing = {
+        key: factory[key]
+        for key in factory
+        if key not in params
+    }
+    if not missing:
+        return None
+    merged = dict(params)
+    merged.update(missing)
+    return create_version(
+        db,
+        "text",
+        merged,
+        "补齐文本相似新增参数：" + "、".join(sorted(missing)),
+        actor,
+        activate=True,
+    )
+
+
+def _migrate_legacy_key_positions(
+    db: Session, actor: User | None = None
+) -> list[DetectionRuleVersion]:
+    """把历史版本里「只展示不生效」的关键岗位范围迁成空列表（不筛选）。
+
+    只在参数恰好等于旧出厂默认值时迁移；管理员自己填过的值保持不动。
+    """
+    legacy_default = [
+        "项目负责人",
+        "项目经理",
+        "技术负责人",
+        "授权代表",
+        "造价人员",
+        "施工人员",
+        "设计负责人",
+    ]
+    active = active_version(db, "personnel")
+    if active is None:
+        return []
+    params = dict(active.params or {})
+    if params.get("key_positions") != legacy_default:
+        return []
+    merged = dict(params)
+    merged["key_positions"] = []
+    return [
+        create_version(
+            db,
+            "personnel",
+            merged,
+            "关键岗位范围改为可配置筛选：历史默认值迁移为不筛选，"
+            "如需只比对关键岗位请在规则页填写岗位关键词",
+            actor,
+            activate=True,
+        )
+    ]
+
+
+def ensure_missing_params(
+    db: Session, actor: User | None = None
+) -> list[DetectionRuleVersion]:
+    """给所有生效维度补齐新引入的参数键（幂等）。
+
+    检测引擎新增参数（批次共同模板、逐项单价门槛等）后，旧的生效版本里没有
+    这些键：阈值回落机制会让它们按默认值生效，但管理员在规则页看不到、也改不
+    了。这里逐个维度补一个版本把缺的键带上并生效，**已存在的键保持原值**——
+    不覆盖管理员调过的参数。
+
+    敏感参数（OCR 密钥）不参与补齐：空值不是「缺键」，补进去反而会清掉真实凭据。
+    """
+    records: list[DetectionRuleVersion] = []
+    # 关键岗位范围历史上只记录不生效，出厂值是 7 个岗位；它一旦真正接入引擎，
+    # 旧版本里的这份列表会立刻开始过滤人员。这里先把它迁成「不筛选」，由管理员
+    # 在规则页按需填写，而不是让升级本身悄悄改变人员比对的覆盖范围。
+    records.extend(_migrate_legacy_key_positions(db, actor))
+    for dimension in DIMENSION_PARAMS:
+        active = active_version(db, dimension)
+        if active is None:
+            continue
+        params = dict(active.params or {})
+        factory = {
+            key: value
+            for key, value in default_params(dimension).items()
+            if key not in SENSITIVE_PARAMS
+        }
+        missing = {key: value for key, value in factory.items() if key not in params}
+        if not missing:
+            continue
+        merged = dict(params)
+        merged.update(missing)
+        records.append(
+            create_version(
+                db,
+                dimension,
+                merged,
+                f"{DIMENSION_LABELS.get(dimension, dimension)}补齐新增参数："
+                + "、".join(sorted(missing)),
+                actor,
+                activate=True,
+            )
+        )
+    return records
+
+
+def ensure_missing_text_params(db: Session, actor: User | None = None) -> DetectionRuleVersion | None:
+    """兼容旧调用：只补齐文本维度。"""
+    active = active_version(db, "text")
+    if active is None:
+        return None
+    params = dict(active.params or {})
+    factory = default_params("text")
+    missing = {key: value for key, value in factory.items() if key not in params}
+    if not missing:
+        return None
+    merged = dict(params)
+    merged.update(missing)
+    return create_version(
+        db,
+        "text",
+        merged,
+        "补齐文本相似新增参数：" + "、".join(sorted(missing)),
+        actor,
+        activate=True,
+    )
 
 
 def list_versions(db: Session, dimension: str | None = None) -> list[DetectionRuleVersion]:
@@ -454,19 +612,44 @@ def resolve_thresholds(snapshot: dict[str, dict]) -> dict:
         "max_candidate_pairs": settings.max_candidate_pairs,
         "max_matches_per_pair": settings.max_matches_per_pair,
         "tender_exclusion_ratio": 0.9,
+        "template_min_companies": 3,
+        "template_max_informativeness": 0.12,
+        "template_max_chars_guard": 200,
         "price_cv": settings.price_cv_threshold,
         "price_close_deviation": settings.price_close_deviation,
         "price_sequence_tolerance": settings.price_sequence_tolerance,
+        "price_line_item_min_shared": 5,
+        "price_line_item_min_identical": 4,
+        "price_line_item_min_ratio": 0.6,
+        "special_tail": ["888", "999", "998"],
+        "tail_concentration_min_count": 3,
+        "common_tail_values": ["000", "500"],
+        "price_amount_case_consistency": True,
+        "structure_min_titles": 3,
+        "structure_title_ratio": 0.5,
+        "structure_table_min": 3,
         "risk_text_high_count": 5,
         "risk_text_high_similarity": 0.95,
         "risk_text_medium_count": 2,
         "risk_text_medium_similarity": 0.85,
         "risk_personnel_high_count": 3,
         "risk_personnel_medium_count": 1,
+        "key_positions": [],
     }
     for entry in (snapshot or {}).values():
         for key, value in (entry.get("params") or {}).items():
-            if key in thresholds and isinstance(thresholds[key], (int, float)):
+            if key not in thresholds or value is None:
+                continue
+            default = thresholds[key]
+            # 数值阈值按默认值的类型转换；列表（如 special_tail）与布尔值单独处理，
+            # 否则会被「只覆盖数值键」的旧逻辑静默丢弃。
+            if isinstance(default, bool):
+                if isinstance(value, bool):
+                    thresholds[key] = value
+            elif isinstance(default, list):
+                if isinstance(value, (list, tuple)):
+                    thresholds[key] = [str(item) for item in value]
+            elif isinstance(default, (int, float)):
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     thresholds[key] = value
     return thresholds

@@ -1,6 +1,4 @@
-from datetime import datetime
-
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class ProjectCreate(BaseModel):
@@ -13,18 +11,5 @@ class ProjectUpdate(BaseModel):
     project_name: str | None = Field(default=None, min_length=1, max_length=255)
     project_code: str | None = Field(default=None, max_length=128)
     description: str | None = None
-
-
-class ProjectOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: str
-    project_name: str
-    project_code: str | None
-    description: str | None
-    status: str
-    created_at: datetime
-    updated_at: datetime
-    company_count: int = 0
-    file_count: int = 0
-    last_analysis_at: datetime | None = None
+    # 结论需要两人复核时才终审；只影响之后发起的审核，不追溯已终审证据
+    requires_second_review: bool | None = None

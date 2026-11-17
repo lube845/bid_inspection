@@ -23,22 +23,6 @@ def file_payload(file: OriginalFile, company: Company | None = None) -> dict:
     }
 
 
-def page_summary(file: OriginalFile) -> dict:
-    pages = sorted(file.pages, key=lambda p: p.page_index)
-    return {
-        "id": file.id,
-        "file_name": file.file_name,
-        "file_type": file.file_type,
-        "page_count": file.page_count,
-        "success_pages": sum(1 for p in pages if p.parse_status == "success"),
-        "empty_pages": sum(1 for p in pages if p.parse_status == "empty"),
-        "failed_pages": sum(1 for p in pages if p.parse_status == "failed"),
-        "ocr_pages": sum(1 for p in pages if p.extraction_method == "ocr"),
-        "parse_status": file.parse_status,
-        "parse_message": file.parse_message,
-    }
-
-
 def page_payload(page: DocumentPage) -> dict:
     return {
         "id": page.id,

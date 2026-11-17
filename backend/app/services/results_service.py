@@ -34,7 +34,72 @@ TYPE_LABELS = {
     EvidenceType.TEXT.value: "文本相似",
     EvidenceType.PERSONNEL.value: "人员重复",
     EvidenceType.PRICE.value: "价格异常",
+    EvidenceType.FILE.value: "文件指纹",
+    EvidenceType.METADATA.value: "文档元数据",
 }
+# 报价来源：报告「报价汇总表」与清单页共用同一套文案
+QUOTE_SOURCE_LABELS = {
+    "manual": "手工补录",
+    "import": "批量导入",
+    "auto": "自动识别",
+}
+# 取证类证据的子类型标签：Excel 报告与风险列表共用
+SUBTYPE_LABELS = {
+    "identical_file": "同一份文件",
+    "shared_metadata": "元数据同源",
+    "shared_image": "相同图片",
+    "shared_rsid": "修订标识同源",
+    "shared_contact": "共用联系方式",
+    "unusual_duration_match": "非常规工期一致",
+    "role_roster_match": "项目班子一致",
+    "line_item_duplicate": "逐项单价雷同",
+    "structure_similarity": "文档结构相似",
+    "shared_anomaly": "同一处非规范写法",
+    "amount_case_mismatch": "大小写金额不一致",
+    "quote_needs_confirmation": "自动识别金额待确认",
+}
+
+
+def _forensics_detail(evidence: ComparisonEvidence, data: dict) -> str:
+    """把不同子类型的取证证据压成一行摘要文本，供 Excel 取证表展示。"""
+    subtype = evidence.evidence_subtype
+    if subtype == "identical_file":
+        return f"SHA-256 {data.get('file_hash', '')}"
+    if subtype == "structure_similarity":
+        comparison = data.get("comparison") or {}
+        parts = []
+        if comparison.get("title_hit"):
+            parts.append(f"标题 {comparison.get('title_common', 0)} 个同序")
+        if comparison.get("table_hit"):
+            parts.append(f"表格 {comparison.get('table_pairs', 0)} 张同构")
+        if comparison.get("image_hit"):
+            parts.append(f"图片 {comparison.get('image_run', 0)} 张同序")
+        return "；".join(parts) or "—"
+    if subtype == "shared_anomaly":
+        return f"{data.get('term', '')} → 应为「{data.get('correction', '')}」"
+    if subtype == "shared_image":
+        return (
+            f"匹配 {data.get('match_count', 0)} 张图片，"
+            f"其中完全相同 {data.get('identical_count', 0)} 张"
+        )
+    if subtype == "shared_rsid":
+        return (
+            f"共同修订标识 {data.get('shared_count', 0)} 个，"
+            f"真实编辑痕迹 {data.get('shared_trace_count', 0)} 个"
+        )
+    if subtype == "shared_contact":
+        return f"{data.get('value', '')}"
+    if subtype == "unusual_duration_match":
+        return f"工期 {data.get('value', '')}"
+    if subtype == "role_roster_match":
+        roster = data.get("roster") or {}
+        return "；".join(f"{role}={name}" for role, name in roster.items())
+    # shared_metadata 与兜底：列出共同字段
+    labels = data.get("shared_field_labels") or {}
+    shared = data.get("shared_fields") or {}
+    return "；".join(f"{labels.get(key, key)}={value}" for key, value in shared.items())
+
+
 _RISK_ORDER = {
     RiskLevel.NONE.value: 0,
     RiskLevel.LOW.value: 1,
@@ -153,10 +218,18 @@ def overview(db: Session, project: Project, task_id: str | None = None) -> dict:
             "text_risk": pair.text_risk,
             "personnel_risk": pair.personnel_risk,
             "price_risk": pair.price_risk,
+            "forensic_risk": pair.forensic_risk,
             "overall_risk": pair.overall_risk,
             "text_count": counts[pair.id][EvidenceType.TEXT.value],
             "personnel_count": counts[pair.id][EvidenceType.PERSONNEL.value],
-            "price_count": len(price_for_pair),
+            # 价格证据有两类：项目级规则（报价集中/等差/尾数，挂在参与企业上）
+            # 与组合级逐项单价雷同（挂在组合上）。两处口径必须合并，否则
+            # 「逐项单价」证据会在价格列里凭空消失。
+            "price_count": len(price_for_pair)
+            + counts[pair.id][EvidenceType.PRICE.value],
+            # 文件级取证：同一份文件被两家提交 / 元数据指向同一编写环境
+            "file_count": counts[pair.id][EvidenceType.FILE.value],
+            "metadata_count": counts[pair.id][EvidenceType.METADATA.value],
             "status": pair.status,
         }
         pair_rows.append(row)
@@ -227,11 +300,29 @@ def overview(db: Session, project: Project, task_id: str | None = None) -> dict:
             "participant_count": len(names),
             "pair_count": len(pairs),
             "text_evidence_count": len(text_evidences),
+            # 有效 = 没有命中招标公共内容、不是批次共同模板、也不是封面字段雷同
             "effective_text_count": sum(
-                1 for e in text_evidences if not e.evidence_data.get("excluded_by_tender")
+                1
+                for e in text_evidences
+                if not e.evidence_data.get("excluded_by_tender")
+                and not e.evidence_data.get("excluded_by_template")
+                and not e.evidence_data.get("cover_only")
+            ),
+            "template_text_count": sum(
+                1 for e in text_evidences if e.evidence_data.get("excluded_by_template")
+            ),
+            "cover_text_count": sum(
+                1 for e in text_evidences if e.evidence_data.get("cover_only")
             ),
             "personnel_duplicate_count": len(personnel_names),
             "price_abnormal_company_count": len(price_companies),
+            # 文件级取证：文件指纹相同 / 元数据同源
+            "file_evidence_count": sum(
+                1 for e in all_evidences if e.evidence_type == EvidenceType.FILE.value
+            ),
+            "metadata_evidence_count": sum(
+                1 for e in all_evidences if e.evidence_type == EvidenceType.METADATA.value
+            ),
             # 价格维度覆盖情况：识别到报价的企业数 / 应识别企业数 / 未识别的企业
             "price_coverage": price_coverage,
             "pending_review_count": sum(
@@ -271,6 +362,234 @@ def task_history(db: Session, project_id: str) -> list[dict]:
     ]
 
 
+def _evidence_identity(evidence: ComparisonEvidence) -> str:
+    """跨任务匹配证据的稳定键.
+
+    文本证据用「组合 + 块对」，其余用「组合/参与企业 + 类型 + 子类型 + 关键值」。
+    重跑会生成新行 id，只有内容键能跨任务对上。
+    """
+    data = evidence.evidence_data or {}
+    company_ids = "|".join(sorted({p.company_id for p in evidence.participants}))
+    # 组合 id 每次任务都会变，跨任务匹配必须用企业 id 而不是 comparison_pair_id
+    pair = evidence.pair
+    pair_key = (
+        "|".join(sorted([pair.company_a_id, pair.company_b_id]))
+        if pair
+        else company_ids
+    )
+    if evidence.evidence_type == EvidenceType.TEXT.value:
+        chunk_a = data.get("chunk_a_id") or ""
+        chunk_b = data.get("chunk_b_id") or ""
+        if chunk_a or chunk_b:
+            return f"text|{pair_key}|{chunk_a}|{chunk_b}|{evidence.evidence_subtype}"
+        return f"text|{pair_key}|{data.get('matched_text', '')[:40]}"
+    if evidence.evidence_type == EvidenceType.PERSONNEL.value:
+        return f"personnel|{pair_key}|{data.get('name') or data.get('name_a')}"
+    if evidence.evidence_type == EvidenceType.PRICE.value:
+        return f"price|{company_ids}|{evidence.evidence_subtype}"
+    if evidence.evidence_subtype == "structure_similarity":
+        return f"structure|{pair_key}"
+    value = data.get("value") or data.get("file_hash") or data.get("term") or ""
+    return f"{evidence.evidence_type}|{pair_key}|{evidence.evidence_subtype}|{value}"
+
+
+def _evidence_identity_label(evidence: ComparisonEvidence) -> str:
+    labels = SUBTYPE_LABELS.get(evidence.evidence_subtype)
+    return labels or TYPE_LABELS.get(evidence.evidence_type, evidence.evidence_type)
+
+
+def task_diff(
+    db: Session,
+    project: Project,
+    current_task_id: str,
+    previous_task_id: str | None = None,
+) -> dict:
+    """比较同一项目的两个分析任务：输入、证据、风险与审核结论的变化。"""
+    current = db.get(AnalysisTask, current_task_id)
+    if current is None or current.project_id != project.id:
+        raise ValueError("分析任务不存在")
+    if previous_task_id:
+        previous = db.get(AnalysisTask, previous_task_id)
+    else:
+        previous = db.scalars(
+            select(AnalysisTask)
+            .where(
+                AnalysisTask.project_id == project.id,
+                AnalysisTask.task_no < current.task_no,
+            )
+            .order_by(AnalysisTask.task_no.desc())
+            .limit(1)
+        ).first()
+    if previous is None:
+        raise ValueError("没有可对比的上一次分析任务")
+
+    def evidences_of(task: AnalysisTask) -> list[ComparisonEvidence]:
+        return list(
+            db.scalars(
+                select(ComparisonEvidence).where(
+                    ComparisonEvidence.analysis_task_id == task.id,
+                    ComparisonEvidence.is_current.is_(True),
+                )
+            )
+        )
+
+    current_evidences = evidences_of(current)
+    previous_evidences = evidences_of(previous)
+    current_map = {_evidence_identity(e): e for e in current_evidences}
+    previous_map = {_evidence_identity(e): e for e in previous_evidences}
+
+    added, removed, changed = [], [], []
+    for key, evidence in current_map.items():
+        old = previous_map.get(key)
+        if old is None:
+            added.append(
+                {
+                    "id": evidence.id,
+                    "label": _evidence_identity_label(evidence),
+                    "severity": evidence.severity,
+                    "summary": evidence.summary,
+                    "review_status": evidence.review_status,
+                }
+            )
+        elif old.severity != evidence.severity:
+            # 只比风险等级：新任务里证据一律从 pending 开始，把审核状态重置
+            # 当成「变化」会让每次对比都刷屏。
+            changed.append(
+                {
+                    "id": evidence.id,
+                    "label": _evidence_identity_label(evidence),
+                    "old_severity": old.severity,
+                    "new_severity": evidence.severity,
+                    "old_review_status": old.review_status,
+                    "new_review_status": evidence.review_status,
+                    "summary": evidence.summary,
+                }
+            )
+    for key, evidence in previous_map.items():
+        if key in current_map:
+            continue
+        removed.append(
+            {
+                "id": evidence.id,
+                "label": _evidence_identity_label(evidence),
+                "severity": evidence.severity,
+                "summary": evidence.summary,
+                "review_status": evidence.review_status,
+            }
+        )
+
+    # 上次已排除、本次重新出现：证据身份键变了（例如文件替换后文本块重切），
+    # 但内容摘要高度相似且上次结论是「正常 / 排除」。这是审计最关心的一类变化。
+    previous_excluded = [
+        evidence
+        for evidence in previous_evidences
+        if evidence.review_status == ReviewStatus.EXCLUDED.value
+    ]
+    reappeared = []
+    for item in added:
+        if not previous_excluded:
+            break
+        for old in previous_excluded:
+            if old.summary and item["summary"] and (
+                old.summary[:40] == item["summary"][:40]
+                or old.summary.split("存在")[0] == item["summary"].split("存在")[0]
+            ):
+                reappeared.append(
+                    {
+                        **item,
+                        "previous_review_status": old.review_status,
+                        "previous_summary": old.summary,
+                    }
+                )
+                break
+
+    def files_of(task: AnalysisTask) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        for company in (task.company_snapshot or {}).get("companies", []):
+            for file in company.get("files") or []:
+                result[file["id"]] = {
+                    "company_name": company.get("company_name"),
+                    "file_name": file.get("file_name"),
+                    "version": file.get("version"),
+                    "file_hash": file.get("file_hash"),
+                }
+        return result
+
+    files_current = files_of(current)
+    files_previous = files_of(previous)
+    file_added = [{"id": key, **files_current[key]} for key in files_current.keys() - files_previous.keys()]
+    file_removed = [{"id": key, **files_previous[key]} for key in files_previous.keys() - files_current.keys()]
+    file_changed = [
+        {
+            "id": key,
+            "company_name": files_current[key]["company_name"],
+            "file_name": files_current[key]["file_name"],
+            "old_version": files_previous[key]["version"],
+            "new_version": files_current[key]["version"],
+        }
+        for key in files_current.keys() & files_previous.keys()
+        if files_current[key]["file_hash"] != files_previous[key]["file_hash"]
+    ]
+
+    def risks_of(task: AnalysisTask) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for pair in db.scalars(
+            select(ComparisonPair).where(ComparisonPair.analysis_task_id == task.id)
+        ):
+            result[f"{pair.company_a_id}|{pair.company_b_id}"] = pair.overall_risk
+        return result
+
+    risks_current = risks_of(current)
+    risks_previous = risks_of(previous)
+    risk_changes = [
+        {
+            "pair_key": key,
+            "old_risk": risks_previous.get(key),
+            "new_risk": risks_current.get(key),
+        }
+        for key in risks_current.keys() | risks_previous.keys()
+        if risks_current.get(key) != risks_previous.get(key)
+    ]
+
+    rules_current = (current.analysis_config or {}).get("rule_versions") or {}
+    rules_previous = (previous.analysis_config or {}).get("rule_versions") or {}
+    rule_changes = [
+        {
+            "dimension": dimension,
+            "old_version": (rules_previous.get(dimension) or {}).get("version_no"),
+            "new_version": (rules_current.get(dimension) or {}).get("version_no"),
+        }
+        for dimension in rules_current.keys() | rules_previous.keys()
+        if (rules_current.get(dimension) or {}).get("version_no")
+        != (rules_previous.get(dimension) or {}).get("version_no")
+    ]
+
+    return {
+        "current": {"id": current.id, "task_no": current.task_no},
+        "previous": {"id": previous.id, "task_no": previous.task_no},
+        "inputs": {
+            "files_added": file_added,
+            "files_removed": file_removed,
+            "files_changed": file_changed,
+            "rule_changes": rule_changes,
+        },
+        "evidences": {
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "reappeared": reappeared,
+        },
+        "risks": risk_changes,
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "reappeared": len(reappeared),
+            "risk_changes": len(risk_changes),
+        },
+    }
+
+
 def _pair_evidences(db: Session, pair: ComparisonPair) -> list[ComparisonEvidence]:
     """组合下的全部证据（含同时涉及两家企业的价格异常证据）。"""
     task = db.get(AnalysisTask, pair.analysis_task_id)
@@ -294,6 +613,9 @@ def pair_detail(db: Session, pair: ComparisonPair) -> dict:
     excluded = sum(
         1 for e in text_evidences if (e.evidence_data or {}).get("excluded_by_tender")
     )
+    templated = sum(
+        1 for e in text_evidences if (e.evidence_data or {}).get("excluded_by_template")
+    )
     return {
         "pair": {
             "id": pair.id,
@@ -306,6 +628,7 @@ def pair_detail(db: Session, pair: ComparisonPair) -> dict:
             "text_risk": pair.text_risk,
             "personnel_risk": pair.personnel_risk,
             "price_risk": pair.price_risk,
+            "forensic_risk": pair.forensic_risk,
             "overall_risk": pair.overall_risk,
             "risk_reasons": pair.risk_reasons,
             "status": pair.status,
@@ -315,13 +638,17 @@ def pair_detail(db: Session, pair: ComparisonPair) -> dict:
             "text": counts[EvidenceType.TEXT.value],
             "personnel": counts[EvidenceType.PERSONNEL.value],
             "price": counts[EvidenceType.PRICE.value],
+            "file": counts[EvidenceType.FILE.value],
+            "metadata": counts[EvidenceType.METADATA.value],
         },
-        # 统一数量口径：识别数 / 命中招标公共内容被排除数 / 有效数
+        # 统一数量口径：识别数 / 两类排除数 / 有效数。
+        # 排除只针对文本证据；文件指纹与元数据证据不存在「公共内容」概念。
         "count_breakdown": {
             "text": {
                 "identified": len(text_evidences),
                 "excluded_by_tender": excluded,
-                "effective": len(text_evidences) - excluded,
+                "excluded_by_template": templated,
+                "effective": len(text_evidences) - excluded - templated,
             }
         },
         "evidences": _with_group_positions([_evidence_summary(e) for e in evidences]),
@@ -336,6 +663,9 @@ def pair_evidences(
     review_status: str | None = None,
     severity: str | None = None,
     tender: str | None = None,
+    cluster_lead_only: bool = False,
+    min_cluster_size: int | None = None,
+    review_queue: str | None = None,
     page: int = 1,
     page_size: int = 20,
     before: int = evidence_context.DEFAULT_BEFORE_CHARS,
@@ -352,14 +682,39 @@ def pair_evidences(
             continue
         if severity and evidence.severity != severity:
             continue
-        excluded = bool((evidence.evidence_data or {}).get("excluded_by_tender"))
-        if tender == "hit" and not excluded:
+        if cluster_lead_only and evidence.cluster_lead_id not in (None, evidence.id):
             continue
-        if tender == "effective" and excluded:
+        if min_cluster_size and (evidence.cluster_size or 1) < min_cluster_size:
+            continue
+        if review_queue == "pending_first" and (evidence.review_stage or 0) != 0:
+            continue
+        if review_queue == "awaiting_second" and (evidence.review_stage or 0) != 1:
+            continue
+        if review_queue == "final" and (evidence.review_stage or 0) != 2:
+            continue
+        data = evidence.evidence_data or {}
+        excluded_tender = bool(data.get("excluded_by_tender"))
+        excluded_template = bool(data.get("excluded_by_template"))
+        if tender == "hit" and not excluded_tender:
+            continue
+        if tender == "template" and not excluded_template:
+            continue
+        # 「有效」= 两类排除都不命中的证据
+        if tender == "effective" and (excluded_tender or excluded_template):
             continue
         filtered.append(evidence)
 
     total = len(filtered)
+    # 聚类字段由服务端预先算好（cluster_index/size），分页不会改变「第 N / 共 M」；
+    # 排序把线索整体放在一起，合并出来的大线索更容易被先看到。
+    filtered.sort(
+        key=lambda item: (
+            -{"high": 3, "medium": 2, "low": 1}.get(item.severity, 0),
+            -(item.cluster_size or 1),
+            item.cluster_id or "",
+            item.cluster_index or 0,
+        )
+    )
     start = max(0, (page - 1) * page_size)
     rows = filtered[start : start + page_size]
     reader = evidence_context.BlockReader(db)
@@ -385,6 +740,8 @@ def pair_evidences(
             "text": counts[EvidenceType.TEXT.value],
             "personnel": counts[EvidenceType.PERSONNEL.value],
             "price": counts[EvidenceType.PRICE.value],
+            "file": counts[EvidenceType.FILE.value],
+            "metadata": counts[EvidenceType.METADATA.value],
         },
         "context": {
             "before_chars": before,
@@ -432,6 +789,9 @@ def _evidence_summary(evidence: ComparisonEvidence) -> dict:
         "review_status": evidence.review_status,
         # 是否命中招标文件公共内容（被排除的雷同内容仍保留识别记录）
         "excluded_by_tender": bool(data.get("excluded_by_tender")),
+        # 是否属于批次共同模板（行业范本/通用套话，同样保留记录但不计风险）
+        "excluded_by_template": bool(data.get("excluded_by_template")),
+        "template_presence": data.get("template_presence"),
         "pair_id": evidence.comparison_pair_id,
         "source_a": _source_summary(evidence.source_a),
         "source_b": _source_summary(evidence.source_b),
@@ -442,6 +802,21 @@ def _evidence_summary(evidence: ComparisonEvidence) -> dict:
         "matched_chars": data.get("matched_chars"),
         "similarity_percent": data.get("similarity_percent"),
         "match_interval_count": data.get("match_interval_count"),
+        # 线索（聚类）：同一段落的跨页/跨块命中合成一条，审核按线索进行
+        "cluster_id": evidence.cluster_id,
+        "cluster_size": evidence.cluster_size or 1,
+        "cluster_index": evidence.cluster_index or 0,
+        "cluster_lead_id": evidence.cluster_lead_id,
+        "is_cluster_lead": evidence.cluster_lead_id == evidence.id,
+        # 审核流程与分派
+        "review_stage": evidence.review_stage or 0,
+        "assignee_id": evidence.assignee_id,
+        "first_review_status": evidence.first_review_status,
+        "review_conflict": bool(
+            (evidence.review_stage or 0) >= 2
+            and evidence.first_review_status
+            and evidence.first_review_status != evidence.review_status
+        ),
     }
 
 
@@ -506,6 +881,26 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
             for p in evidence.participants
         ],
         "review_status": evidence.review_status,
+        "review_stage": evidence.review_stage or 0,
+        "assignee_id": evidence.assignee_id,
+        "first_review": (
+            {
+                "reviewer_id": evidence.first_reviewer_id,
+                "status": evidence.first_review_status,
+            }
+            if evidence.first_reviewer_id or evidence.first_review_status
+            else None
+        ),
+        "review_conflict": bool(
+            (evidence.review_stage or 0) >= 2
+            and evidence.first_review_status
+            and evidence.first_review_status != evidence.review_status
+        ),
+        "cluster_id": evidence.cluster_id,
+        "cluster_size": evidence.cluster_size or 1,
+        "cluster_index": evidence.cluster_index or 0,
+        "cluster_lead_id": evidence.cluster_lead_id,
+        "cluster_members": _cluster_members(db, evidence),
         "review_records": [
             {
                 "id": record.id,
@@ -513,6 +908,7 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
                 "old_status": record.old_status,
                 "new_status": record.new_status,
                 "comment": record.comment,
+                "stage": record.stage or 1,
                 "created_at": record.created_at,
             }
             for record in evidence.review_records
@@ -520,6 +916,31 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
         "algorithm_version": evidence.algorithm_version,
         "created_at": evidence.created_at,
     }
+
+
+def _cluster_members(db: Session, evidence: ComparisonEvidence) -> list[dict]:
+    """同一线索下的全部证据（轻量摘要），供三栏页折叠展示。"""
+    if not evidence.cluster_id or (evidence.cluster_size or 1) <= 1:
+        return []
+    rows = db.scalars(
+        select(ComparisonEvidence)
+        .where(
+            ComparisonEvidence.cluster_id == evidence.cluster_id,
+            ComparisonEvidence.is_current.is_(True),
+        )
+        .order_by(ComparisonEvidence.cluster_index)
+    )
+    return [
+        {
+            "id": row.id,
+            "cluster_index": row.cluster_index,
+            "severity": row.severity,
+            "review_status": row.review_status,
+            "summary": row.summary,
+            "page_index": (row.source_a or {}).get("page_index"),
+        }
+        for row in rows
+    ]
 
 
 def evidence_context_payload(
@@ -538,9 +959,38 @@ def evidence_context_payload(
         raise ValueError(str(exc))
 
 
-def apply_review(
-    db: Session, evidence: ComparisonEvidence, new_status: str, comment: str | None, reviewer: User
-) -> ComparisonEvidence:
+class ReviewConflict(Exception):
+    """审核流程冲突（例如同一审核人试图完成二审）。"""
+
+
+_REVIEW_FINAL_STATUSES = {"confirmed", "excluded"}
+
+
+def _write_review(
+    db: Session,
+    evidence: ComparisonEvidence,
+    new_status: str,
+    comment: str | None,
+    reviewer: User,
+    *,
+    stage: int | None = None,
+    requires_second: bool = False,
+    template_fragment_id: str | None = None,
+    action: str = "evidence.review",
+) -> ReviewRecord:
+    """写一条审核记录的**唯一入口**（单条 / 批量 / 按线索都走这里）。
+
+    ``review_status`` 始终是最新结论，``review_stage`` 表示流程位置：
+    0 未审、1 一审完成待二审、2 终审。二审只对 confirmed/excluded 生效，
+    且必须由不同的人完成。
+    """
+    current_stage = evidence.review_stage or 0
+
+    if stage is None:
+        stage = _resolve_stage(
+            evidence, new_status, reviewer, current_stage, requires_second
+        )
+
     record = ReviewRecord(
         evidence_id=evidence.id,
         reviewer_id=reviewer.id,
@@ -548,16 +998,82 @@ def apply_review(
         old_status=evidence.review_status,
         new_status=new_status,
         comment=comment,
+        stage=stage,
+        template_fragment_id=template_fragment_id,
     )
     db.add(record)
+
+    if stage == 0:
+        # 撤回：回到未审队列，清空一审信息
+        evidence.review_stage = 0
+        evidence.first_reviewer_id = None
+        evidence.first_review_status = None
+    elif stage == 1:
+        evidence.review_stage = 1
+        evidence.first_reviewer_id = reviewer.id
+        evidence.first_review_status = new_status
+    else:
+        evidence.review_stage = 2
+        if evidence.first_review_status is None:
+            evidence.first_reviewer_id = reviewer.id
+            evidence.first_review_status = new_status
     evidence.review_status = new_status
+
     audit.log_audit(
         db,
-        "evidence.review",
+        action,
         "comparison_evidence",
         evidence.id,
         reviewer,
-        {"old_status": record.old_status, "new_status": new_status},
+        {
+            "old_status": record.old_status,
+            "new_status": new_status,
+            "stage": stage,
+        },
+    )
+    return record
+
+
+def _resolve_stage(
+    evidence: ComparisonEvidence,
+    new_status: str,
+    reviewer: User,
+    current_stage: int,
+    requires_second: bool,
+) -> int:
+    if new_status == "pending":
+        return 0
+    if new_status not in _REVIEW_FINAL_STATUSES:
+        # 「暂不判断」是一次分类决定，不再需要二审
+        return 2
+    if current_stage == 1:
+        if evidence.first_reviewer_id == reviewer.id:
+            raise ReviewConflict("二审必须由一审之外的审核人完成")
+        return 2
+    if requires_second:
+        return 1
+    return 2
+
+
+def apply_review(
+    db: Session,
+    evidence: ComparisonEvidence,
+    new_status: str,
+    comment: str | None,
+    reviewer: User,
+    *,
+    template_fragment_id: str | None = None,
+) -> ComparisonEvidence:
+    project = db.get(Project, evidence.project_id)
+    requires_second = bool(project and project.requires_second_review)
+    _write_review(
+        db,
+        evidence,
+        new_status,
+        comment,
+        reviewer,
+        requires_second=requires_second,
+        template_fragment_id=template_fragment_id,
     )
     db.commit()
     db.refresh(evidence)
@@ -676,6 +1192,61 @@ def export_excel(
         if evidence.comparison_pair_id:
             counts[evidence.comparison_pair_id][evidence.evidence_type] += 1
 
+    # 全系统统一的证据编号：报告里的编号必须能直接在风险页查到同一条证据
+    from app.services import risk_service
+
+    codes = risk_service.evidence_codes(db, evidences)
+
+    def reviewer_summary(evidence: ComparisonEvidence) -> str:
+        records = sorted(
+            evidence.review_records, key=lambda r: r.created_at or evidence.created_at
+        )
+        if not records:
+            return ""
+        last = records[-1]
+        return f"{last.reviewer_name}（{REVIEW_LABELS.get(last.new_status, last.new_status)}）"
+
+    def reviewed_at(evidence: ComparisonEvidence) -> str:
+        if not evidence.review_records:
+            return ""
+        last = max(evidence.review_records, key=lambda r: r.created_at or evidence.created_at)
+        return last.created_at.isoformat(sep=" ", timespec="minutes") if last.created_at else ""
+
+    def review_comment(evidence: ComparisonEvidence) -> str:
+        return "; ".join(
+            f"{r.reviewer_name}：{r.comment}" for r in evidence.review_records if r.comment
+        )
+
+    def source_location(source: dict | None) -> str:
+        """把来源渲染成可读的「文件 · 第 N 页」，缺失时明确写「未记录」。"""
+        if not source:
+            return "未记录"
+        file_name = source.get("file_name") or ""
+        page = source.get("printed_page_number") or source.get("page_index")
+        if file_name and page not in (None, ""):
+            return f"{file_name} 第{page}页"
+        if file_name:
+            return file_name
+        if page not in (None, ""):
+            return f"第{page}页"
+        return "未记录"
+
+    def evidence_source_text(evidence: ComparisonEvidence) -> str:
+        if evidence.evidence_type == EvidenceType.PRICE.value:
+            data = evidence.evidence_data or {}
+            parts = [
+                source_location(quote.get("source"))
+                for quote in (data.get("quotes") or [])
+                if quote.get("source")
+            ]
+            if parts:
+                return "；".join(dict.fromkeys(parts))
+            return "人工录入 / 未记录页码"
+        return (
+            f"A：{source_location(evidence.source_a)}；"
+            f"B：{source_location(evidence.source_b)}"
+        )
+
     wb = Workbook()
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="2F5597")
@@ -708,11 +1279,15 @@ def export_excel(
     ws.title = "投标人比对概览"
     overview_rows = []
     for index, pair in enumerate(pairs, start=1):
-        price_count = sum(
-            1
-            for evidence in price_evidences
-            if {pair.company_a_id, pair.company_b_id}
-            <= {p.company_id for p in evidence.participants}
+        # 与概览接口同口径：项目级价格规则 + 组合级逐项单价雷同
+        price_count = (
+            sum(
+                1
+                for evidence in price_evidences
+                if {pair.company_a_id, pair.company_b_id}
+                <= {p.company_id for p in evidence.participants}
+            )
+            + counts[pair.id][EvidenceType.PRICE.value]
         )
         overview_rows.append(
             [
@@ -722,9 +1297,12 @@ def export_excel(
                 counts[pair.id][EvidenceType.TEXT.value],
                 counts[pair.id][EvidenceType.PERSONNEL.value],
                 price_count,
+                counts[pair.id][EvidenceType.FILE.value],
+                counts[pair.id][EvidenceType.METADATA.value],
                 RISK_LABELS.get(pair.text_risk, pair.text_risk),
                 RISK_LABELS.get(pair.personnel_risk, pair.personnel_risk),
                 RISK_LABELS.get(pair.price_risk, pair.price_risk),
+                RISK_LABELS.get(pair.forensic_risk, pair.forensic_risk),
                 RISK_LABELS.get(pair.overall_risk, pair.overall_risk),
                 "已完成" if pair.status == "completed" else pair.status,
             ]
@@ -738,14 +1316,17 @@ def export_excel(
             "文本证据数",
             "人员重复数",
             "价格异常规则数",
+            "文件指纹数",
+            "元数据证据数",
             "文本风险",
             "人员风险",
             "价格风险",
+            "取证风险",
             "综合风险",
             "状态",
         ],
         overview_rows,
-        [8, 26, 26, 12, 12, 16, 10, 10, 10, 10, 10],
+        [8, 26, 26, 12, 12, 16, 12, 14, 10, 10, 10, 10, 12, 10],
     )
 
     # 2. 文本雷同汇总表
@@ -758,19 +1339,22 @@ def export_excel(
         text_rows.append(
             [
                 index,
-                f"E{index:04d}",
+                codes.get(evidence.id, ""),
                 data.get("matched_text", ""),
                 source_a.get("company_name", ""),
                 source_a.get("file_name", ""),
-                source_a.get("page_index", ""),
+                source_a.get("printed_page_number") or source_a.get("page_index", ""),
                 source_b.get("company_name", ""),
                 source_b.get("file_name", ""),
-                source_b.get("page_index", ""),
+                source_b.get("printed_page_number") or source_b.get("page_index", ""),
                 data.get("matched_chars", 0),
                 data.get("similarity_percent", 0),
                 "是" if data.get("excluded_by_tender") else "否",
+                "是" if data.get("excluded_by_template") else "否",
                 REVIEW_LABELS.get(evidence.review_status, evidence.review_status),
-                "; ".join(r.comment for r in evidence.review_records if r.comment),
+                reviewer_summary(evidence),
+                reviewed_at(evidence),
+                review_comment(evidence),
             ]
         )
     write_sheet(
@@ -788,11 +1372,14 @@ def export_excel(
             "雷同字数",
             "相似指标(%)",
             "公共内容排除",
+            "共同模板",
             "审核状态",
-            "备注",
+            "审核人",
+            "审核时间",
+            "审核说明",
         ],
         text_rows,
-        [8, 12, 60, 22, 20, 10, 22, 20, 10, 10, 12, 14, 14, 30],
+        [8, 26, 60, 22, 20, 10, 22, 20, 10, 10, 12, 14, 12, 16, 16, 18, 40],
     )
 
     # 3. 人员姓名重复表
@@ -816,6 +1403,7 @@ def export_excel(
         person_rows.append(
             [
                 index,
+                codes.get(evidence.id, ""),
                 name,
                 companies,
                 roles,
@@ -824,6 +1412,9 @@ def export_excel(
                 len(occurrences),
                 data.get("identity_info", ""),
                 REVIEW_LABELS.get(evidence.review_status, evidence.review_status),
+                reviewer_summary(evidence),
+                reviewed_at(evidence),
+                review_comment(evidence),
                 data.get("note", ""),
             ]
         )
@@ -831,6 +1422,7 @@ def export_excel(
         ws,
         [
             "序号",
+            "证据编号",
             "重复姓名",
             "涉及企业",
             "对应岗位",
@@ -839,23 +1431,96 @@ def export_excel(
             "出现次数",
             "身份辅助信息",
             "审核状态",
+            "审核人",
+            "审核时间",
+            "审核说明",
             "备注",
         ],
         person_rows,
-        [8, 14, 30, 20, 30, 34, 10, 20, 14, 40],
+        [8, 26, 14, 30, 20, 30, 34, 10, 20, 16, 16, 18, 40, 40],
+    )
+
+    # 3.5 报价汇总表：不论是否触发价格异常，都列出全部参与企业的报价与来源。
+    # 只有「价格异常分析表」时，没有异常就只剩表头，自动识别的金额、页码
+    # 与覆盖情况都无从复核（QA：覆盖 4/4 却静默报错价，无法被发现）。
+    quote_entries = ((task.analysis_config or {}).get("price_snapshot") or {}).get("entries") or {}
+    quote_rows = []
+    for company in (task.company_snapshot or {}).get("companies", []):
+        company_id = company.get("company_id")
+        entry = quote_entries.get(company_id) or {}
+        amount = entry.get("amount")
+        source = entry.get("source") or {}
+        origin = entry.get("source_kind") or "auto"
+        quote_rows.append(
+            [
+                len(quote_rows) + 1,
+                company.get("company_name", ""),
+                round(float(amount), 2) if amount is not None else "",
+                entry.get("amount_upper") or "",
+                QUOTE_SOURCE_LABELS.get(origin, origin),
+                source_location(source) if source.get("file_name") else ("人工录入" if origin in {"manual", "import"} else "未记录"),
+                entry.get("raw") or "",
+                "是" if entry.get("needs_confirmation") else "否",
+                "、".join(
+                    f"{float(value):,.2f}" for value in (entry.get("alternative_amounts") or [])
+                ),
+            ]
+        )
+    write_sheet(
+        wb.create_sheet("报价汇总表"),
+        [
+            "序号",
+            "投标人名称",
+            "投标总报价（元）",
+            "大写金额",
+            "来源",
+            "原文位置",
+            "识别原文",
+            "是否待确认",
+            "候选金额",
+        ],
+        quote_rows,
+        [8, 28, 18, 30, 12, 28, 44, 12, 30],
     )
 
     # 4. 价格异常分析表
     ws = wb.create_sheet("价格异常分析表")
     price_rows = []
+    line_item_rows = []
     for evidence in price_evidences:
         data = evidence.evidence_data
         rule_label = data.get("rule_label", evidence.evidence_subtype)
+        # 逐项单价雷同的证据结构是 items，不是 quotes，必须单独展开，
+        # 否则这类证据在价格表里整行消失。
+        if evidence.evidence_subtype == "line_item_duplicate":
+            for item in data.get("items", []):
+                line_item_rows.append(
+                    [
+                        len(line_item_rows) + 1,
+                        codes.get(evidence.id, ""),
+                        item.get("name", ""),
+                        item.get("unit_price_a", ""),
+                        item.get("unit_price_b", ""),
+                        round((item.get("relative_diff") or 0) * 100, 3),
+                        "是" if item.get("same_price") else "否",
+                        data.get("shared_count", ""),
+                        data.get("identical_count", ""),
+                        rule_label,
+                        RISK_LABELS.get(evidence.severity, evidence.severity),
+                        data.get("note", ""),
+                        REVIEW_LABELS.get(evidence.review_status, evidence.review_status),
+                        reviewer_summary(evidence),
+                        reviewed_at(evidence),
+                        review_comment(evidence),
+                    ]
+                )
+            continue
         for quote in data.get("quotes", []):
             source = quote.get("source") or {}
             price_rows.append(
                 [
                     len(price_rows) + 1,
+                    codes.get(evidence.id, ""),
                     quote.get("company_name", ""),
                     quote.get("amount", ""),
                     quote.get("amount_upper", ""),
@@ -864,14 +1529,22 @@ def export_excel(
                     str(int(float(quote.get("amount") or 0)))[-3:].zfill(3),
                     rule_label,
                     RISK_LABELS.get(evidence.severity, evidence.severity),
-                    f"{source.get('file_name', '')} 第{source.get('page_index', '')}页",
+                    # 人工录入的报价没有原文页码，明确写出来而不是留「第页」
+                    source_location(source)
+                    if source.get("file_name")
+                    else ("人工录入" if quote.get("origin") in {"manual", "import"} else "未记录"),
                     data.get("note", ""),
+                    REVIEW_LABELS.get(evidence.review_status, evidence.review_status),
+                    reviewer_summary(evidence),
+                    reviewed_at(evidence),
+                    review_comment(evidence),
                 ]
             )
     write_sheet(
         ws,
         [
             "序号",
+            "证据编号",
             "投标人名称",
             "总报价（元）",
             "大写金额",
@@ -882,10 +1555,139 @@ def export_excel(
             "风险提示",
             "原文位置",
             "备注",
+            "审核状态",
+            "审核人",
+            "审核时间",
+            "审核说明",
         ],
         price_rows,
-        [8, 28, 18, 30, 12, 14, 12, 26, 10, 28, 40],
+        [8, 26, 28, 18, 30, 12, 14, 12, 26, 10, 28, 40, 16, 16, 18, 40],
     )
+
+    if line_item_rows:
+        ws = wb.create_sheet("逐项单价对比表")
+        write_sheet(
+            ws,
+            [
+                "序号",
+                "证据编号",
+                "分项名称",
+                "企业A单价",
+                "企业B单价",
+                "单价差异(%)",
+                "价格相同",
+                "共同分项数",
+                "完全相同条数",
+                "异常类型",
+                "风险提示",
+                "备注",
+                "审核状态",
+                "审核人",
+                "审核时间",
+                "审核说明",
+            ],
+            line_item_rows,
+            [8, 26, 36, 16, 16, 14, 12, 14, 14, 26, 10, 40, 16, 16, 18, 40],
+        )
+
+    # 5. 文件取证表：文件指纹与文档元数据。它和前面三张内容表正交，
+    #    改抬头、换措辞都洗不掉，是评审材料里最直接的一类证据。
+    ws = wb.create_sheet("文件取证表")
+    forensics_rows = []
+    for evidence in evidences:
+        if evidence.evidence_type not in {
+            EvidenceType.FILE.value,
+            EvidenceType.METADATA.value,
+        }:
+            continue
+        data = evidence.evidence_data or {}
+        source_a = evidence.source_a or {}
+        source_b = evidence.source_b or {}
+        detail = _forensics_detail(evidence, data)
+        forensics_rows.append(
+            [
+                len(forensics_rows) + 1,
+                codes.get(evidence.id, ""),
+                SUBTYPE_LABELS.get(evidence.evidence_subtype)
+                or TYPE_LABELS.get(evidence.evidence_type, evidence.evidence_type),
+                source_a.get("company_name", ""),
+                source_a.get("file_name", ""),
+                source_b.get("company_name", ""),
+                source_b.get("file_name", ""),
+                detail,
+                RISK_LABELS.get(evidence.severity, evidence.severity),
+                data.get("note", ""),
+                REVIEW_LABELS.get(evidence.review_status, evidence.review_status),
+                reviewer_summary(evidence),
+                reviewed_at(evidence),
+                review_comment(evidence),
+            ]
+        )
+    write_sheet(
+        ws,
+        [
+            "序号",
+            "证据编号",
+            "证据类型",
+            "企业A",
+            "文件A",
+            "企业B",
+            "文件B",
+            "取证内容",
+            "风险提示",
+            "备注",
+            "审核状态",
+            "审核人",
+            "审核时间",
+            "审核说明",
+        ],
+        forensics_rows,
+        [8, 26, 14, 28, 34, 28, 34, 46, 10, 44, 16, 16, 18, 40],
+    )
+
+    # 6. 审核记录表：只追加的审核历史，报告可独立还原审核过程
+    review_rows = []
+    stage_labels = {0: "撤回", 1: "一审", 2: "终审"}
+    for evidence in evidences:
+        records = sorted(
+            evidence.review_records, key=lambda r: r.created_at or evidence.created_at
+        )
+        for record in records:
+            review_rows.append(
+                [
+                    len(review_rows) + 1,
+                    codes.get(evidence.id, ""),
+                    TYPE_LABELS.get(evidence.evidence_type, evidence.evidence_type),
+                    evidence.summary,
+                    record.reviewer_name,
+                    stage_labels.get(record.stage or 1, "一审"),
+                    REVIEW_LABELS.get(record.old_status, record.old_status),
+                    REVIEW_LABELS.get(record.new_status, record.new_status),
+                    record.comment or "",
+                    record.created_at.isoformat(sep=" ", timespec="minutes")
+                    if record.created_at
+                    else "",
+                ]
+            )
+    if review_rows:
+        ws = wb.create_sheet("审核记录表")
+        write_sheet(
+            ws,
+            [
+                "序号",
+                "证据编号",
+                "证据类型",
+                "证据摘要",
+                "审核人",
+                "审核环节",
+                "原结论",
+                "新结论",
+                "审核说明",
+                "审核时间",
+            ],
+            review_rows,
+            [8, 26, 14, 60, 16, 10, 16, 16, 50, 20],
+        )
 
     stream = BytesIO()
     wb.save(stream)

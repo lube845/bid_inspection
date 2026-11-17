@@ -29,3 +29,6 @@ class ReviewRequest(BaseModel):
     # pending 用于「撤回本次审核」：追加一条记录把状态改回待审核，历史记录不删除也不修改。
     status: str = Field(pattern="^(pending|confirmed|excluded|undecided)$")
     comment: str | None = None
+    # 「排除并记为模板」：当前结论是 excluded 时生效
+    learn_as_template: bool = False
+    template_scope: str = Field(default="project", pattern="^(project|global)$")

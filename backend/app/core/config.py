@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     environment: str = "development"
     api_prefix: str = "/api/v1"
     secret_key: str = "change-me-in-production"
-    access_token_expire_minutes: int = 12 * 60
+    # 访问令牌有效期。默认 8 小时：投标文件属于敏感材料，令牌泄露后的暴露
+    # 窗口越短越好；配合退出登录时的令牌版本号撤销，不必依赖超长有效期。
+    access_token_expire_minutes: int = 8 * 60
     # 文件预览 / SSE 使用的短期票据有效期（秒）
     scoped_ticket_expire_seconds: int = 300
     cors_origins: str = "http://localhost:8080,http://localhost:5173"
@@ -30,10 +32,17 @@ class Settings(BaseSettings):
     seed_demo: bool = False
     # 开发模式下允许 Worker 重启后重新执行停留在 running 的任务（生产环境保持 false）
     allow_rerun_running_tasks: bool = False
-    # 开发模式下自动为已有表补齐新增列（仅 ADD COLUMN），改表结构后无需重建数据库
+    # 表结构管理方式：
+    #   migrate    —— 用 Alembic 迁移（Postgres / 生产）
+    #   create_all —— 按模型直接建表（测试与 SQLite 本地开发）
+    #   auto       —— SQLite 用 create_all，其余用 migrate
+    schema_management: str = "auto"
+    # 开发模式下允许旧库补列（仅 ADD COLUMN）。仅作为基线 stamp 前的 reconciliation，
+    # 正常启动不再自动改表。
     auto_sync_schema: bool = False
 
     admin_username: str = "admin"
+    # 仅在首次初始化时创建账号；部署前必须通过环境变量覆盖。
     admin_password: str = "admin123"
 
     # Analysis defaults. These are rule thresholds, not model parameters.

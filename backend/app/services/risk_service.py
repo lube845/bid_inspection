@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime
 
-from sqlalchemy import false, func, select
+from sqlalchemy import false, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -29,13 +29,16 @@ from app.models import (
     ReviewRecord,
     User,
 )
+from app.models.base import utcnow
 from app.models.enums import EvidenceType, ReviewStatus
-from app.services import results_service
+from app.services import audit, results_service, task_scope
 
 TYPE_CODES = {
     EvidenceType.TEXT.value: "TEXT",
     EvidenceType.PERSONNEL.value: "PERSONNEL",
     EvidenceType.PRICE.value: "PRICE",
+    EvidenceType.FILE.value: "FILE",
+    EvidenceType.METADATA.value: "META",
 }
 
 # PRD 4.11.5：V1.0 批量操作只允许「标记为待进一步核查」，
@@ -81,8 +84,12 @@ def list_risks(
     severity: str | None = None,
     review_status: str | None = None,
     reviewer_id: str | None = None,
+    assignee_id: str | None = None,
+    review_queue: str | None = None,
+    cluster_lead_only: bool = False,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    include_history: bool = False,
     page: int = 1,
     page_size: int = 20,
 ) -> dict:
@@ -100,6 +107,23 @@ def list_risks(
         return {"items": [], "total": 0, "page": page, "page_size": page_size}
     if project_id:
         query = query.where(ComparisonEvidence.project_id == project_id)
+    if not include_history:
+        # 默认只展示每个项目「最新任务」的证据，历史任务的证据可显式查看。
+        # 不加这一层时，重复分析会让同一处雷同以多个任务版本反复进入审核队列。
+        latest = task_scope.latest_task_ids(db, [project_id] if project_id else None)
+        # 没有任务记录的孤立证据（历史导入 / 迁移数据）同样保留，否则会凭空消失
+        orphaned = ~(
+            select(AnalysisTask.id)
+            .where(AnalysisTask.id == ComparisonEvidence.analysis_task_id)
+            .exists()
+        )
+        scope_condition = orphaned
+        if latest:
+            scope_condition = or_(
+                ComparisonEvidence.analysis_task_id.in_(list(latest.values())),
+                orphaned,
+            )
+        query = query.where(scope_condition)
     if evidence_type:
         query = query.where(ComparisonEvidence.evidence_type == evidence_type)
     if severity:
@@ -122,6 +146,21 @@ def list_risks(
         query = query.where(
             ComparisonEvidence.id.in_(
                 select(ReviewRecord.evidence_id).where(ReviewRecord.reviewer_id == reviewer_id)
+            )
+        )
+    if assignee_id:
+        query = query.where(ComparisonEvidence.assignee_id == assignee_id)
+    if review_queue == "pending_first":
+        query = query.where(ComparisonEvidence.review_stage == 0)
+    elif review_queue == "awaiting_second":
+        query = query.where(ComparisonEvidence.review_stage == 1)
+    elif review_queue == "final":
+        query = query.where(ComparisonEvidence.review_stage == 2)
+    if cluster_lead_only:
+        query = query.where(
+            or_(
+                ComparisonEvidence.cluster_lead_id.is_(None),
+                ComparisonEvidence.cluster_lead_id == ComparisonEvidence.id,
             )
         )
 
@@ -205,6 +244,9 @@ def _enrich(db: Session, rows: list[ComparisonEvidence]) -> list[dict]:
                     row.evidence_type, row.evidence_type
                 ),
                 "evidence_subtype": row.evidence_subtype,
+                "evidence_subtype_label": results_service.SUBTYPE_LABELS.get(
+                    row.evidence_subtype, row.evidence_subtype
+                ),
                 "summary": row.summary,
                 "companies": company_names,
                 "company_ids": company_ids,
@@ -215,6 +257,10 @@ def _enrich(db: Session, rows: list[ComparisonEvidence]) -> list[dict]:
                 "excluded_by_tender": bool(
                     (row.evidence_data or {}).get("excluded_by_tender")
                 ),
+                "excluded_by_template": bool(
+                    (row.evidence_data or {}).get("excluded_by_template")
+                ),
+                "cover_only": bool((row.evidence_data or {}).get("cover_only")),
                 "review_status": row.review_status,
                 "review_status_label": results_service.REVIEW_LABELS.get(
                     row.review_status, row.review_status
@@ -225,6 +271,13 @@ def _enrich(db: Session, rows: list[ComparisonEvidence]) -> list[dict]:
                 "created_at": row.created_at,
                 "pair_id": row.comparison_pair_id,
                 "viewer_link": _viewer_link(row),
+                # 线索与审核流程
+                "cluster_id": row.cluster_id,
+                "cluster_size": row.cluster_size or 1,
+                "is_cluster_lead": row.cluster_lead_id in (None, row.id),
+                "review_stage": row.review_stage or 0,
+                "assignee_id": row.assignee_id,
+                "assigned_at": row.assigned_at,
             }
         )
     return items
@@ -238,6 +291,36 @@ def _viewer_link(evidence: ComparisonEvidence) -> str:
             f"?tab=analysis&pair={evidence.comparison_pair_id}&evidence={evidence.id}"
         )
     return f"#/projects/{evidence.project_id}?tab=results"
+
+
+def evidence_codes(db: Session, rows: list[ComparisonEvidence]) -> dict[str, str]:
+    """批量计算证据编号（``{evidence_id: code}``），供导出与列表共用。
+
+    编号必须全系统一致：风险页展示的编号与 Excel 报告的编号必须能直接对应，
+    否则报告无法反向定位到系统里的证据。
+    """
+    if not rows:
+        return {}
+    task_ids = {row.analysis_task_id for row in rows}
+    project_ids = {row.project_id for row in rows}
+    tasks = {
+        task.id: task
+        for task in db.scalars(select(AnalysisTask).where(AnalysisTask.id.in_(task_ids)))
+    }
+    projects = {
+        project.id: project
+        for project in db.scalars(select(Project).where(Project.id.in_(project_ids)))
+    }
+    sequences = _evidence_sequences(db, rows)
+    return {
+        row.id: evidence_code(
+            projects.get(row.project_id),
+            tasks[row.analysis_task_id].task_no if row.analysis_task_id in tasks else 0,
+            row.evidence_type,
+            sequences.get(row.id, 0),
+        )
+        for row in rows
+    }
 
 
 def _evidence_sequences(
@@ -353,9 +436,20 @@ def risk_detail(db: Session, evidence: ComparisonEvidence) -> dict:
         "task_status": task.status if task else None,
         "companies": [p.get("company_name") for p in participants if p.get("company_name")],
         "reviewer_name": latest_record[0]["reviewer_name"] if latest_record else "",
+        # 分派人姓名供详情弹窗展示；证据只存 assignee_id，这里一次性解析
+        "assignee_name": _assignee_name(db, evidence.assignee_id),
         "files": files,
         "viewer_link": _viewer_link(evidence),
     }
+
+
+def _assignee_name(db: Session, assignee_id: str | None) -> str:
+    if not assignee_id:
+        return ""
+    user = db.get(User, assignee_id)
+    if user is None:
+        return ""
+    return user.display_name or user.username
 
 
 def batch_review(
@@ -396,17 +490,11 @@ def batch_review(
         if skip_reviewed and evidence.review_status != ReviewStatus.PENDING.value:
             skipped_reviewed.append(evidence.id)
             continue
-        db.add(
-            ReviewRecord(
-                evidence_id=evidence.id,
-                reviewer_id=reviewer.id,
-                reviewer_name=reviewer.display_name or reviewer.username,
-                old_status=evidence.review_status,
-                new_status=new_status,
-                comment=comment,
-            )
+        # 「暂不判断」是一次分类决定，直接终审，不走二审队列——
+        # 否则现有批量入口就成了双人复核的绕过通道。
+        results_service._write_review(
+            db, evidence, new_status, comment, reviewer, stage=2
         )
-        evidence.review_status = new_status
         updated += 1
     skipped = [eid for eid in evidence_ids if eid not in {row.id for row in rows}]
     return {
@@ -415,6 +503,108 @@ def batch_review(
         "skipped_reviewed": skipped_reviewed,
         "status": new_status,
     }
+
+
+def batch_assign(
+    db: Session,
+    evidence_ids: list[str],
+    assignee_id: str | None,
+    actor: User,
+) -> dict:
+    """把证据分派给指定审核人；``assignee_id`` 为空表示取消分派。"""
+    if not evidence_ids:
+        raise RiskValidationError("请先选择要分派的证据")
+    if len(evidence_ids) > MAX_BATCH_SIZE:
+        raise RiskValidationError(f"单次最多分派 {MAX_BATCH_SIZE} 条证据")
+    rows = list(
+        db.scalars(
+            select(ComparisonEvidence).where(
+                ComparisonEvidence.id.in_(evidence_ids),
+                ComparisonEvidence.is_current.is_(True),
+            )
+        )
+    )
+    assignee = db.get(User, assignee_id) if assignee_id else None
+    if assignee_id and (assignee is None or not assignee.is_active):
+        raise RiskValidationError("指定的审核人不存在或已被禁用")
+    now = utcnow()
+    for evidence in rows:
+        evidence.assignee_id = assignee.id if assignee else None
+        evidence.assigned_at = now if assignee else None
+    audit.log_audit(
+        db,
+        "evidence.assign",
+        "comparison_evidence",
+        None,
+        actor,
+        {
+            "count": len(rows),
+            "assignee_id": assignee.id if assignee else None,
+            "assignee_name": (assignee.display_name or assignee.username) if assignee else None,
+        },
+    )
+    return {"updated": len(rows), "assignee_id": assignee.id if assignee else None}
+
+
+def cluster_review(
+    db: Session,
+    evidence_ids: list[str],
+    new_status: str,
+    comment: str | None,
+    reviewer: User,
+    *,
+    skip_reviewed: bool = False,
+) -> dict:
+    """按线索审核：一条操作覆盖同一线索下的全部证据.
+
+    每条成员仍各自写一条 ``review_record``（与单条审核同构），只是入口不同；
+    二审要求每个成员的 ``first_reviewer_id`` 都不是当前审核人，否则整批拒绝。
+    """
+    if new_status not in {"confirmed", "excluded", "undecided"}:
+        raise RiskValidationError("按线索审核只支持确认 / 排除 / 暂不判断")
+    if not evidence_ids:
+        raise RiskValidationError("请先选择要处理的线索")
+    rows = list(
+        db.scalars(
+            select(ComparisonEvidence).where(
+                ComparisonEvidence.id.in_(evidence_ids),
+                ComparisonEvidence.is_current.is_(True),
+            )
+        )
+    )
+    if not rows:
+        raise RiskValidationError("没有可处理的证据")
+    conflict = [
+        row.id
+        for row in rows
+        if (row.review_stage or 0) == 1 and row.first_reviewer_id == reviewer.id
+    ]
+    if new_status in {"confirmed", "excluded"} and conflict:
+        raise RiskValidationError("线索中有证据的一审由本人完成，二审必须由其他审核人处理")
+    projects = {
+        project.id: project
+        for project in db.scalars(
+            select(Project).where(Project.id.in_({row.project_id for row in rows}))
+        )
+    }
+    updated = 0
+    skipped: list[str] = []
+    for evidence in rows:
+        if skip_reviewed and evidence.review_status != ReviewStatus.PENDING.value:
+            skipped.append(evidence.id)
+            continue
+        project = projects.get(evidence.project_id)
+        results_service._write_review(
+            db,
+            evidence,
+            new_status,
+            comment,
+            reviewer,
+            requires_second=bool(project and project.requires_second_review),
+            action="evidence.review_cluster",
+        )
+        updated += 1
+    return {"updated": updated, "skipped_reviewed": skipped, "status": new_status}
 
 
 def risk_filters(db: Session) -> dict:

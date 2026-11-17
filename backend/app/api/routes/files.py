@@ -296,7 +296,9 @@ def file_ticket(
     _get_file(db, file_id)
     ttl = settings.scoped_ticket_expire_seconds
     return {
-        "ticket": create_scoped_ticket(user.id, "file", file_id, ttl),
+        "ticket": create_scoped_ticket(
+            user.id, "file", file_id, ttl, token_version=user.token_version or 0
+        ),
         "expires_in": ttl,
     }
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
@@ -28,6 +28,10 @@ class OriginalFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # 文档元数据指纹（解析时提取，JSON）：PDF 的 Producer/Creator/作者/创建时间/
+    # 文档 ID，DOCX 的作者与最后修改人。改抬头、改措辞都改不掉这些字段，
+    # 是「同一台机器、同一个人编写」的直接线索。
+    doc_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     parse_status: Mapped[str] = mapped_column(

@@ -42,6 +42,13 @@ ACTION_LABELS = {
     "analysis.retry_pair": "重试任务",
     "evidence.review": "审核证据",
     "report.export": "导出报告",
+    "price_quote.manual_entry": "补录报价",
+    "price_quote.import": "导入报价",
+    "price_quote.delete": "删除报价",
+    "evidence.assign": "分派证据",
+    "evidence.review_cluster": "按线索审核",
+    "template_fragment.create": "标记模板片段",
+    "template_fragment.revoke": "撤销模板片段",
     "rule.update": "修改检测规则",
     "user.create": "新增用户",
     "user.update": "修改用户",
@@ -59,6 +66,8 @@ ENTITY_LABELS = {
     "app_user": "用户",
     "detection_rule_version": "检测规则",
     "company": "投标企业",
+    "price_quote": "投标报价",
+    "template_fragment": "模板片段",
 }
 
 
@@ -168,12 +177,17 @@ def update_user(
         user.role = role
     if is_active is not None:
         user.is_active = is_active
+        # 禁用账号时吊销已签发的令牌：否则已登录的会话在令牌过期前仍可继续使用
+        if is_active is False:
+            user.token_version = int(user.token_version or 0) + 1
     db.flush()
     return user_payload(user)
 
 
 def reset_password(db: Session, user: User, password: str) -> dict:
     user.password_hash = hash_password(password)
+    # 重置密码后旧令牌必须失效，防止密码泄露后旧会话继续可用
+    user.token_version = int(user.token_version or 0) + 1
     db.flush()
     return user_payload(user)
 

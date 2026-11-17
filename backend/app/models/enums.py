@@ -6,6 +6,9 @@ class ProjectStatus(str, Enum):
     READY = "ready"  # 待分析
     ANALYZING = "analyzing"  # 分析中
     ANALYZED = "analyzed"  # 分析完成
+    # 分析任务已完成，但某个维度没有完整执行（例如价格维度未识别到报价）。
+    # 单独成状态而不是沿用「分析完成」，避免用户误以为三个维度都有结论。
+    ANALYZED_PARTIAL = "analyzed_partial"  # 分析完成（部分维度未覆盖）
     ARCHIVED = "archived"  # 已归档
 
 
@@ -15,6 +18,7 @@ PROJECT_STATUS_LABELS = {
     ProjectStatus.READY.value: "待分析",
     ProjectStatus.ANALYZING.value: "分析中",
     ProjectStatus.ANALYZED.value: "分析完成",
+    ProjectStatus.ANALYZED_PARTIAL.value: "分析完成（部分维度未覆盖）",
     ProjectStatus.ARCHIVED.value: "已归档",
 }
 
@@ -87,6 +91,15 @@ class EvidenceType(str, Enum):
     TEXT = "text"
     PERSONNEL = "personnel"
     PRICE = "price"
+    # 文件指纹：同一份原始文件被两家以上企业提交（铁证，不依赖合同内容）
+    FILE = "file"
+    # 文档元数据：PDF 生产者/作者、DOCX 作者与最后修改人、生成环境指纹
+    METADATA = "metadata"
+
+    @classmethod
+    def analysis_types(cls) -> list[str]:
+        """不进入「分析维度」菜单、由文件阶段独立产出的证据类型。"""
+        return [cls.FILE.value, cls.METADATA.value]
 
 
 class RiskLevel(str, Enum):

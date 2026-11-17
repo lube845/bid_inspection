@@ -27,7 +27,14 @@ from app.models.enums import (
     FileParseStatus,
     PageStatus,
 )
-from app.services import audit, logical_document_service, project_service, rule_service
+from app.services import (
+    audit,
+    document_forensics,
+    document_metadata,
+    logical_document_service,
+    project_service,
+    rule_service,
+)
 from app.services.ocr import build_ocr_provider
 from app.services.parser import ParseError, parse_document
 from app.storage.local import get_storage
@@ -269,6 +276,21 @@ def parse_file(
     if file.parse_status == FileParseStatus.SUPERSEDED.value:
         return file
 
+    # 解析结果可能改变招标文件基准（例如扫描件 OCR 前为空页 → 现在有正文），
+    # 而分析任务把招标文件版本固化在 tender_file_version_id 里。这里记下「本文件
+    # 是否在本项目已有分析任务之前就已存在」：重新解析若改变了正文，需要提示用户
+    # 按新基准重新分析，否则会继续查看未做公共内容排除的旧结果。
+    previous_status = file.parse_status
+    had_analysis = db.scalar(
+        select(AnalysisTask.id)
+        .where(AnalysisTask.project_id == file.project_id)
+        .limit(1)
+    ) is not None
+    previous_texts = {
+        page.page_index: (page.page_text or "").strip()
+        for page in file.pages
+    }
+
     file.parse_status = FileParseStatus.PARSING.value
     file.parse_message = None
     db.commit()
@@ -286,6 +308,15 @@ def parse_file(
         # OCR 由系统管理里的「OCR 识别」规则决定是否启用与调用方式
         ocr_provider = build_ocr_provider(rule_service.active_ocr_config(db))
         parsed = parse_document(path, file.file_type, ocr_provider=ocr_provider)
+        # 元数据与正文分开提取：元数据缺失不影响解析，但它是「同一台机器 /
+        # 同一个人编写」的关键线索，失败时只记空字典。
+        file.doc_metadata = document_metadata.extract_metadata(path, file.file_type)
+        # 图片指纹与 DOCX 修订标识属于文件级取证，同样在解析时一次性算好，
+        # 避免分析任务里重复读取大文件。Pillow 缺失时指纹为空，不阻断解析。
+        file.doc_metadata = {
+            **file.doc_metadata,
+            **document_forensics.build_metadata_extras(path, file.file_type),
+        }
     except (ParseError, FileNotFoundError) as exc:
         _mark_parse_failed(db, file, company, project, str(exc), actor)
         _maybe_auto_start(db, project, auto_start)
@@ -356,6 +387,13 @@ def parse_file(
         file.parse_status = FileParseStatus.SUCCESS.value
         file.parse_message = f"成功解析 {success_pages}/{len(parsed.pages)} 页"
 
+    # 招标文件重新解析（例如扫描件 OCR 成功）后，正文基准变了，但已有分析任务
+    # 固化的是旧版本。标记旧结果过期，前端据此提示「按新基准重新分析」。
+    tender_text_changed = False
+    if file.kind == FileKind.TENDER.value and had_analysis:
+        new_texts = {page.page_index: (page.page_text or "").strip() for page in file.pages}
+        tender_text_changed = new_texts != previous_texts or previous_status == FileParseStatus.FAILED.value
+
     db.flush()
     if company:
         logical_document_service.rebuild_logical_document(db, company)
@@ -368,7 +406,11 @@ def parse_file(
         "original_file",
         file.id,
         actor,
-        {"status": file.parse_status, "pages": file.page_count},
+        {
+            "status": file.parse_status,
+            "pages": file.page_count,
+            "tender_baseline_changed": tender_text_changed,
+        },
     )
     db.commit()
     db.refresh(file)
@@ -454,6 +496,14 @@ def parse_center(db: Session, project_id: str) -> dict:
         .limit(1)
     ).first()
 
+    # 解析中心也要能看到「招标基准已变化」：用户在这里点“重试解析”，
+    # 成功后若不提示重新分析，就会继续查看未排除公共内容的旧结果。
+    from app.services import analysis_service  # 延迟导入，避免循环依赖
+
+    stale_tender = (
+        analysis_service._tender_baseline_stale(db, last_task) if last_task else None
+    )
+
     return {
         "total": len(active),
         "counts": counts,
@@ -462,6 +512,7 @@ def parse_center(db: Session, project_id: str) -> dict:
             "task_id": last_task.id if last_task else None,
             "status": last_task.status if last_task else None,
             "started": last_task is not None,
+            "stale_tender_baseline": stale_tender,
         },
     }
 

@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 from itertools import combinations
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
+from app.analysis.anomalies import (
+    DEFAULT_TYPO_TERMS,
+    build_anomaly_evidences,
+    extract_anomalies,
+    _batch_common_terms,
+)
 from app.analysis.base import EvidenceDraft
+from app.analysis.clustering import assign_clusters
+from app.analysis.structure import (
+    build_structure_evidence,
+    build_structure_fingerprint_with_images,
+    compare_structures,
+)
 from app.analysis.baseline import TenderBaseline
 from app.analysis.chunking import TextChunk, build_chunks
 from app.analysis.personnel import (
@@ -14,20 +27,37 @@ from app.analysis.personnel import (
     extract_people,
 )
 from app.analysis.price import (
+    QUALITY_RULES,
     Quote,
     analyze_prices,
+    analyze_quote_quality,
     build_price_evidences,
     extract_quote,
+    quote_from_snapshot,
+)
+from app.analysis.forensics import (
+    build_file_fingerprint_evidence,
+    build_image_evidence,
+    build_metadata_evidence,
+    build_rsid_evidence,
+)
+from app.analysis import image_hash
+from app.analysis.facts import build_fact_conflict_evidences, extract_facts
+from app.analysis.line_items import (
+    build_line_item_evidence,
+    compare_line_items,
+    extract_line_items,
 )
 from app.analysis.risk import max_risk, personnel_risk, price_risk, text_risk
 from app.analysis.sources import BlockRef, load_company_blocks
+from app.analysis.template import TemplateProfile, build_template_profile
 from app.analysis.text_similarity import (
     TextIndex,
     build_tender_baseline,
     build_text_evidences,
     match_chunks,
 )
-from app.analysis.thresholds import text_thresholds
+from app.analysis.thresholds import price_thresholds, text_thresholds
 from app.core.config import settings
 from app.models import (
     AnalysisCompanySnapshot,
@@ -39,7 +69,9 @@ from app.models import (
     ComparisonPair,
     EvidenceParticipant,
     OriginalFile,
+    PriceQuote,
     Project,
+    TemplateFragment,
     TextSimilarityResult,
     User,
 )
@@ -56,8 +88,17 @@ from app.models.enums import (
     TaskStatus,
 )
 from app.schemas.analysis import StartAnalysisRequest
-from app.services import audit, logical_document_service, project_service, rule_service
+from app.services import (
+    audit,
+    document_forensics,
+    document_metadata,
+    logical_document_service,
+    project_service,
+    rule_service,
+    template_service,
+)
 from app.services.project_service import FINISHED_TASK_STATUSES
+from app.storage.local import get_storage
 from app.workers import dispatch
 
 
@@ -308,6 +349,12 @@ def create_task(
                     "warning",
                 )
             )
+        # 存量文件是在元数据提取功能上线前解析的，doc_metadata 还是空。
+        # 这里按需补取一次并落库，用户不必为了取证维度重新解析全部文件。
+        for file in usable:
+            if not file.doc_metadata:
+                file.doc_metadata = _extract_file_metadata(file)
+
         version = logical_document_service.rebuild_logical_document(db, company)
         snapshot_companies.append(
             {
@@ -323,6 +370,9 @@ def create_task(
                         "file_hash": f.file_hash,
                         "page_count": f.page_count,
                         "parse_status": f.parse_status,
+                        # 元数据随任务快照固化：之后重新解析或替换文件，
+                        # 本次任务的取证结论仍可复现。
+                        "doc_metadata": f.doc_metadata or {},
                     }
                     for f in usable
                 ],
@@ -344,6 +394,9 @@ def create_task(
     tender_file_version_id = (
         tender_files[0].id if (payload.exclude_tender_public_content and tender_files) else None
     )
+    # 固化招标正文指纹：之后重新解析（典型：开启 OCR 后扫描件识别成功）会改变
+    # 正文，但文件 id 不变；只有指纹才能判断「公共内容排除基准」是否已过期。
+    tender_signature = _tender_content_signature(tender_files[0]) if tender_file_version_id else None
     if payload.exclude_tender_public_content and not tender_files:
         warnings.append(
             _validation("no_tender", "未上传招标文件，跳过公共内容排除", "info")
@@ -376,6 +429,9 @@ def create_task(
     # 之后即使规则被修改，历史任务重跑时仍使用启动时的这一版规则。
     rule_snapshot = rule_service.active_snapshot(db)
     thresholds = rule_service.resolve_thresholds(rule_snapshot)
+    # 人工报价在启动时固化：之后即使报价被改，本任务仍用启动时那一版。
+    # 自动抽取的报价要等拿到文本块后才能补，由 _ensure_price_snapshot 在运行期补齐。
+    price_snapshot = _build_manual_price_snapshot(db, project.id, selected)
 
     task = AnalysisTask(
         project_id=project.id,
@@ -387,6 +443,8 @@ def create_task(
             "confirm_partial": payload.confirm_partial,
             "thresholds": thresholds,
             "rule_versions": rule_snapshot,
+            "price_snapshot": price_snapshot,
+            "tender_signature": tender_signature,
         },
         tender_file_version_id=tender_file_version_id,
         company_snapshot={
@@ -397,6 +455,7 @@ def create_task(
         algorithm_version=settings.algorithm_version,
         progress=progress,
         created_by=actor.id if actor else None,
+        template_snapshot=_build_template_snapshot(db, project.id),
     )
     db.add(task)
     db.flush()
@@ -629,6 +688,18 @@ def _draft_to_evidence(
     return evidence
 
 
+def _extract_file_metadata(file: OriginalFile) -> dict:
+    """按需补取存量文件的元数据（含图片指纹与 rsid）；不可读时返回空字典。"""
+    try:
+        path = get_storage().local_path(file.storage_key)
+    except (FileNotFoundError, ValueError):
+        return {}
+    return {
+        **document_metadata.extract_metadata(path, file.file_type),
+        **document_forensics.build_metadata_extras(path, file.file_type),
+    }
+
+
 def _blocks_for_snapshot(db: Session, company: dict) -> list[BlockRef]:
     return load_company_blocks(
         db,
@@ -639,13 +710,59 @@ def _blocks_for_snapshot(db: Session, company: dict) -> list[BlockRef]:
     )
 
 
+def _prepare_forensic_context(
+    db: Session,
+    task: AnalysisTask,
+    blocks_by_company: dict[str, list[BlockRef]],
+    snapshot: dict[str, dict],
+) -> dict:
+    """批次级取证上下文：招标标题基准、批次共性错字、结构指纹。
+
+    这些都要「跨企业」统计才有意义（例如同一错字 3 家企业都有 → 行业通病），
+    所以放在 pair 循环之前算一次，各组合复用。
+    """
+    tender_headings: set[str] = set()
+    if task.tender_file_version_id:
+        tender_blocks = load_company_blocks(
+            db, "tender", "招标文件", [task.tender_file_version_id], limit=10000
+        )
+        if tender_blocks:
+            tender_headings = set(
+                build_structure_fingerprint_with_images(tender_blocks).headings
+            )
+
+    anomalies_by_company = {
+        company_id: extract_anomalies(blocks, DEFAULT_TYPO_TERMS)
+        for company_id, blocks in blocks_by_company.items()
+    }
+    # 3 家及以上共有同一错字时，视为行业通病，不抬风险
+    batch_common_terms = _batch_common_terms(anomalies_by_company, min_companies=3)
+
+    structures = {}
+    for company in snapshot.values():
+        company_id = company["company_id"]
+        images = []
+        for file in company.get("files") or []:
+            images.extend((file.get("doc_metadata") or {}).get("images") or [])
+        structures[company_id] = build_structure_fingerprint_with_images(
+            blocks_by_company.get(company_id, []), images
+        )
+
+    return {
+        "tender_headings": tender_headings,
+        "anomalies": anomalies_by_company,
+        "batch_common_terms": batch_common_terms,
+        "structures": structures,
+    }
+
+
 def _prepare_text_engine(
     db: Session,
     task: AnalysisTask,
     blocks_by_company: dict[str, list[BlockRef]],
     thresholds: dict,
-) -> tuple[dict, dict[str, list[TextChunk]], TextIndex, TenderBaseline | None]:
-    """构建本次任务复用的分块、MinHash/LSH 索引和招标文件基准。"""
+) -> tuple[dict, dict[str, list[TextChunk]], TextIndex, TenderBaseline | None, TemplateProfile]:
+    """构建本次任务复用的分块、MinHash/LSH 索引、招标文件基准和模板画像。"""
     rules = text_thresholds(thresholds)
     chunks_by_company = {
         company_id: build_chunks(blocks, rules)
@@ -654,6 +771,14 @@ def _prepare_text_engine(
     index = TextIndex(rules)
     index.add_chunks(
         [chunk for chunks in chunks_by_company.values() for chunk in chunks]
+    )
+    # 批次共同模板：统计每个文本块在几家企业的标书里同时出现。
+    # 一次任务只算一次，各企业组合复用同一份画像。
+    template = build_template_profile(
+        chunks_by_company,
+        similarity=float(rules["text_similarity"]),
+        shingle_size=int(rules["text_shingle_size"]),
+        index=index,
     )
 
     tender_baseline = None
@@ -666,7 +791,20 @@ def _prepare_text_engine(
             tender_baseline = build_tender_baseline(
                 build_chunks(tender_blocks, rules), thresholds=thresholds
             )
-    return rules, chunks_by_company, index, tender_baseline
+    return rules, chunks_by_company, index, tender_baseline, template
+
+
+def _load_template_library(db: Session, task: AnalysisTask, thresholds: dict):
+    """按任务快照加载经验模板库（快照之后新增的片段不参与本次任务）。"""
+    fragment_ids = (task.template_snapshot or {}).get("fragment_ids") or []
+    if not fragment_ids:
+        return None
+    rules = text_thresholds(thresholds)
+    return template_service.load_library(
+        db,
+        fragment_ids,
+        shingle_size=int(rules["text_shingle_size"]),
+    )
 
 
 def run_task(db: Session, task_id: str) -> AnalysisTask:
@@ -723,6 +861,7 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
         pair.text_risk = RiskLevel.NONE.value
         pair.personnel_risk = RiskLevel.NONE.value
         pair.price_risk = RiskLevel.NONE.value
+        pair.forensic_risk = RiskLevel.NONE.value
         pair.overall_risk = RiskLevel.NONE.value
         pair.risk_reasons = []
         pair.error_message = None
@@ -746,12 +885,16 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
 
     blocks_by_company: dict[str, list[BlockRef]] = {}
     people_by_company: dict[str, list[PersonOccurrence]] = {}
+    # 「关键岗位范围」参数真正接入检测引擎（此前只记录不生效）
+    key_positions = (task_thresholds or {}).get("key_positions") or []
     try:
         for company in companies:
             blocks = _blocks_for_snapshot(db, company)
             blocks_by_company[company["company_id"]] = blocks
             if Dimension.PERSONNEL.value in dimensions:
-                people_by_company[company["company_id"]] = extract_people(blocks)
+                people_by_company[company["company_id"]] = extract_people(
+                    blocks, key_positions=key_positions
+                )
             _log(
                 db,
                 task,
@@ -759,11 +902,20 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
             )
         db.commit()
 
+        # 批次级取证上下文（招标标题基准、批次共性错字、结构指纹）只算一次
+        forensic_context = _prepare_forensic_context(
+            db, task, blocks_by_company, {c["company_id"]: c for c in companies}
+        )
+
         # 结构化分块 + 项目级 MinHash/LSH 索引只构建一次，所有企业组合复用
         if Dimension.TEXT.value in dimensions:
-            text_rules, chunks_by_company, text_index, tender_baseline = _prepare_text_engine(
-                db, task, blocks_by_company, task_thresholds
-            )
+            (
+                text_rules,
+                chunks_by_company,
+                text_index,
+                tender_baseline,
+                template_profile,
+            ) = _prepare_text_engine(db, task, blocks_by_company, task_thresholds)
         else:
             text_rules, chunks_by_company, text_index, tender_baseline = (
                 text_thresholds(task_thresholds),
@@ -771,6 +923,14 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
                 None,
                 None,
             )
+            template_profile = TemplateProfile()
+        # 经验模板库按任务快照加载；文本维度关闭时没有匹配点，直接跳过
+        template_library = (
+            _load_template_library(db, task, task_thresholds)
+            if Dimension.TEXT.value in dimensions
+            else None
+        )
+        template_hits: dict[str, int] = {}
         if Dimension.TEXT.value in dimensions:
             for company in companies:
                 _log(
@@ -792,6 +952,18 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
                     task,
                     f"已建立招标文件公共内容基准（{len(tender_baseline.hashes)} 个指纹）",
                 )
+            shared_templates = sum(
+                1
+                for count in template_profile.presence.values()
+                if count >= int(text_rules["template_min_companies"])
+            )
+            if shared_templates:
+                _log(
+                    db,
+                    task,
+                    f"识别到 {shared_templates} 个跨企业共同模板文本块，"
+                    f"命中这些模板的证据会标记为「共同模板」并排除出风险计数",
+                )
 
         pairs = list(
             db.scalars(
@@ -811,10 +983,14 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
                     task,
                     pair,
                     people_by_company,
+                    blocks_by_company,
                     chunks_by_company,
                     text_index,
                     tender_baseline,
                     text_rules,
+                    template_profile,
+                    forensic_context=forensic_context,
+                    template_library=template_library,
                 )
                 db.commit()
             except Exception as exc:  # 单个企业组合失败不影响其他组合
@@ -829,9 +1005,32 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
                 _bump_progress(task, dimensions, failed=True)
                 db.commit()
 
+        if template_hits:
+            template_service.bump_hits(db, template_hits)
+            db.commit()
+
+        # 所有企业组合的证据都落库后再聚类：线索要跨「同一组合内的多条证据」计算，
+        # 不能放在 _run_pair 里逐条判断。
+        try:
+            cluster_summary = assign_clusters(db, task.id)
+            if cluster_summary:
+                merged = sum(1 for size in cluster_summary.values() if size > 1)
+                _log(
+                    db,
+                    task,
+                    f"证据聚类完成：{len(cluster_summary)} 条线索，其中 {merged} 条由多处命中合并",
+                )
+                db.commit()
+        except Exception as exc:  # 聚类失败不影响检测结论
+            db.rollback()
+            task = db.get(AnalysisTask, task_id)
+            _log(db, task, f"证据聚类失败: {exc}", "warning")
+            db.commit()
+
         price_failed = False
         if Dimension.PRICE.value in dimensions:
             try:
+                _ensure_price_snapshot(db, task, companies, blocks_by_company)
                 coverage = _run_price_stage(db, task, companies, blocks_by_company)
                 _set_progress(
                     task,
@@ -862,12 +1061,40 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
                 _set_progress(task, dimension, status="completed")
         task.finished_at = utcnow()
         total_pairs = len(pairs)
+        price_coverage = ((task.progress or {}).get(Dimension.PRICE.value) or {}).get(
+            "coverage"
+        ) or {}
+        price_incomplete = (
+            Dimension.PRICE.value in dimensions
+            and (
+                price_coverage.get("status") == "no_quote"
+                or (
+                    int(price_coverage.get("expected") or 0)
+                    > int(price_coverage.get("recognized") or 0)
+                )
+            )
+        )
         if total_pairs and failed_pairs >= total_pairs:
             task.status = TaskStatus.FAILED.value
             task.error_message = "全部企业组合分析失败"
-        elif failed_pairs or price_failed:
+        elif failed_pairs or price_failed or price_incomplete:
+            # 价格维度没覆盖全也属于「部分完成」：不能报告为全部维度完成
             task.status = TaskStatus.PARTIAL.value
-            task.error_message = f"{failed_pairs} 个企业组合失败" + ("，价格异常分析失败" if price_failed else "")
+            reasons = []
+            if failed_pairs:
+                reasons.append(f"{failed_pairs} 个企业组合失败")
+            if price_failed:
+                reasons.append("价格异常分析失败")
+            if price_incomplete:
+                missing = int(price_coverage.get("expected") or 0) - int(
+                    price_coverage.get("recognized") or 0
+                )
+                reasons.append(
+                    "未识别到投标总报价"
+                    if price_coverage.get("status") == "no_quote"
+                    else f"价格维度有 {missing} 家企业未识别到报价"
+                )
+            task.error_message = "，".join(reasons)
         else:
             task.status = TaskStatus.COMPLETED.value
         _log(db, task, f"分析任务结束：{task.status}")
@@ -923,11 +1150,15 @@ def _run_pair(
     task: AnalysisTask,
     pair: ComparisonPair,
     people_by_company: dict[str, list[PersonOccurrence]],
+    blocks_by_company: dict[str, list[BlockRef]],
     chunks_by_company: dict[str, list[TextChunk]],
     text_index: TextIndex | None,
     tender_baseline: TenderBaseline | None,
     text_rules: dict,
+    template_profile: TemplateProfile | None = None,
     record_progress: bool = True,
+    forensic_context: dict | None = None,
+    template_library=None,
 ) -> None:
     dimensions = task.analysis_config.get("dimensions", ALL_DIMENSIONS)
     # 本次分析使用的阈值快照（来自启动时生效的检测规则版本）
@@ -943,6 +1174,9 @@ def _run_pair(
     text_level = RiskLevel.NONE.value
     personnel_level = RiskLevel.NONE.value
     risk_reasons: list[str] = []
+    # 批次共性 rsid：同一批文件里「每家都有」的修订标识来自工具链或模板，
+    # 不代表同源。先算出这批文档的公共 ID 集合，比对时扣除。
+    batch_common_rsid = _batch_common_rsid(snapshot)
 
     if Dimension.TEXT.value in dimensions:
         started = utcnow()
@@ -963,9 +1197,32 @@ def _run_pair(
                 "warning",
             )
         _persist_text_results(db, task, pair, matches)
-        drafts = build_text_evidences(matches, tender_baseline, thresholds=thresholds)
-        excluded = [d for d in drafts if d.evidence_data.get("excluded_by_tender")]
-        effective = [d for d in drafts if not d.evidence_data.get("excluded_by_tender")]
+        drafts = build_text_evidences(
+            matches,
+            tender_baseline,
+            thresholds=thresholds,
+            template=template_profile,
+            library=template_library,
+        )
+        # 模板命中的片段要计入片段统计；一次任务结束时批量写回
+        for draft in drafts:
+            fragment_id = draft.evidence_data.get("template_fragment_id")
+            if fragment_id:
+                template_hits[fragment_id] = template_hits.get(fragment_id, 0) + 1
+        excluded = [
+            d
+            for d in drafts
+            if d.evidence_data.get("excluded_by_tender")
+            or d.evidence_data.get("excluded_by_template")
+        ]
+        effective = [
+            d
+            for d in drafts
+            if not d.evidence_data.get("excluded_by_tender")
+            and not d.evidence_data.get("excluded_by_template")
+            # 封面/目录字段（项目名称、投标人、日期…）雷同没有信息量，不计入风险
+            and not d.evidence_data.get("cover_only")
+        ]
         max_similarity = max(
             (
                 d.evidence_data.get("effective_similarity", d.evidence_data["similarity"])
@@ -1047,12 +1304,519 @@ def _run_pair(
             )
         )
 
-    pair.overall_risk = max_risk(pair.text_risk, pair.personnel_risk, pair.price_risk)
+    # 价格维度补充：逐项单价雷同（清单明细）。归在价格维度下，
+    # 因为它的证据类型与价格异常一致，审核与报告的展示路径完全复用。
+    if Dimension.PRICE.value in dimensions:
+        _run_line_item_stage(
+            db, task, pair, company_a, company_b, blocks_by_company, thresholds
+        )
+
+    # 关键事实冲突：共用联系方式、非常规工期一致、项目班子整组一致。
+    # 与人员维度互补（人员维度看单人重复，这里看「整组安排」）。
+    _run_fact_conflicts(
+        db, task, pair, company_a, company_b, blocks_by_company
+    )
+
+    # 文件级取证：文件指纹与文档元数据。它不依赖文本内容，因此不归入
+    # 任何「分析维度」，只要该企业组存在就执行。
+    forensics_level = _run_file_forensics(
+        db, task, pair, company_a, company_b, snapshot, batch_common_rsid
+    )
+    # 结构相似与错字一致：与文件取证同属「不依赖文本相似度」的独立信号，
+    # 结果合并进 forensic_risk，避免为它新增一个分析维度与一对列。
+    structure_level = _run_structure_stage(
+        db, task, pair, company_a, company_b, forensic_context
+    )
+    anomaly_level = _run_anomaly_stage(
+        db, task, pair, company_a, company_b, forensic_context
+    )
+    forensic_for_pair = max_risk(forensics_level, structure_level, anomaly_level)
+    pair.forensic_risk = forensic_for_pair
+    if forensics_level != RiskLevel.NONE.value:
+        risk_reasons.append("文件指纹或文档元数据存在同源迹象")
+    if structure_level != RiskLevel.NONE.value:
+        risk_reasons.append("文档结构高度相似（章节、表格或图片顺序一致）")
+    if anomaly_level != RiskLevel.NONE.value:
+        risk_reasons.append("相同上下文出现同一处非规范写法")
+
+    pair.overall_risk = max_risk(
+        pair.text_risk,
+        pair.personnel_risk,
+        pair.price_risk,
+        pair.forensic_risk,
+    )
     pair.risk_reasons = risk_reasons
     pair.status = PairStatus.COMPLETED.value
     _bump_progress(task, dimensions, record_progress=record_progress)
     _log(db, task, f"{company_a['company_name']} ↔ {company_b['company_name']} 比对完成")
     db.flush()
+
+
+def _run_line_item_stage(
+    db: Session,
+    task: AnalysisTask,
+    pair: ComparisonPair,
+    company_a: dict,
+    company_b: dict,
+    blocks_by_company: dict[str, list[BlockRef]],
+    thresholds: dict,
+) -> None:
+    """逐项单价比对（清单明细）。"""
+    items_a = extract_line_items(blocks_by_company.get(pair.company_a_id, []))
+    items_b = extract_line_items(blocks_by_company.get(pair.company_b_id, []))
+    if not items_a or not items_b:
+        return
+    report = compare_line_items(items_a, items_b)
+    rules = price_thresholds(thresholds)
+    draft = build_line_item_evidence(
+        report,
+        min_shared=int(rules["price_line_item_min_shared"]),
+        min_identical=int(rules["price_line_item_min_identical"]),
+        min_ratio=float(rules["price_line_item_min_ratio"]),
+    )
+    if draft is None:
+        return
+    _draft_to_evidence(
+        db,
+        task,
+        pair,
+        draft,
+        [
+            (pair.company_a_id, company_a.get("company_name", ""), "a", draft.source_a),
+            (pair.company_b_id, company_b.get("company_name", ""), "b", draft.source_b),
+        ],
+    )
+
+
+def _run_structure_stage(
+    db: Session,
+    task: AnalysisTask,
+    pair: ComparisonPair,
+    company_a: dict,
+    company_b: dict,
+    forensic_context: dict | None,
+) -> str:
+    """结构指纹比对（章节树 / 表格骨架 / 图片顺序）。"""
+    if not forensic_context:
+        return RiskLevel.NONE.value
+    structures = forensic_context.get("structures") or {}
+    fingerprint_a = structures.get(pair.company_a_id)
+    fingerprint_b = structures.get(pair.company_b_id)
+    if fingerprint_a is None or fingerprint_b is None:
+        return RiskLevel.NONE.value
+    rules = task.analysis_config.get("thresholds") or {}
+    comparison = compare_structures(
+        fingerprint_a,
+        fingerprint_b,
+        tender_headings=forensic_context.get("tender_headings") or set(),
+        min_titles=int(rules.get("structure_min_titles") or 3),
+        title_ratio=float(rules.get("structure_title_ratio") or 0.5),
+        min_tables=int(rules.get("structure_table_min") or 3),
+    )
+    draft = build_structure_evidence(
+        (pair.company_a_id, company_a.get("company_name", "")),
+        (pair.company_b_id, company_b.get("company_name", "")),
+        comparison,
+    )
+    if draft is None:
+        return RiskLevel.NONE.value
+    _draft_to_evidence(
+        db,
+        task,
+        pair,
+        draft,
+        [
+            (pair.company_a_id, company_a.get("company_name", ""), "a", None),
+            (pair.company_b_id, company_b.get("company_name", ""), "b", None),
+        ],
+    )
+    return draft.severity
+
+
+def _run_anomaly_stage(
+    db: Session,
+    task: AnalysisTask,
+    pair: ComparisonPair,
+    company_a: dict,
+    company_b: dict,
+    forensic_context: dict | None,
+) -> str:
+    """同一处非规范写法 + 相同上下文。"""
+    if not forensic_context:
+        return RiskLevel.NONE.value
+    anomalies = forensic_context.get("anomalies") or {}
+    drafts = build_anomaly_evidences(
+        (pair.company_a_id, company_a.get("company_name", "")),
+        (pair.company_b_id, company_b.get("company_name", "")),
+        anomalies.get(pair.company_a_id, []),
+        anomalies.get(pair.company_b_id, []),
+        batch_common=forensic_context.get("batch_common_terms") or set(),
+    )
+    level = RiskLevel.NONE.value
+    for draft in drafts:
+        _draft_to_evidence(
+            db,
+            task,
+            pair,
+            draft,
+            [
+                (pair.company_a_id, company_a.get("company_name", ""), "a", draft.source_a),
+                (pair.company_b_id, company_b.get("company_name", ""), "b", draft.source_b),
+            ],
+        )
+        if not draft.evidence_data.get("batch_common"):
+            level = max_risk(level, draft.severity)
+    return level
+
+
+def _run_fact_conflicts(
+    db: Session,
+    task: AnalysisTask,
+    pair: ComparisonPair,
+    company_a: dict,
+    company_b: dict,
+    blocks_by_company: dict[str, list[BlockRef]],
+) -> None:
+    """关键事实冲突：共用联系方式、非常规工期一致、项目班子整组一致。"""
+    facts_a = extract_facts(blocks_by_company.get(pair.company_a_id, []))
+    facts_b = extract_facts(blocks_by_company.get(pair.company_b_id, []))
+    if not facts_a or not facts_b:
+        return
+    drafts = build_fact_conflict_evidences(
+        facts_a,
+        facts_b,
+        (pair.company_a_id, company_a.get("company_name", "")),
+        (pair.company_b_id, company_b.get("company_name", "")),
+    )
+    for draft in drafts:
+        _draft_to_evidence(
+            db,
+            task,
+            pair,
+            draft,
+            [
+                (pair.company_a_id, company_a.get("company_name", ""), "a", draft.source_a),
+                (pair.company_b_id, company_b.get("company_name", ""), "b", draft.source_b),
+            ],
+        )
+
+
+def _batch_common_rsid(snapshot: dict[str, dict]) -> set[str]:
+    """本批文件中「每家企业都有」的 rsid，比对时扣除。
+
+    办公工具链会给所有导入的文档写入同一套固定 rsid（实测 python-docx
+    生成的三个互不相关文档，交集是全部 9 个）。这类 ID 不携带任何编写者信息，
+    必须从交集里扣掉，否则每一对企业都会被判成同源。只有两家企业参与时无法
+    区分「共性」与「共享」，此时返回空集合，由证据的说明字段提示人工核实。
+    """
+    per_company: list[set[str]] = []
+    for company in snapshot.values():
+        ids: set[str] = set()
+        for file in company.get("files") or []:
+            ids.update((file.get("doc_metadata") or {}).get("rsid_ids") or [])
+        if ids:
+            per_company.append(ids)
+    # 少于 3 家企业时没有「多数派」可比，不做扣除
+    if len(per_company) < 3:
+        return set()
+    return set.intersection(*per_company)
+
+
+def _run_file_forensics(
+    db: Session,
+    task: AnalysisTask,
+    pair: ComparisonPair,
+    company_a: dict,
+    company_b: dict,
+    snapshot: dict[str, dict],
+    batch_common_rsid: set[str] | None = None,
+) -> str:
+    """文件级取证：同一份文件被两家提交、或元数据指向同一编写环境。
+
+    返回该组合的取证风险等级；证据本身通过统一的 ``_draft_to_evidence``
+    落库，因此风险页、三栏页和 Excel 报告都能直接看到。
+    """
+    files_a = (snapshot.get(pair.company_a_id) or {}).get("files") or []
+    files_b = (snapshot.get(pair.company_b_id) or {}).get("files") or []
+    if not files_a or not files_b:
+        return RiskLevel.NONE.value
+
+    company_a_ref = (pair.company_a_id, company_a.get("company_name", ""))
+    company_b_ref = (pair.company_b_id, company_b.get("company_name", ""))
+    highest = RiskLevel.NONE.value
+    level_order = {
+        RiskLevel.NONE.value: 0,
+        RiskLevel.LOW.value: 1,
+        RiskLevel.MEDIUM.value: 2,
+        RiskLevel.HIGH.value: 3,
+    }
+
+    def emit(draft: EvidenceDraft | None) -> None:
+        nonlocal highest
+        if draft is None:
+            return
+        if level_order.get(draft.severity, 0) > level_order.get(highest, 0):
+            highest = draft.severity
+        _draft_to_evidence(
+            db,
+            task,
+            pair,
+            draft,
+            [
+                (pair.company_a_id, company_a_ref[1], "a", draft.source_a),
+                (pair.company_b_id, company_b_ref[1], "b", draft.source_b),
+            ],
+        )
+
+    for file_a in files_a:
+        for file_b in files_b:
+            ref_a = {
+                "file_id": file_a.get("id"),
+                "file_name": file_a.get("file_name"),
+                "file_hash": file_a.get("file_hash"),
+                "metadata": file_a.get("doc_metadata") or {},
+            }
+            ref_b = {
+                "file_id": file_b.get("id"),
+                "file_name": file_b.get("file_name"),
+                "file_hash": file_b.get("file_hash"),
+                "metadata": file_b.get("doc_metadata") or {},
+            }
+            # 同一份文件：哈希相同即字节级完全相同
+            if ref_a["file_hash"] and ref_a["file_hash"] == ref_b["file_hash"]:
+                emit(
+                    build_file_fingerprint_evidence(
+                        company_a_ref, company_b_ref, ref_a, ref_b
+                    )
+                )
+                continue
+            # 元数据同源：哈希不同（内容改过），但编写环境没变
+            emit(build_metadata_evidence(company_a_ref, company_b_ref, ref_a, ref_b))
+
+            # 图片同源：印章、证书扫描件、业绩截图在两份标书里重复出现
+            images_a = ref_a["metadata"].get("images") or []
+            images_b = ref_b["metadata"].get("images") or []
+            if images_a and images_b:
+                matches = image_hash.compare_image_sets(images_a, images_b)
+                emit(
+                    build_image_evidence(
+                        company_a_ref, company_b_ref, ref_a, ref_b, matches
+                    )
+                )
+
+            # DOCX 修订标识：两份文档共享编辑会话 ID，说明从同一底稿派生。
+            # 必须扣除「批次共性 ID」——工具链（python-docx、某些模板）会给
+            # 所有文档写入同一套固定 rsid，不扣掉会把毫无关系的标书全部报成
+            # 同源（实测：三个完全不同的 docx 交集都是 9 个）。
+            ids_a = set(ref_a["metadata"].get("rsid_ids") or [])
+            ids_b = set(ref_b["metadata"].get("rsid_ids") or [])
+            if ids_a and ids_b:
+                trace_a = set(ref_a["metadata"].get("rsid_trace_ids") or [])
+                trace_b = set(ref_b["metadata"].get("rsid_trace_ids") or [])
+                common = batch_common_rsid or set()
+                shared = (ids_a & ids_b) - common
+                shared_trace = (trace_a & trace_b) - common
+                comparison = {
+                    "shared_ids": sorted(shared),
+                    "shared_count": len(shared),
+                    "shared_trace": sorted(shared_trace),
+                    "shared_trace_count": len(shared_trace),
+                    "overlap_ratio": (
+                        len(shared) / min(len(ids_a), len(ids_b)) if ids_a and ids_b else 0.0
+                    ),
+                }
+                emit(
+                    build_rsid_evidence(
+                        company_a_ref, company_b_ref, ref_a, ref_b, comparison
+                    )
+                )
+
+    return highest
+
+
+def _build_manual_price_snapshot(db: Session, project_id: str, companies: list[Company]) -> dict:
+    """把当前有效的人工报价固化成任务快照的一份拷贝。"""
+    if not companies:
+        return {"captured_at": utcnow().isoformat(), "entries": {}}
+    ids = [company.id for company in companies]
+    names = {company.id: company.company_name for company in companies}
+    quotes = db.scalars(
+        select(PriceQuote).where(
+            PriceQuote.project_id == project_id,
+            PriceQuote.company_id.in_(ids),
+            PriceQuote.is_active.is_(True),
+        )
+    )
+    entries: dict[str, dict] = {}
+    for quote in quotes:
+        entries[quote.company_id] = {
+            "company_id": quote.company_id,
+            "company_name": names.get(quote.company_id, ""),
+            "amount": float(quote.amount),
+            "amount_upper": quote.amount_upper,
+            "raw": quote.raw_text,
+            "source_kind": quote.source_kind,
+            "quote_id": quote.id,
+            "quote_version_no": quote.version_no,
+            "source": {
+                "company_id": quote.company_id,
+                "company_name": names.get(quote.company_id, ""),
+                "locator_precision": "quote",
+                "source_kind": quote.source_kind,
+                "version_no": quote.version_no,
+            },
+        }
+    return {"captured_at": utcnow().isoformat(), "entries": entries}
+
+
+def _build_template_snapshot(db: Session, project_id: str) -> dict:
+    """固化任务使用的模板库片段 id（全局 + 本项目）。"""
+    rows = db.scalars(
+        select(TemplateFragment).where(
+            TemplateFragment.revoked_at.is_(None),
+            or_(
+                TemplateFragment.scope == "global",
+                and_(
+                    TemplateFragment.scope == "project",
+                    TemplateFragment.project_id == project_id,
+                ),
+            ),
+        )
+    )
+    ids = [row.id for row in rows]
+    return {"captured_at": utcnow().isoformat(), "fragment_ids": ids}
+
+
+def _ensure_price_snapshot(
+    db: Session,
+    task: AnalysisTask,
+    companies: list[dict],
+    blocks_by_company: dict[str, list[BlockRef]],
+) -> None:
+    """补齐任务快照里的报价来源。
+
+    优先级：人工导入/补录 > 首次自动抽取结果 > 本次抽取。
+    自动抽取只做一次并固化，重跑任务不会因为正文变化而改变历史结论。
+    SQLAlchemy 不会跟踪嵌套 JSON 的修改，必须把整个 config 重新赋值回写。
+    """
+    config = dict(task.analysis_config or {})
+    snapshot = dict(config.get("price_snapshot") or {})
+    entries = dict(snapshot.get("entries") or {})
+
+    changed = False
+    for company in companies:
+        company_id = company["company_id"]
+        if company_id in entries:
+            continue
+        quote = extract_quote(
+            company_id, company["company_name"], blocks_by_company.get(company_id, [])
+        )
+        if quote is None:
+            continue
+        entries[company_id] = {
+            "company_id": company_id,
+            "company_name": company["company_name"],
+            "amount": float(quote.amount),
+            "amount_upper": quote.upper,
+            "raw": quote.raw,
+            "source_kind": "auto",
+            "quote_id": None,
+            "quote_version_no": None,
+            "source": quote.source,
+            # 表格里的合计候选互相矛盾：保留候选值，分析阶段生成「待确认」证据
+            "needs_confirmation": bool(quote.inconsistent),
+            "alternative_amounts": sorted(
+                {round(value, 2) for value in (quote.alternatives or [])}
+            )
+            if quote.inconsistent
+            else [],
+        }
+        changed = True
+
+    if changed:
+        snapshot["entries"] = entries
+        snapshot.setdefault("captured_at", utcnow().isoformat())
+        config["price_snapshot"] = snapshot
+        task.analysis_config = config
+        db.flush()
+
+
+def _stale_price_quotes(db: Session, task: AnalysisTask) -> list[dict]:
+    """快照里的报价是否已经不是当前有效版本（仅用于提示，不改变结论）。
+
+    覆盖三种情况：任务启动后报价被修改、被删除、以及任务启动时还没有报价
+    （自动抽取或空快照）而之后补录了——最后一种同样意味着本次结论没有用上
+    人工确认的最新报价。
+    """
+    snapshot = ((task.analysis_config or {}).get("price_snapshot") or {}).get("entries") or {}
+    current = {
+        quote.company_id: quote
+        for quote in db.scalars(
+            select(PriceQuote).where(
+                PriceQuote.project_id == task.project_id,
+                PriceQuote.is_active.is_(True),
+            )
+        )
+    }
+    companies = {
+        c["company_id"]: c["company_name"]
+        for c in (task.company_snapshot or {}).get("companies", [])
+    }
+    stale: list[dict] = []
+    seen: set[str] = set()
+    for company_id, entry in snapshot.items():
+        seen.add(company_id)
+        snapshot_version = entry.get("quote_version_no")
+        now = current.get(company_id)
+        if snapshot_version is None:
+            # 任务启动时该企业没有人工报价（用的是正文自动抽取），之后补录了
+            # 人工报价——本次结论没有用上人工确认值。
+            if now is not None:
+                stale.append(
+                    {
+                        "company_id": company_id,
+                        "company_name": entry.get("company_name")
+                        or companies.get(company_id)
+                        or "",
+                        "snapshot_version": None,
+                        "current_version": now.version_no,
+                        "reason": "manual_added",
+                    }
+                )
+            continue
+        if now is None:
+            stale.append(
+                {
+                    "company_id": company_id,
+                    "company_name": entry.get("company_name"),
+                    "snapshot_version": snapshot_version,
+                    "current_version": None,
+                    "reason": "deleted",
+                }
+            )
+        elif now.version_no != snapshot_version:
+            stale.append(
+                {
+                    "company_id": company_id,
+                    "company_name": entry.get("company_name"),
+                    "snapshot_version": snapshot_version,
+                    "current_version": now.version_no,
+                    "reason": "updated",
+                }
+            )
+    for company_id, quote in current.items():
+        if company_id in seen:
+            continue
+        stale.append(
+            {
+                "company_id": company_id,
+                "company_name": companies.get(company_id) or "",
+                "snapshot_version": None,
+                "current_version": quote.version_no,
+                "reason": "added",
+            }
+        )
+    return stale
 
 
 def _run_price_stage(
@@ -1066,16 +1830,19 @@ def _run_price_stage(
     返回的 coverage 会写入任务进度，结果页据此提示「哪些企业未识别到报价」，
     避免识别失败被静默当作「没有异常」。
     """
+    # 报价只从任务快照读取（人工 > 抽取，见 _ensure_price_snapshot）。
+    snapshot = (task.analysis_config or {}).get("price_snapshot") or {}
+    entries = snapshot.get("entries") or {}
     quotes: list[Quote] = []
     missing: list[str] = []
+    source_counts = {"manual": 0, "import": 0, "auto": 0}
     for company in companies:
-        quote = extract_quote(
-            company["company_id"],
-            company["company_name"],
-            blocks_by_company.get(company["company_id"], []),
-        )
+        entry = entries.get(company["company_id"])
+        quote = quote_from_snapshot(entry) if entry else None
         if quote:
             quotes.append(quote)
+            origin = quote.origin if quote.origin in source_counts else "auto"
+            source_counts[origin] += 1
         else:
             missing.append(company["company_name"])
 
@@ -1084,21 +1851,27 @@ def _run_price_stage(
         "recognized": len(quotes),
         "missing_companies": missing,
         "status": "completed",
+        "manual_count": source_counts["manual"] + source_counts["import"],
+        "imported_count": source_counts["import"],
+        "auto_count": source_counts["auto"],
     }
     if not quotes:
         _log(db, task, "未识别到结构化投标总报价，价格异常分析无结果", "warning")
         coverage["status"] = "no_quote"
         return coverage
 
-    findings = analyze_prices(
-        quotes, thresholds=task.analysis_config.get("thresholds") or {}
-    )
-    if not findings:
+    thresholds = task.analysis_config.get("thresholds") or {}
+    findings = analyze_prices(quotes, thresholds=thresholds)
+    # 单家质量项（大小写不一致）与「多家串通」规则分开统计，也不参与组合风险
+    quality_findings = analyze_quote_quality(quotes, thresholds=thresholds)
+    if not findings and not quality_findings:
         _log(db, task, f"识别到 {len(quotes)} 家总报价，未触发价格异常规则")
         coverage["finding_count"] = 0
         return coverage
     mean = sum(q.amount for q in quotes) / len(quotes)
-    drafts = build_price_evidences(findings, mean)
+    drafts = build_price_evidences(findings, mean) + build_price_evidences(
+        quality_findings, mean
+    )
     for draft in drafts:
         participants = [
             (
@@ -1110,8 +1883,14 @@ def _run_price_stage(
             for quote in draft.evidence_data.get("quotes", [])
         ]
         _draft_to_evidence(db, task, None, draft, participants)
-    _log(db, task, f"价格异常分析完成，触发 {len(findings)} 条规则")
-    coverage["finding_count"] = len(findings)
+    _log(
+        db,
+        task,
+        f"价格异常分析完成，触发 {len(findings)} 条规则"
+        + (f"，另有 {len(quality_findings)} 条单家质量提示" if quality_findings else ""),
+    )
+    coverage["finding_count"] = len(findings) + len(quality_findings)
+    coverage["quality_count"] = len(quality_findings)
     db.flush()
     return coverage
 
@@ -1128,6 +1907,9 @@ def _apply_price_risk_to_pairs(db: Session, task: AnalysisTask) -> None:
     )
     coverage: list[tuple[set[str], str]] = []
     for evidence in price_evidences:
+        # 单家质量项（大小写不一致等）不是串通线索，不计入组合价格风险
+        if evidence.evidence_subtype in QUALITY_RULES:
+            continue
         company_ids = {
             p.company_id
             for p in evidence.participants
@@ -1145,7 +1927,10 @@ def _apply_price_risk_to_pairs(db: Session, task: AnalysisTask) -> None:
         ]
         level, reasons = price_risk(severities)
         pair.price_risk = level
-        pair.overall_risk = max_risk(pair.text_risk, pair.personnel_risk, pair.price_risk)
+        # 重算综合风险时必须带上取证维度，否则 high 的文件指纹证据会被这里覆盖
+        pair.overall_risk = max_risk(
+            pair.text_risk, pair.personnel_risk, pair.price_risk, pair.forensic_risk
+        )
         existing = [
             reason
             for reason in (pair.risk_reasons or [])
@@ -1166,9 +1951,13 @@ def retry_pair(db: Session, task: AnalysisTask, pair: ComparisonPair) -> Compari
     }
     thresholds = task.analysis_config.get("thresholds") or {}
     if Dimension.TEXT.value in task.analysis_config.get("dimensions", ALL_DIMENSIONS):
-        text_rules, chunks_by_company, text_index, tender_baseline = _prepare_text_engine(
-            db, task, blocks_by_company, thresholds
-        )
+        (
+            text_rules,
+            chunks_by_company,
+            text_index,
+            tender_baseline,
+            template_profile,
+        ) = _prepare_text_engine(db, task, blocks_by_company, thresholds)
     else:
         text_rules, chunks_by_company, text_index, tender_baseline = (
             text_thresholds(thresholds),
@@ -1176,6 +1965,16 @@ def retry_pair(db: Session, task: AnalysisTask, pair: ComparisonPair) -> Compari
             None,
             None,
         )
+        template_profile = TemplateProfile()
+    # 经验模板库来自任务快照，重试时同样复用，保证同一任务前后一致
+    template_library = (
+        _load_template_library(db, task, thresholds)
+        if Dimension.TEXT.value in task.analysis_config.get("dimensions", ALL_DIMENSIONS)
+        else None
+    )
+
+    # 结构/错字取证依赖批次上下文（招标标题、批次共性错字），重试单条也要重建
+    forensic_context = _prepare_forensic_context(db, task, blocks_by_company, snapshot)
 
     # 保留历史证据与执行记录，只将旧证据标记为非当前，避免直接覆盖历史
     for evidence in list(pair.evidences):
@@ -1188,6 +1987,7 @@ def retry_pair(db: Session, task: AnalysisTask, pair: ComparisonPair) -> Compari
     pair.text_risk = RiskLevel.NONE.value
     pair.personnel_risk = RiskLevel.NONE.value
     pair.price_risk = RiskLevel.NONE.value
+    pair.forensic_risk = RiskLevel.NONE.value
     pair.overall_risk = RiskLevel.NONE.value
     pair.risk_reasons = []
     db.flush()
@@ -1197,12 +1997,18 @@ def retry_pair(db: Session, task: AnalysisTask, pair: ComparisonPair) -> Compari
         task,
         pair,
         people_by_company,
+        blocks_by_company,
         chunks_by_company,
         text_index,
         tender_baseline,
         text_rules,
+        template_profile,
         record_progress=False,
+        forensic_context=forensic_context,
+        template_library=template_library,
     )
+    # 只重算本组合的聚类，其他组合不受影响
+    assign_clusters(db, task.id, pair_ids=[pair.id])
     _apply_price_risk_to_pairs(db, task)
 
     pairs = list(
@@ -1230,6 +2036,59 @@ def cancel_task(db: Session, task: AnalysisTask, actor: User | None = None) -> A
     audit.log_audit(db, "analysis.cancel", "analysis_task", task.id, actor)
     db.commit()
     return task
+
+
+def _tender_content_signature(file: OriginalFile) -> str:
+    """招标正文指纹：页数 + 各页文本长度 + 整体哈希。
+
+    重新解析同一份内容不应触发过期提示，所以不能用 updated_at；只有正文真的
+    变了（空页 → OCR 出正文）才需要重新分析。
+    """
+    pages = sorted(file.pages, key=lambda page: page.page_index)
+    digest = hashlib.sha256()
+    for page in pages:
+        text = (page.page_text or "").strip()
+        digest.update(f"{page.page_index}:{len(text)}:".encode())
+        digest.update(text.encode())
+    return digest.hexdigest()
+
+
+def _tender_baseline_stale(db: Session, task: AnalysisTask) -> dict | None:
+    """招标文件在任务启动后被重新解析/替换 → 本任务的公共内容排除已过期。
+
+    任务把招标文件版本固化在 ``tender_file_version_id``，重新解析不会改变该
+    id，但正文会变（典型场景：扫描件先解析为空页，开启 OCR 后重试成功）。
+    用任务启动时固化的正文指纹对比当前正文，避免 updated_at 的假阳性。
+    """
+    if not task.tender_file_version_id:
+        return None
+    tender = db.get(OriginalFile, task.tender_file_version_id)
+    if tender is None:
+        return {
+            "reason": "deleted",
+            "file_name": None,
+            "updated_at": None,
+            "message": "本次分析使用的招标文件已不存在，公共内容排除结论需要重新计算",
+        }
+    snapshot = (task.analysis_config or {}).get("tender_signature")
+    if not snapshot:
+        # 旧任务没有指纹：退回时间判断，只提示、不阻断
+        started = task.started_at or task.created_at
+        changed = bool(tender.updated_at and started and tender.updated_at > started)
+    else:
+        changed = snapshot != _tender_content_signature(tender)
+    if not changed:
+        return None
+    return {
+        "reason": "reparsed",
+        "file_name": tender.file_name,
+        "parse_status": tender.parse_status,
+        "updated_at": tender.updated_at,
+        "message": (
+            f"招标文件《{tender.file_name}》在本次分析后正文发生了变化（例如扫描件重新识别），"
+            "公共内容排除可能已失效，请按新基准重新分析"
+        ),
+    }
 
 
 def task_detail(db: Session, task: AnalysisTask) -> dict:
@@ -1267,6 +2126,10 @@ def task_detail(db: Session, task: AnalysisTask) -> dict:
         ],
         "algorithm_version": task.algorithm_version,
         "progress": task.progress,
+        # 报价在任务启动后又被修改时，这里提示「结论基于旧报价」
+        "stale_price_quotes": _stale_price_quotes(db, task),
+        # 招标文件在任务启动后重新解析/替换时，公共内容排除已过期
+        "stale_tender_baseline": _tender_baseline_stale(db, task),
         "pair_count": len(pairs),
         "completed_pair_count": sum(1 for p in pairs if p.status == PairStatus.COMPLETED.value),
         "failed_pair_count": sum(1 for p in pairs if p.status == PairStatus.FAILED.value),

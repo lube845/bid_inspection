@@ -55,8 +55,6 @@ BAIDU_LANGUAGE_TYPES = [
     "RUS",
 ]
 
-# 单次请求体积上限（百度侧限制：base64 + urlencode 不超过 8MB）
-BAIDU_MAX_FILE_MB = 8
 # 原始文件体积上限：base64 之后约放大 4/3，再留一点 urlencode 的余量
 MAX_RAW_FILE_MB = 6
 
@@ -96,15 +94,6 @@ class OCRProvider(ABC):
 
 class NoopOCRProvider(OCRProvider):
     name = "OCR 未启用"
-
-    def extract_text(self, file_path: Path, page_index: int) -> str | None:
-        return None
-
-
-class TesseractOCRProvider(OCRProvider):  # pragma: no cover - 示例实现，默认不启用
-    """接入示例：安装 pytesseract + pdf2image 后启用。"""
-
-    name = "Tesseract OCR"
 
     def extract_text(self, file_path: Path, page_index: int) -> str | None:
         return None
