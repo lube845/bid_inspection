@@ -155,7 +155,7 @@ cd backend
 
 测试覆盖：端到端种子流程（解析 → 3 组比对 → 三级证据 → Excel 导出）、审核记录追加、20 家企业上限、文本规范化偏移映射；文本引擎的结构化分块、MinHash/LSH 召回、Jaccard/有效相似度、招标文件基准排除、局部对齐与块对结果入库；以及系统级模块——工作台防重复计数与待办、风险清单筛选分页与证据编号、批量审核限制、规则版本生命周期与阈值真正生效、操作日志、用户管理与管理员鉴权。
 
-新增覆盖（`pytest` 共 269 项）：迁移脚本与模型一致性（`test_migrations.py`）、报价导入与快照优先级（`test_price_quotes.py`）、尾数参数与大小写一致性（`test_price_rules.py`）、证据聚类边界（`test_clusters.py`）、分派/审核/按线索审核（`test_review_workflow.py`）、结构指纹与错字一致性（`test_structure.py`）、经验模板库（`test_template_library.py`）、跨任务对比（`test_task_diff.py`）、QA 报告（`prd_kimi_test.md`）缺陷回归（`test_qa_1117_regressions.py`）：退出登录令牌吊销、重复分析只看最新任务、千分位/表格合计行报价识别（含「分项在合计之前」的布局）、合计候选矛盾时标记待确认、统一社会信用代码校验位、封面字段雷同降级、关键岗位范围参数生效、取整尾数不报异常、招标正文变化后旧任务标记基准过期、报价清单展示自动识别金额。
+新增覆盖（`pytest` 共 271 项）：迁移脚本与模型一致性（`test_migrations.py`）、报价导入与快照优先级（`test_price_quotes.py`）、尾数参数与大小写一致性（`test_price_rules.py`）、证据聚类边界（`test_clusters.py`）、分派/审核/按线索审核（`test_review_workflow.py`）、结构指纹与错字一致性（`test_structure.py`）、经验模板库（`test_template_library.py`）、跨任务对比（`test_task_diff.py`）、QA 报告（`prd_kimi_test.md`）缺陷回归（`test_qa_1117_regressions.py`）：退出登录令牌吊销、重复分析只看最新任务、千分位/表格合计行报价识别（含「分项在合计之前」的布局）、合计候选矛盾时标记待确认、统一社会信用代码校验位、封面字段雷同降级、关键岗位范围参数生效、取整尾数不报异常、招标正文变化后旧任务标记基准过期、报价清单展示自动识别金额；第三轮 QA 回归（`test_qa_test3_regressions.py`）；项目权限（`test_project_access.py`）、价格矩阵（`test_price_matrix.py`）、单家价格文件（`test_company_price_file.py`）、模板命中计数（`test_template_hits_regression.py`）。
 
 ---
 
