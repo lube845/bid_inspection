@@ -644,6 +644,12 @@ th.num { text-align: right; }
 .pill.draft { background: var(--medium-bg); color: var(--medium); border-color: var(--medium-line); }
 .pill.active { background: var(--ok-bg); color: var(--ok); border-color: var(--ok-line); }
 .pill.text, .pill.personnel, .pill.price { background: var(--primary-soft); color: var(--primary-ink); border-color: var(--low-line); }
+/* 项目权限级别：查看 / 审批 / 管理，颜色由浅到深 */
+.pill.viewer { background: var(--none-bg); color: var(--none); }
+.pill.reviewer { background: var(--low-bg); color: var(--low); border-color: var(--low-line); }
+.pill.manager { background: var(--primary-soft); color: var(--primary-ink); border-color: var(--low-line); }
+/* 权限页里就地改权限的下拉：保持行高一致 */
+.perm-role-select { width: auto; min-width: 96px; height: 32px; padding: 0 8px; }
 
 /* ---------- 统计卡片 ---------- */
 .stat {
@@ -800,8 +806,10 @@ th.num { text-align: right; }
   display: flex; gap: 2px;
   border-bottom: 1px solid var(--line);
   margin-bottom: 18px;
-  overflow-x: auto;
-  scrollbar-width: thin;
+  /* 项目页签已到 10 个：宁可换行也不要横向滚动，
+     否则「权限管理」这类末尾页签在小屏上会直接看不见 */
+  flex-wrap: wrap;
+  overflow-x: visible;
 }
 .tabs a, .tabs .tab {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1408,3 +1416,66 @@ html { caret-color: var(--primary); scrollbar-color: #cbd5e1 transparent; scroll
 /* 深色侧边栏内的滚动条跟随深色表面 */
 .sidebar { scrollbar-color: rgba(148, 163, 184, 0.4) transparent; }
 .sidebar::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.35); background-clip: content-box; }
+
+/* ---------- 价格比对：总价一览 + 单价矩阵 ---------- */
+.total-list { display: flex; flex-direction: column; gap: 8px; }
+.total-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 220px) minmax(0, 1fr) 150px auto;
+  align-items: center; gap: 12px;
+}
+.total-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.total-bar { height: 10px; background: var(--bg-soft); border-radius: 999px; overflow: hidden; }
+.total-bar > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--primary), #0ea5e9); }
+.total-amount { font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+
+/* 矩阵容器：企业多时横向滚动，首列（清单项）吸顶 */
+.pm-scroll { overflow: auto; max-height: 68vh; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.pm-table { border-collapse: separate; border-spacing: 0; min-width: 100%; font-size: 12.5px; }
+.pm-table th, .pm-table td { border-bottom: 1px solid var(--line); padding: 7px 10px; }
+.pm-table thead th {
+  position: sticky; top: 0; z-index: 2; background: var(--bg-soft);
+  font-size: 12px; font-weight: 600; color: var(--text-2); text-align: center;
+  white-space: nowrap;
+}
+.pm-table .pm-item {
+  position: sticky; left: 0; z-index: 1; background: #fff; text-align: left;
+  min-width: 200px; max-width: 300px;
+}
+.pm-table thead .pm-item { z-index: 3; background: var(--bg-soft); }
+.pm-item-name { display: block; font-weight: 600; color: var(--text); }
+.pm-item-meta { display: block; font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 2px; }
+.pm-cell {
+  text-align: right; font-variant-numeric: tabular-nums; cursor: help;
+  position: relative; white-space: nowrap;
+}
+.pm-cell .pm-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 999px;
+  margin-left: 6px; vertical-align: middle; background: currentColor; opacity: 0.7;
+}
+.pm-cell:hover { filter: brightness(0.97); }
+/* 状态色：沿用风险语义色，红=相同（线索最强） */
+.pm-identical { background: var(--high-bg); color: var(--high); font-weight: 650; }
+.pm-near { background: var(--medium-bg); color: var(--medium); font-weight: 600; }
+.pm-outlier { background: #ede9fe; color: #5b21b6; font-weight: 600; }
+.pm-peer { background: #fff; color: var(--text); }
+.pm-single { background: var(--bg-soft); color: var(--muted); }
+.pm-missing { background: #fafafa; color: var(--muted); text-align: center; }
+.pm-dash { opacity: 0.6; }
+.pm-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.pm-legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.pm-swatch { width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--line-strong); display: inline-block; }
+.pm-swatch.pm-identical { background: var(--high-bg); border-color: var(--high-line); }
+.pm-swatch.pm-near { background: var(--medium-bg); border-color: var(--medium-line); }
+.pm-swatch.pm-outlier { background: #ede9fe; border-color: #ddd6fe; }
+.pm-swatch.pm-peer { background: #fff; }
+.pm-swatch.pm-single { background: var(--bg-soft); }
+
+@media (max-width: 900px) {
+  .total-row { grid-template-columns: minmax(0, 1fr) 110px; grid-template-areas: "name amount" "bar bar"; row-gap: 4px; }
+  .total-name { grid-area: name; }
+  .total-bar { grid-area: bar; }
+  .total-amount { grid-area: amount; }
+  .total-row .pill { display: none; }
+  .pm-scroll { max-height: 60vh; }
+}

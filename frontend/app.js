@@ -5,6 +5,8 @@ const state = {
   token: localStorage.getItem("bid_token") || "",
   user: JSON.parse(localStorage.getItem("bid_user") || "null"),
   lastProjectId: localStorage.getItem("bid_last_project") || "",
+  // 当前项目的权限级别（viewer / reviewer / manager），由项目页加载时写入
+  projectRole: null,
 };
 
 /* 项目状态文案：优先使用服务端下发的 status_label，这里仅作兜底 */
@@ -48,7 +50,7 @@ const SUBTYPE = {
 const subtypeLabel = (value) => SUBTYPE[value] || value;
 
 /* 系统级模块用到的标签 */
-const USER_ROLE = { admin: "系统管理员", analyst: "项目分析人员", reviewer: "风险审核人员" };
+const USER_ROLE = { admin: "管理员", user: "用户" };
 const RULE_DIM = { text: "文本相似", personnel: "人员重复", price: "价格异常" };
 
 let pollTimer = null;
@@ -70,7 +72,6 @@ function resetRiskListState(projectId) {
     date_from: "", date_to: "", page: 1, page_size: 20,
   };
 }
-let systemTab = "rules";
 let logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "", page: 1, page_size: 50 };
 let selectedCompanyByProject = {};
 
@@ -298,7 +299,9 @@ async function api(path, options = {}) {
     apiGetCache.clear();
   }
   const response = await fetch(API + path, { method, headers, body });
-  if (response.status === 401) {
+  /* 登录接口的 401 是「账号或密码错误」，不是会话过期：这类请求要原样把
+     后端 detail 透出，绝不能触发 logout() 覆盖成过期提示。 */
+  if (response.status === 401 && !options.allow401) {
     logout();
     const expired = new Error("登录已过期，请重新登录");
     expired.status = 401;
@@ -391,9 +394,11 @@ function showLogin() {
 function showApp() {
   $("#login-view").classList.add("hidden");
   $("#app-shell").classList.remove("hidden");
-  const name = state.user ? state.user.display_name || state.user.username : "";
+  const name = state.user
+    ? state.user.display_name || state.user.employee_no || state.user.username
+    : "";
   const role = state.user ? USER_ROLE[state.user.role] || state.user.role : "";
-  const subline = name === role ? state.user?.username || "" : role;
+  const subline = name === role ? state.user?.employee_no || state.user?.username || "" : role;
   const box = $("#user-box");
   if (box) {
     /* 姓名与角色上下两行，便于和右侧退出按钮排在同一行 */
@@ -490,9 +495,21 @@ async function route() {
         location.replace("#/projects");
       }
       return;
+    } else if (path === "/settings") {
+      setNav("settings");
+      await renderSettingsPage();
+    } else if (path === "/audit") {
+      setNav("audit");
+      await renderAuditPage();
+    } else if (path === "/users") {
+      setNav("users");
+      await renderUsersPage();
     } else if (path === "/system") {
-      setNav("system");
-      await renderSystem(params);
+      /* 旧的「系统管理」入口已拆成三个一级页面：默认落到系统配置 */
+      const legacyTab = params.get("tab");
+      const target = legacyTab === "logs" ? "audit" : legacyTab === "users" ? "users" : "settings";
+      location.replace(`#/${target}`);
+      return;
     } else if (path === "/projects") {
       setNav("projects");
       await renderProjects();
@@ -605,14 +622,17 @@ async function renderProjects() {
     <tr>
       <td><a href="#/projects/${project.id}"><strong>${esc(project.project_name)}</strong></a>
         <div class="small muted">${esc(project.project_code || "无项目编号")}</div></td>
+      <td>${project.is_owner
+        ? `<span class="small muted">我创建的</span>`
+        : `<span class="pill ${esc(project.my_role || "none")}">${esc(PROJECT_ROLE[project.my_role] || "共享")}</span>`}</td>
       <td>${num(project.company_count)}</td>
       <td>${num(project.file_count)}</td>
       <td>${pill(project.status, projectStatusLabel(project))}</td>
       <td>${fmtDate(project.last_analysis_at)}</td>
       <td>
         <a class="btn small" href="#/projects/${project.id}">进入</a>
-        ${project.status !== "archived" ? `<button class="btn small" data-archive="${project.id}">归档</button>` : ""}
-        <button class="btn small danger" data-delete="${project.id}" data-name="${esc(project.project_name)}">删除</button>
+        ${project.my_role === "manager" && project.status !== "archived" ? `<button class="btn small" data-archive="${project.id}">归档</button>` : ""}
+        ${project.my_role === "manager" ? `<button class="btn small danger" data-delete="${project.id}" data-name="${esc(project.project_name)}">删除</button>` : ""}
       </td>
     </tr>`).join("");
 
@@ -644,8 +664,11 @@ async function renderProjects() {
         </div>
         ${hasFilters ? `<div class="filter-actions"><button type="button" class="btn small" id="filter-reset">${icon("refresh")}重置筛选</button></div>` : ""}
       </div>
-      ${rows ? `<table><thead><tr><th>项目名称</th><th>企业数</th><th>文件数</th><th>项目状态</th><th>最近分析</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
-        : `<div class="empty">暂无项目，创建第一个项目开始整理标书资料。<button class="btn primary" id="empty-create-project">${icon("plus")}创建项目</button></div>`}
+      ${rows
+        ? `<table><thead><tr><th>项目名称</th><th>我的权限</th><th>企业数</th><th>文件数</th><th>项目状态</th><th>最近分析</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
+        : hasFilters
+          ? `<div class="empty">没有符合当前筛选条件的项目。<button class="btn small" id="filter-reset-empty">${icon("refresh")}清除筛选条件</button></div>`
+          : `<div class="empty">暂无项目，创建第一个项目开始整理标书资料。<button class="btn primary" id="empty-create-project">${icon("plus")}创建项目</button></div>`}
     </div>`;
 
   let searchTimer = null;
@@ -677,6 +700,10 @@ async function renderProjects() {
   });
   $("#create-project").addEventListener("click", openCreateProject);
   $("#empty-create-project")?.addEventListener("click", openCreateProject);
+  $("#filter-reset-empty")?.addEventListener("click", () => {
+    projectListState = { q: "", status: "", include_archived: false };
+    renderProjects();
+  });
 
   $$("[data-archive]").forEach((btn) => btn.addEventListener("click", async () => {
     const ok = await confirmDialog({
@@ -690,22 +717,68 @@ async function renderProjects() {
       catch (error) { toast(error.message, "error"); }
     }, "归档中…");
   }));
-  $$("[data-delete]").forEach((btn) => btn.addEventListener("click", async () => {
-    const ok = await confirmDialog({
-      title: "删除项目",
-      message: `确认删除项目“${btn.dataset.name}”？原始资料与历史分析记录会保留在数据库中，但项目将从列表和统计中移除。`,
-      confirmLabel: "删除",
-      danger: true,
-    });
-    if (!ok) return;
-    await withBusy(btn, async () => {
-      try { await api(`/projects/${btn.dataset.delete}`, { method: "DELETE" }); toast("项目已删除", "success"); renderProjects(); }
-      catch (error) { toast(error.message, "error"); }
-    }, "删除中…");
-  }));
+  $$("[data-delete]").forEach((btn) => btn.addEventListener("click", () => openDeleteProject(btn)));
+
 }
 
-function openCreateProject() {
+/* 删除项目：默认软删除（可追溯）；彻底删除需要输入项目名称二次确认，
+   并明确告知会连同文件与证据一起物理清除、不可恢复。 */
+function openDeleteProject(btn) {
+  const projectId = btn.dataset.delete;
+  const projectName = btn.dataset.name || "该项目";
+  let purge = false;
+  const modal = openModal({
+    title: "删除项目",
+    body: `
+      <p style="margin:0 0 10px">确认删除项目“<strong>${esc(projectName)}</strong>”？</p>
+      <label class="small" style="display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+        <input type="checkbox" id="delete-purge" style="margin-top:3px" />
+        <span><strong>同时彻底删除全部资料</strong>（不可恢复）<br>
+          <span class="muted">勾选后会一并清除磁盘上的原始文件、解析文本、分析任务、证据与审核记录、报价与模板片段。
+          不勾选则只从列表与统计中移除，原始资料仍保留在数据库中，便于误删恢复。</span></span>
+      </label>
+      <div id="delete-purge-confirm" hidden style="margin-top:12px">
+        <label class="small" for="delete-confirm-name">请输入项目名称以确认彻底删除</label>
+        <input id="delete-confirm-name" placeholder="${esc(projectName)}" />
+      </div>
+      <div id="delete-error" class="form-error" hidden></div>`,
+    footer: `<button type="button" class="btn" data-close>取消</button>
+      <button type="button" class="btn danger" id="delete-submit">删除</button>`,
+  });
+  const purgeBox = $("#delete-purge", modal.root);
+  const confirmWrap = $("#delete-purge-confirm", modal.root);
+  purgeBox?.addEventListener("change", () => {
+    purge = purgeBox.checked;
+    confirmWrap.hidden = !purge;
+    const submit = $("#delete-submit", modal.root);
+    if (submit) submit.textContent = purge ? "彻底删除" : "删除";
+  });
+  $("#delete-submit", modal.root)?.addEventListener("click", (event) => {
+    const button = event.currentTarget;
+    const fail = (message) => {
+      const box = $("#delete-error", modal.root);
+      if (!box) { toast(message, "error"); return; }
+      box.hidden = false;
+      box.textContent = message;
+      box.setAttribute("tabindex", "-1");
+      box.focus();
+    };
+    if (purge) {
+      const typed = ($("#delete-confirm-name", modal.root)?.value || "").trim();
+      if (typed !== projectName) { fail("请输入完整的项目名称以确认彻底删除"); return; }
+    }
+    withBusy(button, async () => {
+      try {
+        const result = await api(`/projects/${projectId}${purge ? "?purge=true" : ""}`, { method: "DELETE" });
+        modal.close();
+        toast(result.message || "项目已删除", "success");
+        renderProjects();
+      } catch (error) { fail(error.message); }
+    }, purge ? "彻底删除中…" : "删除中…");
+  });
+}
+
+async function openCreateProject() {
   const modal = openModal({
     title: "创建项目",
     body: `<form id="project-form">
@@ -735,16 +808,198 @@ function openCreateProject() {
   }, "创建中…"));
 }
 
+/* ---------- 项目权限管理 ---------- */
+const PROJECT_ROLE = { viewer: "查看", reviewer: "审批", manager: "管理" };
+/* 当前项目是否可写：查看者只能浏览，页面上所有写操作按钮都要隐藏 */
+const canEditProject = () => state.projectRole === "manager";
+const PROJECT_ROLE_HINT = {
+  viewer: "查看：看项目全部内容（含比对结果、价格比对、审核列表、导出报告），不能审核、不能改任何资料",
+  reviewer: "审批：在「查看」基础上，可审核证据、按线索审核、批量标记与分派",
+  manager: "管理：在「审批」基础上，可改项目设置、增删企业、上传/解析/删除文件、导入报价、发起分析、分享给他人",
+};
+
+function projectRoleOptions(selected) {
+  return Object.entries(PROJECT_ROLE)
+    .map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`)
+    .join("");
+}
+
+async function renderProjectPermissions(container, project, perms) {
+  const data = perms || await api(`/projects/${project.id}/permissions`);
+  const canManage = Boolean(data.can_manage);
+  const rows = (data.items || []).map((item) => {
+    const identity = item.employee_no || item.email || item.username;
+    return `<tr>
+      <td><strong>${esc(item.display_name || item.username)}</strong>
+        <div class="small muted mono">${esc(identity || "")}</div></td>
+      <td class="col-secondary">${esc(item.email || "—")}</td>
+      <td>${item.is_owner
+        ? `<span class="pill manager">${esc(item.role_label)}</span> <span class="small muted">创建者</span>`
+        : canManage
+          ? `<select class="perm-role-select" data-member="${esc(item.id)}" aria-label="修改 ${esc(item.display_name)} 的权限">${projectRoleOptions(item.role)}</select>`
+          : `<span class="pill ${esc(item.role)}">${esc(item.role_label)}</span>`}</td>
+      <td class="small muted">${fmtDate(item.created_at)}</td>
+      <td>${canManage && !item.is_owner
+        ? `<button class="btn small danger" data-revoke-member="${esc(item.id)}" data-name="${esc(item.display_name || item.username)}">移除</button>`
+        : "—"}</td>
+    </tr>`;
+  }).join("");
+
+  container.innerHTML = `
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <h2 style="margin:0">权限管理</h2>
+        <span class="small muted">项目默认只有创建者可见；分享后对方才能看到，并按所选级别操作</span>
+        <span class="spacer"></span>
+        ${canManage ? `<button class="btn primary" id="share-project">${icon("users")}分享项目</button>` : ""}
+      </div>
+      <div class="info-box" style="margin-bottom:14px">
+        我的权限：<strong>${esc(PROJECT_ROLE[data.my_role] || "无")}</strong>
+        ${data.is_system_admin ? "（系统管理员对所有项目拥有管理权限）" : ""}${data.is_owner ? "（项目创建者）" : ""}
+      </div>
+      ${rows
+        ? `<div class="table-scroll"><table><thead><tr><th>成员</th><th class="col-secondary">邮箱</th><th>权限</th><th>加入时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`
+        : `<div class="empty">还没有分享给其他用户。</div>`}
+      <div class="small muted" style="margin-top:12px">
+        权限逐级包含（管理 ⊃ 审批 ⊃ 查看），且不能授予高于自己的级别。
+        <ul class="small" style="margin:8px 0 0;padding-left:18px">
+          <li><strong>查看</strong>：看项目全部内容与导出，不能审核或改动</li>
+          <li><strong>审批</strong>：查看 + 审核证据、按线索审核、批量标记与分派</li>
+          <li><strong>管理</strong>：审批 + 改项目设置、管企业与文件、导入报价、发起分析、继续分享</li>
+        </ul>
+      </div>
+    </div>`;
+
+  if (!canManage) return;
+
+  $("#share-project")?.addEventListener("click", () => openShareProjectModal(project, data));
+
+  $$("[data-revoke-member]").forEach((btn) => btn.addEventListener("click", async () => {
+    const ok = await confirmDialog({
+      title: "移除项目权限",
+      message: `确认移除「${btn.dataset.name}」对本项目的访问权限？对方将立即看不到该项目。`,
+      confirmLabel: "移除",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api(`/projects/${project.id}/permissions/${btn.dataset.revokeMember}`, { method: "DELETE" });
+      toast("已移除访问权限", "success");
+      renderProject(project.id, "permissions");
+    } catch (error) { toast(error.message, "error"); }
+  }));
+
+  $$(".perm-role-select").forEach((select) => select.addEventListener("change", async () => {
+    try {
+      await api(`/projects/${project.id}/permissions/${select.dataset.member}`, {
+        method: "PATCH",
+        body: { role: select.value },
+      });
+      toast("权限已更新", "success");
+      renderProject(project.id, "permissions");
+    } catch (error) {
+      toast(error.message, "error");
+      renderProject(project.id, "permissions");
+    }
+  }));
+}
+
+/* 分享弹窗：按工号/邮箱输入 → 显示匹配到的用户 → 选权限 → 二次确认 */
+function openShareProjectModal(project, perms) {
+  const targets = perms.share_targets || [];
+  const modal = openModal({
+    title: "分享项目",
+    body: `<form id="share-form">
+      <div class="form-row">
+        <label for="share-account">工号或邮箱 *</label>
+        <input id="share-account" list="share-account-list" autocomplete="off" placeholder="输入对方的工号或邮箱" required />
+        <datalist id="share-account-list">
+          ${targets.map((t) => `<option value="${esc(t.employee_no || t.email || "")}">${esc(t.display_name)}</option>`).join("")}
+        </datalist>
+        <div class="small muted" style="margin-top:6px">按工号或邮箱定位账号。</div>
+      </div>
+      <div class="form-row">
+        <label for="share-role">分配权限 *</label>
+        <select id="share-role">${projectRoleOptions("viewer")}</select>
+        <div class="small muted" id="share-role-hint" style="margin-top:6px">${PROJECT_ROLE_HINT.viewer}</div>
+      </div>
+      <p id="share-error" class="form-error" role="alert" hidden></p>
+    </form>`,
+    footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="share-submit">确认分享</button>`,
+  });
+
+  const accountInput = $("#share-account", modal.root);
+  const roleSelect = $("#share-role", modal.root);
+  const hint = $("#share-role-hint", modal.root);
+  const errorBox = $("#share-error", modal.root);
+  accountInput.focus({ preventScroll: true });
+
+  roleSelect.addEventListener("change", () => {
+    hint.textContent = PROJECT_ROLE_HINT[roleSelect.value] || "";
+  });
+
+  const showError = (message) => {
+    errorBox.hidden = false;
+    errorBox.textContent = message;
+  };
+
+  const submit = $("#share-submit", modal.root);
+  submit.addEventListener("click", () => withBusy(submit, async () => {
+    errorBox.hidden = true;
+    const account = accountInput.value.trim();
+    if (!account) {
+      showError("请输入对方的工号或邮箱");
+      accountInput.focus();
+      return;
+    }
+    const match = targets.find((t) =>
+      (t.employee_no && t.employee_no === account)
+      || (t.email && t.email.toLowerCase() === account.toLowerCase()));
+    if (!match) {
+      showError(`没有找到工号或邮箱为「${account}」的用户`);
+      return;
+    }
+    const role = roleSelect.value;
+    const ok = await confirmDialog({
+      title: "确认分享",
+      message: `把项目「${project.project_name}」分享给 ${match.display_name}（${match.employee_no || match.email}），权限为「${PROJECT_ROLE[role]}」？`,
+      confirmLabel: "确认分享",
+    });
+    if (!ok) return;
+    try {
+      const result = await api(`/projects/${project.id}/permissions`, {
+        method: "POST",
+        body: { account, role },
+      });
+      toast(result.message || "项目已分享", "success");
+      modal.close();
+      renderProject(project.id, "permissions");
+    } catch (error) { showError(error.message); }
+  }, "分享中…"));
+}
+
 /* ---------- project shell ---------- */
 async function renderProject(projectId, tab, options = {}) {
   state.lastProjectId = projectId;
   localStorage.setItem("bid_last_project", projectId);
   const project = await api(`/projects/${projectId}`);
+  /* 权限决定页签与按钮：查看者只能看，审批者多一个审核页，管理者才有全部页签 */
+  const perms = await api(`/projects/${projectId}/permissions`).catch(() => null);
+  state.projectRole = perms?.my_role || null;
+  const canReview = Boolean(perms?.can_review);
+  const canManage = Boolean(perms?.can_manage);
   const tabs = [
     ["overview", "项目概览"], ["files", "文件管理"], ["parse", "解析中心"],
     ["task", "分析任务"], ["analysis", "比对分析"], ["review", "审核"],
-    ["results", "比对结果"], ["quotes", "报价清单"], ["report", "分析报告"],
-  ];
+    ["results", "比对结果"], ["price-matrix", "价格比对"],
+    ["report", "分析报告"], ["permissions", "权限管理"],
+  ].filter(([key]) => {
+    if (key === "review") return canReview;
+    /* 管理类页签（文件/解析/任务/报价）对查看者仍然可见，只是写操作会 403；
+       这里只隐藏纯管理入口，避免查看者一进页面就点到一堆报错 */
+    if (key === "permissions") return canManage;
+    return true;
+  });
   $("#main").innerHTML = `
     <div class="page-head">
       <div>
@@ -753,8 +1008,11 @@ async function renderProject(projectId, tab, options = {}) {
         <div class="sub">${esc(project.project_code || "无项目编号")} · 创建于 ${fmtDate(project.created_at)} · ${pill(project.status, projectStatusLabel(project))}</div>
       </div>
       <div class="row">
-        <button class="btn" id="edit-project">${icon("edit")}编辑项目</button>
-        ${project.status !== "archived" ? `<button class="btn" id="archive-project">归档</button>` : `<button class="btn" id="unarchive-project">取消归档</button>`}
+        ${canManage ? `<button class="btn" id="share-project-top">${icon("users")}分享项目</button>` : ""}
+        ${canManage ? `<button class="btn" id="edit-project">${icon("edit")}编辑项目</button>` : ""}
+        ${canManage
+          ? (project.status !== "archived" ? `<button class="btn" id="archive-project">归档</button>` : `<button class="btn" id="unarchive-project">取消归档</button>`)
+          : `<span class="pill ${esc(perms?.my_role || "none")}">${esc({viewer: "查看权限", reviewer: "审批权限", manager: "管理权限"}[perms?.my_role] || "只读")}</span>`}
       </div>
     </div>
     <div class="tabs" role="tablist" aria-label="项目页面">
@@ -762,7 +1020,12 @@ async function renderProject(projectId, tab, options = {}) {
     </div>
     <div id="tab-content">${skeletonPage(3)}</div>`;
 
-  $("#edit-project").addEventListener("click", () => openEditProject(project));
+  $("#edit-project")?.addEventListener("click", () => openEditProject(project));
+  /* 页头直接开分享弹窗：权限页签在末尾，入口不好找 */
+  $("#share-project-top")?.addEventListener("click", async () => {
+    const data = perms || await api(`/projects/${projectId}/permissions`);
+    openShareProjectModal(project, data);
+  });
   const archiveBtn = $("#archive-project");
   if (archiveBtn) archiveBtn.addEventListener("click", async () => {
     const ok = await confirmDialog({ title: "归档项目", message: "归档后该项目默认不在项目列表中显示，可随时取消归档。", confirmLabel: "归档" });
@@ -791,25 +1054,19 @@ async function renderProject(projectId, tab, options = {}) {
     await renderProjectReview(content, project);
   }
   else if (tab === "results") await renderResults(content, project);
-  else if (tab === "quotes") await renderQuotes(content, project);
+  else if (tab === "price-matrix") await renderPriceMatrix(content, project);
   else if (tab === "report") await renderReport(content, project);
+  else if (tab === "permissions") await renderProjectPermissions(content, project, perms);
   else content.innerHTML = `<div class="empty">未知页面</div>`;
 }
 
-function openEditProject(project) {
+async function openEditProject(project) {
   const modal = openModal({
     title: "编辑项目",
     body: `<form id="edit-project-form">
       <div class="form-row"><label for="edit-name">项目名称 *</label><input id="edit-name" name="project_name" required maxlength="255" value="${esc(project.project_name)}" /></div>
       <div class="form-row"><label for="edit-code">项目编号</label><input id="edit-code" name="project_code" maxlength="128" value="${esc(project.project_code || "")}" /></div>
       <div class="form-row"><label for="edit-desc">项目说明</label><textarea id="edit-desc" name="description">${esc(project.description || "")}</textarea></div>
-      <div class="form-row">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-          <input type="checkbox" id="edit-second-review" name="requires_second_review" ${project.requires_second_review ? "checked" : ""} />
-          结论需要两位审核人复核（一审完成后再由另一人终审）
-        </label>
-        <div class="small muted" style="margin-top:4px">只影响开启之后发起的审核，已终审的证据不追溯。</div>
-      </div>
     </form>`,
     footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="edit-submit">保存</button>`,
   });
@@ -825,8 +1082,6 @@ function openEditProject(project) {
     const data = Object.fromEntries(new FormData(form).entries());
     data.project_code = data.project_code || null;
     data.description = data.description || null;
-    // 复选框未勾选时 FormData 里没有该键，需要显式转成布尔值
-    data.requires_second_review = $("#edit-second-review", modal.root)?.checked ?? false;
     try {
       await api(`/projects/${project.id}`, { method: "PATCH", body: data });
       modal.close(); toast("项目已更新", "success"); renderProject(project.id, "overview");
@@ -879,7 +1134,7 @@ async function renderOverview(container, project) {
         num(stats.pending_review_count) ? "high" : "",
         stats.pending_review_count == null ? "暂无分析结果" : "与结果页同口径（最新任务）",
         /* 直接进本项目的审核页（项目内 tab），不经由全局页面 */
-        num(stats.pending_review_count) ? `#/projects/${project.id}?tab=review&review_queue=pending_first` : ""
+        num(stats.pending_review_count) ? `#/projects/${project.id}?tab=review&review_queue=pending` : ""
       )}
     </div>
     <div class="next-step">
@@ -913,8 +1168,11 @@ async function renderOverview(container, project) {
 }
 
 /* ---------- 上传弹窗 ---------- */
-const UPLOAD_ACCEPT = ".pdf,.docx,.doc,.txt,.md,.wps";
+/* 只列出**真正能解析**的格式：DOC 与旧版二进制 WPS 解析必失败，
+   不再接受上传，否则用户要经历「上传成功 → 解析失败」才知道不支持。 */
+const UPLOAD_ACCEPT = ".pdf,.docx,.txt,.md,.wps";
 const UPLOAD_EXTENSIONS = UPLOAD_ACCEPT.split(",");
+const UPLOAD_UNSUPPORTED_HINT = "不支持旧版 DOC 文件，请先在 Word / WPS 中另存为 DOCX 或 PDF 后上传";
 const UPLOAD_MAX_BYTES = 500 * 1024 * 1024;
 
 /* 统一的文件上传弹窗：点击打开本地文件选择，或拖入文件批量上传 */
@@ -926,7 +1184,7 @@ function openUploadModal({ title, hint = "", endpoint, onDone }) {
         aria-label="点击选择文件，或将文件拖放到此处批量上传">
         <div class="upload-dropzone-icon">${icon("upload")}</div>
         <div class="upload-dropzone-title">点击选择文件，或将文件拖放到此处</div>
-        <div class="small muted">支持 PDF / DOCX / DOC / TXT / MD / WPS，可批量上传，单个文件不超过 500MB</div>
+        <div class="small muted">支持 PDF / DOCX / TXT / MD / WPS，可批量上传，单个文件不超过 500MB；旧版 DOC 请先另存为 DOCX 或 PDF</div>
         ${hint ? `<div class="small muted" style="margin-top:6px">${esc(hint)}</div>` : ""}
       </div>
       <input type="file" id="upload-modal-input" multiple accept="${UPLOAD_ACCEPT}" hidden />
@@ -970,8 +1228,10 @@ function openUploadModal({ title, hint = "", endpoint, onDone }) {
     const files = Array.from(fileList || []);
     let unsupported = 0;
     let oversized = 0;
+    let legacyDoc = 0;
     files.forEach((file) => {
       const ext = `.${file.name.split(".").pop() || ""}`.toLowerCase();
+      if (ext === ".doc") { legacyDoc += 1; return; }
       if (!UPLOAD_EXTENSIONS.includes(ext)) { unsupported += 1; return; }
       if (file.size > UPLOAD_MAX_BYTES) { oversized += 1; return; }
       const key = `${file.name}:${file.size}:${file.lastModified}`;
@@ -980,6 +1240,7 @@ function openUploadModal({ title, hint = "", endpoint, onDone }) {
     });
     renderSelected();
     if (unsupported) toast(`已跳过 ${unsupported} 个不支持的文件格式`, "error");
+    if (legacyDoc) toast(`已跳过 ${legacyDoc} 个旧版 DOC 文件：${UPLOAD_UNSUPPORTED_HINT}`, "error");
     if (oversized) toast(`已跳过 ${oversized} 个超过 500MB 的文件`, "error");
   };
 
@@ -1072,7 +1333,7 @@ async function renderFiles(container, project) {
       <div class="small muted">${file.file_type.toUpperCase()} · ${fmtSize(file.file_size)} · ${file.page_count} 页</div>
       <div>${filePill(file.parse_status)}</div>
       <button type="button" class="btn small" data-open-file="${esc(file.id)}">查看</button>
-      <button class="btn small" data-parse-file="${file.id}">${file.parse_status === "success" ? "重新解析" : "解析"}</button>
+      ${canEditProject() ? `<button class="btn small" data-parse-file="${file.id}">${file.parse_status === "success" ? "重新解析" : "解析"}</button>` : ""}
     </div>`).join("");
 
   container.innerHTML = `
@@ -1082,27 +1343,27 @@ async function renderFiles(container, project) {
           <h2 style="margin:0">招标文件</h2>
           <div class="small muted" style="margin-top:4px">可选 · 用于识别公共内容，避免模板条款产生误报</div>
         </div>
-        <button class="btn" id="tender-upload">${icon("upload")}上传文件</button>
+        ${canEditProject() ? `<button class="btn" id="tender-upload">${icon("upload")}上传文件</button>` : ""}
       </div>
       <div style="margin-top:12px">${tenderRows || `<div class="empty" style="padding:18px">尚未上传招标文件。未上传时分析不执行公共内容排除。</div>`}</div>
     </div>
     <div class="card">
       <div class="row" style="justify-content:space-between">
         <h2 style="margin:0">投标企业 <span class="muted" style="font-weight:400">${companyData.total} / ${companyData.limit}</span></h2>
-        <button class="btn primary" id="add-company" ${companyData.total >= companyData.limit ? "disabled" : ""}>${icon("plus")}添加企业</button>
+        ${canEditProject() ? `<button class="btn primary" id="add-company" ${companyData.total >= companyData.limit ? "disabled" : ""}>${icon("plus")}添加企业</button>` : ""}
       </div>
       <div style="margin-top:12px">${companyRows || `<div class="empty">尚未创建投标企业。</div>`}</div>
       ${companyData.total >= companyData.limit ? `<div class="warn-box" style="margin-top:8px">当前项目最多支持 20 家投标企业。</div>` : ""}
     </div>
     <div id="company-detail">${detail ? companyDetailHtml(detail, project) : ""}</div>`;
 
-  $("#tender-upload").addEventListener("click", () => openUploadModal({
+  $("#tender-upload")?.addEventListener("click", () => openUploadModal({
     title: "上传招标文件",
     hint: "招标文件为可选项；未上传时分析不执行公共内容排除。",
     endpoint: `/projects/${project.id}/tender-files`,
     onDone: () => renderFiles(container, project),
   }));
-  $("#add-company").addEventListener("click", () => openAddCompany(project, container));
+  $("#add-company")?.addEventListener("click", () => openAddCompany(project, container));
   $$("[data-company]").forEach((btn) => btn.addEventListener("click", () => {
     selectedCompanyByProject[project.id] = selectedCompanyByProject[project.id] === btn.dataset.company ? "" : btn.dataset.company;
     renderFiles(container, project);
@@ -1121,11 +1382,12 @@ function companyDetailHtml(company, project) {
         ${file.parse_message ? `<div class="small muted">${esc(file.parse_message)}</div>` : ""}
       </div>
       <div>${filePill(file.parse_status)}</div>
+      ${canEditProject() ? `
       <button class="btn small" data-move-up="${file.id}" aria-label="上移文件：${esc(file.file_name)}" ${index === 0 ? "disabled" : ""}>${icon("arrow-up")}</button>
-      <button class="btn small" data-move-down="${file.id}" aria-label="下移文件：${esc(file.file_name)}" ${index === files.length - 1 ? "disabled" : ""}>${icon("arrow-down")}</button>
+      <button class="btn small" data-move-down="${file.id}" aria-label="下移文件：${esc(file.file_name)}" ${index === files.length - 1 ? "disabled" : ""}>${icon("arrow-down")}</button>` : ""}
       <button type="button" class="btn small" data-open-file="${esc(file.id)}">${icon("external")}查看</button>
-      <button class="btn small" data-parse="${file.id}">${file.parse_status === "success" ? "重新解析" : "解析"}</button>
-      <button class="btn small danger" data-delete-file="${file.id}" data-file-name="${esc(file.file_name)}" aria-label="删除文件：${esc(file.file_name)}">${icon("trash")}删除</button>
+      ${canEditProject() ? `<button class="btn small" data-parse="${file.id}">${file.parse_status === "success" ? "重新解析" : "解析"}</button>
+      <button class="btn small danger" data-delete-file="${file.id}" data-file-name="${esc(file.file_name)}" aria-label="删除文件：${esc(file.file_name)}">${icon("trash")}删除</button>` : ""}
     </div>`).join("");
 
   return `
@@ -1137,16 +1399,120 @@ function companyDetailHtml(company, project) {
           <div class="small muted" style="margin-top:4px">
             ${company.credit_code_type === "other" ? "其他证件" : "统一社会信用代码"}：${esc(company.credit_code || "未填写")}
           </div>
+          ${priceSummaryHtml(company.price)}
         </div>
         <div class="row">
-          <button class="btn small" id="edit-company">${icon("edit")}编辑资料</button>
-          <button class="btn small" id="company-file-upload">${icon("upload")}上传文件</button>
-          ${!company.confirmed && company.file_count > 0 ? `<button class="btn primary small" id="confirm-company">${icon("check")}确认企业资料</button>` : ""}
           <button class="btn small" id="preview-logical">${icon("layers")}预览逻辑标书</button>
+          ${canEditProject() ? `<button class="btn small" id="edit-company">${icon("edit")}编辑资料</button>
+          <button class="btn small" id="company-file-upload">${icon("upload")}上传标书</button>
+          <button class="btn small" id="company-price-upload">${icon("coins")}上传价格 Excel</button>
+          ${!company.confirmed && company.file_count > 0 ? `<button class="btn primary small" id="confirm-company">${icon("check")}确认企业资料</button>` : ""}` : ""}
         </div>
       </div>
       ${rows || `<div class="empty" style="padding:20px">该企业还没有文件。</div>`}
     </div>`;
+}
+
+/* 单企业价格 Excel 上传：解析预览 → 确认导入。导入后总价与清单分项都以它为准。 */
+function openCompanyPriceUpload(company, onDone) {
+  const modal = openModal({
+    title: `上传价格 Excel · ${company.company_name}`,
+    wide: true,
+    body: `
+      <div class="info-box small">
+        上传这家企业的报价资料（.xlsx / .csv）。表头包含「项目名称 + 单价」即按清单导入分项单价，
+        含「合计」或「投标总报价（元）」行则同时导入总价。导入后<strong>以 Excel 为准</strong>，
+        覆盖正文自动识别与手工补录。
+      </div>
+      <div class="form-row" style="margin-top:12px">
+        <label for="company-price-file">价格文件</label>
+        <input type="file" id="company-price-file" accept=".xlsx,.xlsm,.csv" />
+      </div>
+      <div id="company-price-preview" style="margin-top:12px"></div>`,
+    footer: `<button class="btn" data-close>取消</button>
+      <button class="btn" id="company-manual-quote">手工录入总价</button>
+      <button class="btn" id="company-price-validate">校验预览</button>
+      <button class="btn primary" id="company-price-commit" disabled>确认导入</button>`,
+  });
+  const input = $("#company-price-file", modal.root);
+  const preview = $("#company-price-preview", modal.root);
+  const commitBtn = $("#company-price-commit", modal.root);
+  const money = (value) => Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+
+  const upload = async (dryRun) => {
+    const file = input.files[0];
+    if (!file) { toast("请选择价格文件", "error"); return null; }
+    const form = new FormData();
+    form.append("file", file);
+    return api(`/companies/${company.id}/price-file?dry_run=${dryRun ? "true" : "false"}`, { method: "POST", body: form });
+  };
+
+  const renderPreview = (result) => {
+    const issues = [
+      ...(result.errors || []).map((item) => ({ ...item, level: "error" })),
+      ...(result.warnings || []).map((item) => ({ ...item, level: "warning" })),
+    ];
+    const items = result.items || [];
+    preview.innerHTML = `
+      <div class="row small" style="gap:12px">
+        <span>总报价：<strong>${result.total_amount == null ? "未识别" : `${money(result.total_amount)} 元`}</strong></span>
+        <span>分项 <strong>${num(items.length)}</strong> 条</span>
+        <span class="${(result.errors || []).length ? "danger" : ""}">错误 ${num((result.errors || []).length)}</span>
+        <span class="muted">提示 ${num((result.warnings || []).length)}</span>
+      </div>
+      ${issues.length ? `<div class="warn-box" style="margin-top:8px" role="alert"><ul class="small" style="margin:0;padding-left:18px">
+        ${issues.slice(0, 20).map((item) => `<li>${item.row ? `第 ${item.row} 行：` : ""}${esc(item.message)}</li>`).join("")}
+      </ul></div>` : ""}
+      ${items.length ? `<div class="table-scroll" style="margin-top:8px;max-height:260px"><table class="small">
+        <thead><tr><th>行</th><th>清单项</th><th>单位</th><th class="num">数量</th><th class="num">单价</th></tr></thead>
+        <tbody>${items.slice(0, 200).map((item) => `<tr>
+          <td>${num(item.row)}</td><td>${esc(item.name)}</td><td>${esc(item.unit || "—")}</td>
+          <td class="num">${item.quantity == null ? "—" : money(item.quantity)}</td>
+          <td class="num">${money(item.unit_price)}</td></tr>`).join("")}</tbody>
+      </table></div>
+      ${items.length > 200 ? `<div class="small muted">仅预览前 200 条。</div>` : ""}` : ""}`;
+    commitBtn.disabled = (result.errors || []).length > 0 || (result.total_amount == null && !items.length);
+  };
+
+  /* 没有 Excel 时仍可手工录总价（只影响总价，不产生分项） */
+  $("#company-manual-quote", modal.root).addEventListener("click", () => {
+    modal.close();
+    openQuoteEdit(
+      { companyId: company.id, companyName: company.company_name, amount: "", amountUpper: "" },
+      onDone,
+    );
+  });
+
+  $("#company-price-validate", modal.root).addEventListener("click", (event) => withBusy(event.currentTarget, async () => {
+    try { const result = await upload(true); if (result) renderPreview(result); }
+    catch (error) { toast(error.message, "error"); }
+  }, "解析中…"));
+
+  commitBtn.addEventListener("click", () => withBusy(commitBtn, async () => {
+    try {
+      const result = await upload(false);
+      if (!result) return;
+      modal.close();
+      toast(`已导入 ${company.company_name} 的价格资料`, "success");
+      onDone?.();
+    } catch (error) { toast(error.message, "error"); }
+  }, "导入中…"));
+}
+
+/* 企业的价格资料状态：总价来源 + 清单分项来源。上传过价格 Excel 时以它为准。 */
+function priceSummaryHtml(price) {
+  if (!price) return "";
+  const sourceLabel = { manual: "手工补录", import: "价格 Excel", auto: "自动识别" };
+  const total = price.total_amount != null
+    ? `${Number(price.total_amount).toLocaleString("zh-CN", { minimumFractionDigits: 2 })} 元（${sourceLabel[price.total_source] || price.total_source || "未知来源"}）`
+    : `<span class="muted">未录入总报价</span>`;
+  const items = price.item_count
+    ? `${num(price.item_count)} 个分项（${sourceLabel[price.item_source] || price.item_source}${price.item_file ? ` · ${esc(price.item_file)}` : ""}）`
+    : `<span class="muted">无分项单价</span>`;
+  return `<div class="small" style="margin-top:6px">
+    <span class="pill ${price.total_source === "import" ? "ok" : price.total_source === "manual" ? "low" : ""}">价格资料</span>
+    总价：${total} · 清单：${items}
+  </div>`;
 }
 
 function bindCompanyDetail(container, company, project) {
@@ -1157,6 +1523,7 @@ function bindCompanyDetail(container, company, project) {
     endpoint: `/companies/${company.id}/files`,
     onDone: refresh,
   }));
+  $("#company-price-upload", container)?.addEventListener("click", () => openCompanyPriceUpload(company, refresh));
   const confirmBtn = $("#confirm-company", container);
   confirmBtn?.addEventListener("click", () => withBusy(confirmBtn, async () => {
     try { await api(`/companies/${company.id}/confirm`, { method: "POST" }); toast("企业资料已确认", "success"); refresh(); }
@@ -1322,7 +1689,7 @@ async function renderParseCenter(container, project) {
   const ocrHint = emptyPages > 0 && ocrPages === 0
     ? `<div class="warn-box" style="margin-bottom:14px" role="alert">
         <strong>有 ${emptyPages} 页没有提取到文本（空白页或扫描页）。</strong>
-        当前没有页面通过 OCR 识别。若这些是扫描件，请在「系统管理 → 检测规则 → OCR 识别」中启用 OCR 并配置凭据，否则这部分内容不会参与比对。
+        当前没有页面通过 OCR 识别。若这些是扫描件，请在「系统配置 → OCR 识别」中启用 OCR 并配置凭据，否则这部分内容不会参与比对。
       </div>` : "";
   const rows = data.rows.map((row) => `
     <tr>
@@ -1364,14 +1731,14 @@ async function renderParseCenter(container, project) {
         ${["queued", "running"].includes(data.analysis?.status)
           ? `<span class="small muted">比对已自动开始（${taskPill(data.analysis.status)}）</span><a class="btn small" href="#/projects/${project.id}?tab=task">查看比对进展</a>`
           : `<span class="small muted">全部文件解析完成后，系统会自动开始项目内企业两两比对</span>`}
-        <button class="btn primary small" id="parse-all">${icon("scan")}全部解析</button>
+        ${canEditProject() ? `<button class="btn primary small" id="parse-all">${icon("scan")}全部解析</button>` : ""}
       </div>
       <table><thead><tr><th>文件名称</th><th>所属企业</th><th>总页数</th><th>成功页数</th><th>OCR页数</th><th>空白页</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>${rows || `<tr><td colspan="8"><div class="empty">暂无文件</div></td></tr>`}</tbody></table>
     </div>`;
 
   const parseAllBtn = $("#parse-all");
-  parseAllBtn.addEventListener("click", () => withBusy(parseAllBtn, async () => {
+  parseAllBtn?.addEventListener("click", () => withBusy(parseAllBtn, async () => {
     try { const result = await api(`/projects/${project.id}/parse`, { method: "POST" }); toast(result.message, "success"); setTimeout(() => renderParseCenter(container, project), 1000); }
     catch (error) { toast(error.message, "error"); }
   }, "提交中…"));
@@ -1409,18 +1776,49 @@ async function openPagesModal(fileId, fileName) {
     <button class="btn small" style="justify-content:space-between" data-page="${page.page_index}">
       第 ${page.page_index} 页 ${page.parse_status === "success" ? "✓" : page.parse_status === "empty" ? "空白" : "失败"}
     </button>`).join("") || `<div class="empty">无页面</div>`;
-  list.addEventListener("click", async (event) => {
+  /* 大文件单页可能有上万个文本块，接口按块分页返回；这里逐批「加载更多」，
+     避免一次渲染整页导致浏览器长时间卡死。 */
+  let currentPage = null;
+  let loadedBlocks = [];
+  let blockTotal = 0;
+  const renderPageContent = (page) => {
+    const content = $("#page-content", modal.root);
+    const header = `<div class="small muted" style="margin-bottom:8px">第 ${page.page_index} 页 · ${page.extraction_method === "ocr" ? "OCR" : "原生文本"} · ${page.parse_status} ${page.note ? `· ${esc(page.note)}` : ""}</div>`;
+    const truncatedNote = page.page_text_truncated
+      ? `<div class="warn-box small" style="margin-bottom:10px">本页共 ${num(page.page_text_total)} 个字符，此处只展开前 ${num((page.page_text || "").length)} 个；完整内容请「打开原始文件」查看。</div>`
+      : "";
+    const blocksHtml = loadedBlocks.map((block) => `<div style="margin-bottom:12px">${esc(block.content)}</div>`).join("");
+    const more = loadedBlocks.length < blockTotal
+      ? `<button type="button" class="btn small" id="page-more">加载更多文本块（已加载 ${num(loadedBlocks.length)} / ${num(blockTotal)}）</button>`
+      : "";
+    content.innerHTML = `${header}${truncatedNote}${blocksHtml || `<div class="muted">该页没有可提取文本</div>`}${more}`;
+    $("#page-more", modal.root)?.addEventListener("click", () => loadPage(currentPage, true));
+  };
+  const loadPage = async (pageIndex, append = false) => {
+    if (!append) {
+      currentPage = pageIndex;
+      loadedBlocks = [];
+      blockTotal = 0;
+    }
+    const content = $("#page-content", modal.root);
+    const moreBtn = $("#page-more", modal.root);
+    if (moreBtn) { moreBtn.disabled = true; moreBtn.textContent = "加载中…"; }
+    else content.innerHTML = "加载中…";
+    try {
+      const offset = append ? loadedBlocks.length : 0;
+      const detail = await api(`/files/${fileId}/pages/${pageIndex}?block_offset=${offset}&block_limit=500`);
+      const page = detail.page;
+      blockTotal = num(page.block_total, 0);
+      loadedBlocks = append ? loadedBlocks.concat(page.blocks || []) : (page.blocks || []);
+      renderPageContent(page);
+    } catch (error) {
+      content.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
+    }
+  };
+  list.addEventListener("click", (event) => {
     const button = event.target.closest("[data-page]");
     if (!button) return;
-    const content = $("#page-content", modal.root);
-    content.innerHTML = "加载中…";
-    try {
-      const detail = await api(`/files/${fileId}/pages/${button.dataset.page}`);
-      const page = detail.page;
-      content.innerHTML = `
-        <div class="small muted" style="margin-bottom:8px">第 ${page.page_index} 页 · ${page.extraction_method === "ocr" ? "OCR" : "原生文本"} · ${page.parse_status} ${page.note ? `· ${esc(page.note)}` : ""}</div>
-        ${(page.blocks || []).map((block) => `<div style="margin-bottom:12px">${esc(block.content)}</div>`).join("") || `<div class="muted">该页没有可提取文本</div>`}`;
-    } catch (error) { content.innerHTML = `<div class="error-box">${esc(error.message)}</div>`; }
+    loadPage(button.dataset.page, false);
   });
   const first = $("[data-page]", list);
   if (first) first.click();
@@ -1607,9 +2005,9 @@ async function renderTaskDetail(container, project, taskId) {
       <strong>价格维度未完全覆盖：</strong>${num(priceCoverage.expected)} 家企业中 ${priceMissing} 家未识别到投标总报价
       ${priceMissingNames ? `（${esc(priceMissingNames)}）` : ""}，这些企业不参与价格异常判断。
       <div class="row small" style="margin-top:6px">
-        <span>可在「报价清单」补录或批量导入后重新分析。</span>
+        <span>可在「文件管理」为这些企业上传价格 Excel 后重新分析。</span>
         <span class="spacer"></span>
-        <a class="btn small" href="#/projects/${task.project_id}?tab=quotes">前往报价清单</a>
+        <a class="btn small" href="#/projects/${task.project_id}?tab=files">前往文件管理</a>
       </div>
     </div>` : (priceSourceNote ? `<div class="info-box small" style="margin-top:14px">报价来源：${priceSourceNote}。</div>` : "");
   /* 招标文件在任务启动后被重新解析（典型：扫描件 OCR 重试成功）：
@@ -1638,7 +2036,7 @@ async function renderTaskDetail(container, project, taskId) {
       <div class="row small" style="margin-top:8px">
         <span>按最新报价重新分析后，历史任务仍会保留旧结论。</span>
         <span class="spacer"></span>
-        <a class="btn small" href="#/projects/${task.project_id}?tab=quotes">查看报价清单</a>
+        <a class="btn small" href="#/projects/${task.project_id}?tab=price-matrix">查看价格比对</a>
         <button class="btn small primary" id="rerun-stale-quotes">按最新报价重新分析</button>
       </div>
     </div>` : "";
@@ -1774,7 +2172,7 @@ async function renderResults(container, project) {
   const priceMissing = priceCoverage.expected > 0 ? Math.max(0, num(priceCoverage.expected) - num(priceCoverage.recognized)) : 0;
   const missingNames = (priceCoverage.missing_companies || []).slice(0, 5).join("、");
   const priceNote = priceMissing
-    ? `未识别 ${priceMissing} 家，可在报价清单补录`
+    ? `未识别 ${priceMissing} 家，可在文件管理补录价格`
     : [num(priceCoverage.manual_count) ? `人工 ${num(priceCoverage.manual_count)} 家` : "", num(priceCoverage.auto_count) ? `识别 ${num(priceCoverage.auto_count)} 家` : ""].filter(Boolean).join(" · ");
   const excludedNote = textCountNote(stats);
   const pairRows = data.pairs.map((pair) => `
@@ -1908,100 +2306,147 @@ async function openTaskDiff(project, taskId) {
 }
 
 /* ---------- report ---------- */
-/* ---------- 报价清单：人工导入 / 补录 ---------- */
+/* ---------- 价格比对（可视化） ----------
+   总价一览 + 「企业 × 清单项」单价矩阵。每个单元格按价格关系着色：
+   完全相同（红）、接近（橙）、偏离中位价（紫）、正常同行价（绿）、仅有该家（灰）。
+   悬浮显示同项其他企业的价格与原文位置，点击打开原文核对。 */
+const PRICE_STATUS = {
+  identical: { label: "与其他企业相同", cls: "identical", tone: "high" },
+  near: { label: "与其他企业接近", cls: "near", tone: "medium" },
+  outlier: { label: "偏离同项中位价", cls: "outlier", tone: "medium" },
+  peer: { label: "同行价", cls: "peer", tone: "ok" },
+  single: { label: "仅此一家报价", cls: "single", tone: "" },
+  missing: { label: "未报价", cls: "missing", tone: "" },
+};
 
-const QUOTE_SOURCE = { manual: "手工补录", import: "批量导入", auto: "自动识别" };
+const priceText = (value) => Number(value).toLocaleString("zh-CN", {
+  minimumFractionDigits: 2, maximumFractionDigits: 4,
+});
 
-async function renderQuotes(container, project) {
-  const data = await api(`/projects/${project.id}/quotes`);
-  const money = (value) => Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 2 });
-  const rows = (data.items || []).map((item) => {
-    const quote = item.quote;
-    const detected = item.detected;
-    /* 自动识别值只读展示：没有人工报价时它是实际生效的金额，必须能复核；
-       有矛盾候选（金额不一致）时要醒目提示，而不是静默采用。 */
-    const amountCell = quote
-      ? `<span>${money(quote.amount)}</span>${detected && Math.abs(detected.amount - quote.amount) > 0.01
-          ? `<div class="small muted">自动识别：${money(detected.amount)}</div>` : ""}`
-      : detected
-        ? `<span>${money(detected.amount)}</span><div class="small muted">自动识别，未人工确认</div>`
-        : `<span class="muted">未识别</span>`;
-    const sourceCell = quote
-      ? `<span class="pill ${quote.source_kind === "auto" ? "" : "low"}">${QUOTE_SOURCE[quote.source_kind] || quote.source_kind}</span>`
-      : detected
-        ? `<span class="pill">自动识别</span>`
-        : "—";
-    const warnCell = detected?.needs_confirmation
-      ? `<div class="warn-box small" style="margin-top:4px">识别到多个合计金额（${(detected.alternative_amounts || []).map(money).join("、")} 元），需人工确认</div>`
-      : "";
-    return `
-      <tr>
-        <td>${esc(item.company_name)}</td>
-        <td class="small muted">${esc(item.credit_code || "—")}</td>
-        <td class="num">${amountCell}${warnCell}</td>
-        <td class="small">${esc(quote?.amount_upper || detected?.amount_upper || "—")}</td>
-        <td>${sourceCell}</td>
-        <td class="small muted">${quote ? `v${num(quote.version_no)} · ${fmtDate(quote.updated_at)}` : "—"}</td>
-        <td class="row" style="gap:6px;justify-content:flex-end">
-          <button type="button" class="btn small" data-edit-quote="${item.company_id}" data-company-name="${esc(item.company_name)}" data-amount="${quote ? quote.amount : (detected ? detected.amount : "")}" data-upper="${esc(quote?.amount_upper || detected?.amount_upper || "")}">${quote ? "修改" : detected ? "确认为人工报价" : "补录"}</button>
-          ${quote ? `<button type="button" class="btn small ghost" data-delete-quote="${item.company_id}">删除</button>` : ""}
-        </td>
-      </tr>`;
+function priceCellTitle(cell, row, companyName) {
+  if (!cell || cell.amount == null) return `${companyName}：未报此分项`;
+  const status = PRICE_STATUS[cell.status]?.label || cell.status;
+  const peers = (cell.peers || []).filter((value) => value !== cell.amount);
+  const lines = [
+    `${companyName}：${priceText(cell.amount)} 元`,
+    `判定：${status}`,
+    `本项中位价：${priceText(row.median)} 元`,
+  ];
+  if (peers.length) lines.push(`其他企业报价：${peers.map(priceText).join("、")} 元`);
+  const source = cell.source || {};
+  if (source.file_name) lines.push(`来源：${source.file_name}${source.page_index ? ` 第 ${source.page_index} 页` : ""}`);
+  if (source.extraction_method === "ocr") lines.push("（OCR 识别文本）");
+  return lines.join("\n");
+}
+
+async function renderPriceMatrix(container, project) {
+  const money = priceText;
+  container.innerHTML = skeletonBlock(5);
+  let data;
+  try {
+    data = await api(`/projects/${project.id}/price-matrix`);
+  } catch (error) {
+    container.innerHTML = `<div class="error-box" role="alert">${esc(error.message)}</div>`;
+    return;
+  }
+  const summary = data.summary || {};
+  const companies = data.companies || [];
+  const rows = data.rows || [];
+
+  if (!rows.length) {
+    container.innerHTML = `
+      <div class="card">
+        <h2 style="margin-top:0">价格比对</h2>
+        <div class="empty">${esc(data.reason || "暂无可比较的逐项单价。")}</div>
+        <div class="row" style="justify-content:center;gap:8px;margin-top:8px">
+          <a class="btn small" href="#/projects/${project.id}?tab=task">查看分析任务</a>
+          <a class="btn small" href="#/projects/${project.id}?tab=files">去文件管理上传价格 Excel</a>
+        </div>
+      </div>`;
+    return;
+  }
+
+  /* 总价一览：按总价升序，条形长度按总价最大值归一化，便于一眼看出梯队 */
+  const totals = companies.filter((company) => company.total_amount != null);
+  const maxTotal = Math.max(...totals.map((company) => company.total_amount), 1);
+  const totalRows = companies.map((company) => {
+    const amount = company.total_amount;
+    const width = amount == null ? 0 : Math.max(2, Math.round((amount / maxTotal) * 100));
+    const sourceLabel = company.source_kind === "manual" ? "人工确认"
+      : company.source_kind === "import" ? "批量导入"
+      : company.source_kind === "auto" ? "自动识别" : "未录入";
+    return `<div class="total-row">
+      <span class="total-name">${esc(company.name)}</span>
+      <span class="total-bar"><i style="width:${width}%"></i></span>
+      <span class="total-amount">${amount == null ? `<span class="muted">未录入</span>` : `${money(amount)} 元`}</span>
+      <span class="pill ${company.source_kind === "manual" ? "ok" : company.needs_confirmation ? "warn" : ""}">${esc(sourceLabel)}${company.needs_confirmation ? " · 待确认" : ""}</span>
+    </div>`;
+  }).join("");
+
+  /* 单价矩阵：企业为列、清单项为行；单元格带状态色与悬浮明细 */
+  const header = companies.map((company) => `<th class="pm-company">${esc(company.name)}</th>`).join("");
+  const body = rows.map((row) => {
+    const cells = (row.cells || []).map((cell) => {
+      const info = PRICE_STATUS[cell.status] || PRICE_STATUS.missing;
+      const company = companies.find((item) => item.id === cell.company_id);
+      const name = company ? company.name : "";
+      if (cell.amount == null) {
+        return `<td class="pm-cell pm-missing" title="${esc(priceCellTitle(cell, row, name))}"><span class="pm-dash">—</span></td>`;
+      }
+      return `<td class="pm-cell pm-${info.cls}" title="${esc(priceCellTitle(cell, row, name))}">
+        <span class="pm-amount">${money(cell.amount)}</span>
+        <span class="pm-dot" aria-hidden="true"></span>
+      </td>`;
+    }).join("");
+    return `<tr>
+      <th scope="row" class="pm-item">
+        <span class="pm-item-name">${esc(row.name)}</span>
+        <span class="pm-item-meta">中位 ${money(row.median)} · ${num(row.peer_count)} 家</span>
+      </th>
+      ${cells}
+    </tr>`;
   }).join("");
 
   container.innerHTML = `
     <div class="card">
       <div class="row" style="justify-content:space-between;align-items:flex-start">
         <div>
-          <h2 style="margin:0">报价清单</h2>
+          <h2 style="margin:0">报价总览</h2>
           <div class="small muted" style="margin-top:4px">
-            价格维度优先使用人工确认的报价；未录入时使用最新分析任务自动识别的金额（只读）。
-            分析任务启动时会固化当时的报价，之后再修改报价不影响历史任务。
+            总价口径与「文件管理」中的价格资料一致（价格 Excel > 手工录入 > 正文自动识别）。
           </div>
         </div>
-        <div class="row" style="gap:8px">
-          <a class="btn" href="${API}/projects/${project.id}/quotes/template" id="quote-template">下载模板</a>
-          <button class="btn" id="quote-import">${icon("upload")}批量导入</button>
+        <div class="small muted">分析任务 #${num(data.task.task_no)} · ${TASK_STATUS[data.task.status] || data.task.status}</div>
+      </div>
+      <div class="total-list" style="margin-top:12px">${totalRows}</div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="row" style="justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">逐项单价矩阵</h2>
+          <div class="small muted" style="margin-top:4px">
+            ${num(summary.row_count)} 个分项 · ${num(summary.cell_count)} 个报价 ·
+            其中 <b>${num(summary.identical_cell_count)}</b> 个与其他企业相同或接近。
+            把鼠标移到单元格上可查看同项其他企业报价与原文位置。
+          </div>
+        </div>
+        <div class="pm-legend">
+          ${Object.entries(PRICE_STATUS).filter(([key]) => key !== "missing").map(([key, item]) =>
+            `<span class="pm-legend-item"><i class="pm-swatch pm-${item.cls}"></i>${esc(item.label)}</span>`).join("")}
         </div>
       </div>
-      <div class="table-scroll" style="margin-top:12px">
-        <table>
-          <thead><tr><th>企业</th><th>统一社会信用代码</th><th class="num">投标总报价（元）</th><th>大写金额</th><th>来源</th><th>版本</th><th></th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="7"><div class="empty">还没有投标企业。</div></td></tr>`}</tbody>
+      <div class="pm-scroll" style="margin-top:12px">
+        <table class="pm-table">
+          <thead><tr><th class="pm-item">清单项</th>${header}</tr></thead>
+          <tbody>${body}</tbody>
         </table>
       </div>
+      <div class="small muted" style="margin-top:10px">
+        单价来自最新分析任务对正文表格的自动识别，只覆盖「项目名称 + 单价」的行式清单。
+        「相同」只说明数字一致，可能源于同一套市场定额，需结合清单来源与工程量核实；系统输出为线索，不构成违规认定。
+      </div>
     </div>`;
-
-  $("#quote-template").addEventListener("click", async (event) => {
-    event.preventDefault();
-    const button = event.currentTarget;
-    await withBusy(button, async () => {
-      try {
-        const blob = await api(`/projects/${project.id}/quotes/template`, { blob: true });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = "报价单模板.xlsx";
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(url);
-      } catch (error) { toast(error.message, "error"); }
-    });
-  });
-  $("#quote-import").addEventListener("click", () => openQuoteImport(project, () => renderQuotes(container, project)));
-  $$("[data-edit-quote]").forEach((btn) => btn.addEventListener("click", () => openQuoteEdit({
-    companyId: btn.dataset.editQuote,
-    companyName: btn.dataset.companyName,
-    amount: btn.dataset.amount,
-    amountUpper: btn.dataset.upper,
-  }, () => renderQuotes(container, project))));
-  $$("[data-delete-quote]").forEach((btn) => btn.addEventListener("click", async () => {
-    const ok = await confirmDialog({ title: "删除报价", message: "删除后价格维度将回退到从正文自动识别。历史任务仍使用启动时固化的报价。", confirmLabel: "删除", danger: true });
-    if (!ok) return;
-    try { await api(`/companies/${btn.dataset.deleteQuote}/quote`, { method: "DELETE" }); toast("已删除报价", "success"); renderQuotes(container, project); }
-    catch (error) { toast(error.message, "error"); }
-  }));
 }
 
 function openQuoteEdit({ companyId, companyName, amount, amountUpper }, onDone) {
@@ -2028,70 +2473,6 @@ function openQuoteEdit({ companyId, companyName, amount, amountUpper }, onDone) 
         } });
         modal.close();
         toast("报价已保存", "success");
-        onDone?.();
-      } catch (error) { toast(error.message, "error"); }
-    });
-  });
-}
-
-async function openQuoteImport(project, onDone) {
-  const modal = openModal({
-    title: "批量导入报价",
-    wide: true,
-    body: `
-      <div class="info-box small">按模板填写后上传。支持 .xlsx / .csv；企业名称或统一社会信用代码任一匹配即可。
-        导入先做校验预览，确认无误后再写入。</div>
-      <div class="form-row" style="margin-top:12px"><label for="quote-file">报价单文件</label>
-        <input type="file" id="quote-file" accept=".xlsx,.csv" /></div>
-      <div id="quote-preview" style="margin-top:12px"></div>`,
-    footer: `<button class="btn" data-close>取消</button>
-      <button class="btn" id="quote-validate">校验预览</button>
-      <button class="btn primary" id="quote-commit" disabled>确认导入</button>`,
-  });
-  const fileInput = $("#quote-file", modal.root);
-  const preview = $("#quote-preview", modal.root);
-  const commitBtn = $("#quote-commit", modal.root);
-
-  const upload = async (dryRun) => {
-    const file = fileInput.files[0];
-    if (!file) { toast("请选择报价单文件", "error"); return null; }
-    const form = new FormData();
-    form.append("file", file);
-    return api(`/projects/${project.id}/quotes/import?dry_run=${dryRun ? "true" : "false"}`, { method: "POST", body: form });
-  };
-
-  const renderPreview = (result) => {
-    const issues = [...(result.errors || []).map((item) => ({ ...item, level: "error" })), ...(result.warnings || []).map((item) => ({ ...item, level: "warning" }))];
-    preview.innerHTML = `
-      <div class="row small" style="gap:12px">
-        <span>可导入 <strong>${num(result.summary.total)}</strong> 条</span>
-        <span class="${result.summary.error_count ? "danger" : ""}">错误 ${num(result.summary.error_count)}</span>
-        <span class="muted">提示 ${num(result.summary.warning_count)}</span>
-      </div>
-      ${issues.length ? `<div class="warn-box" style="margin-top:8px" role="alert"><ul class="small" style="margin:0;padding-left:18px">
-        ${issues.slice(0, 30).map((item) => `<li>${item.row ? `第 ${item.row} 行：` : ""}${esc(item.message)}</li>`).join("")}
-      </ul></div>` : ""}
-      ${result.rows.length ? `<div class="table-scroll" style="margin-top:8px"><table class="small">
-        <thead><tr><th>行</th><th>企业</th><th class="num">投标总报价</th><th>大写金额</th></tr></thead>
-        <tbody>${result.rows.map((row) => `<tr><td>${row.row}</td><td>${esc(row.company_name)}</td><td class="num">${Number(row.amount).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</td><td class="small">${esc(row.amount_upper || "—")}</td></tr>`).join("")}</tbody>
-      </table></div>` : ""}`;
-    commitBtn.disabled = !result.rows.length || result.summary.error_count > 0;
-  };
-
-  $("#quote-validate", modal.root).addEventListener("click", async (event) => {
-    const button = event.currentTarget;
-    await withBusy(button, async () => {
-      try { const result = await upload(true); if (result) renderPreview(result); }
-      catch (error) { toast(error.message, "error"); }
-    });
-  });
-  commitBtn.addEventListener("click", async () => {
-    await withBusy(commitBtn, async () => {
-      try {
-        const result = await upload(false);
-        if (!result) return;
-        modal.close();
-        toast(`已导入 ${result.summary.total} 家报价`, "success");
         onDone?.();
       } catch (error) { toast(error.message, "error"); }
     });
@@ -2287,11 +2668,10 @@ async function mountPairViewer(container, pairId, evidenceId) {
           <option value="template" ${view.tender === "template" ? "selected" : ""}>批次共同模板</option>
           <option value="effective" ${view.tender === "effective" ? "selected" : ""}>有效内容（两类都不命中）</option>
         </select>
-        <select id="ev-filter-queue" aria-label="按审核流程筛选证据">
-          <option value="">全部流程状态</option>
-          <option value="pending_first" ${view.queue === "pending_first" ? "selected" : ""}>待审核（一审）</option>
-          <option value="awaiting_second" ${view.queue === "awaiting_second" ? "selected" : ""}>待二审</option>
-          <option value="final" ${view.queue === "final" ? "selected" : ""}>已终审</option>
+        <select id="ev-filter-queue" aria-label="按审核状态筛选证据">
+          <option value="">全部审核状态</option>
+          <option value="pending" ${view.queue === "pending" ? "selected" : ""}>待审核</option>
+          <option value="reviewed" ${view.queue === "reviewed" ? "selected" : ""}>已审核</option>
         </select>
         <label class="small" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
           <input type="checkbox" id="ev-cluster-lead" ${view.clusterLeadOnly ? "checked" : ""} /> 按线索折叠
@@ -2355,8 +2735,6 @@ async function mountPairViewer(container, pairId, evidenceId) {
         ${item.excluded_by_template ? `<div class="flag tender">${item.template_source === "library" ? "经验模板" : "批次共同模板"} · 不计入风险${item.template_source === "library" ? "" : `（${num(item.template_presence)} 家企业共现）`}</div>` : ""}
         <div class="summary">${esc(item.summary)}</div>
         ${item.cluster_size > 1 ? `<div class="meta"><span class="flag">线索 · ${num(item.cluster_size)} 处命中</span>${item.cluster_index ? ` 第 ${num(item.cluster_index)}/${num(item.cluster_size)}` : ""}</div>` : ""}
-        ${item.review_stage === 1 ? `<div class="meta"><span class="flag">一审完成 · 待二审</span></div>` : ""}
-        ${item.review_conflict ? `<div class="meta"><span class="flag tender">一审与终审结论不同</span></div>` : ""}
       </div>`).join("") || `<div class="empty" style="padding:18px">没有符合筛选条件的证据</div>`;
     if (view.items.length < view.total) {
       const more = document.createElement("button");
@@ -2489,9 +2867,6 @@ async function mountPairViewer(container, pairId, evidenceId) {
         view.items[index] = {
           ...view.items[index],
           review_status: refreshed.review_status,
-          review_stage: refreshed.review_stage,
-          first_review_status: refreshed.first_review?.status,
-          review_conflict: refreshed.review_conflict,
         };
       }
       renderList();
@@ -2581,8 +2956,15 @@ async function mountPairViewer(container, pairId, evidenceId) {
       const firstPage = payload.page_start || page;
       const lastPage = Math.max(firstPage, payload.page_end || page);
       for (let index = firstPage; index <= lastPage; index += 1) pages.push(index);
-      const details = await Promise.all(pages.map((index) => api(`/files/${fileId}/pages/${index}`)));
+      /* 每页只取前若干块：超大文本页一次拉全会让浏览器长时间卡住，
+         超出部分提示用「打开原始文件 / 新标签页」查看。 */
+      const details = await Promise.all(
+        pages.map((index) => api(`/files/${fileId}/pages/${index}?block_offset=0&block_limit=800`)),
+      );
       bodyEl.innerHTML = details.map((detail) => {
+        const truncated = detail.page.has_more_blocks
+          ? `<div class="warn-box small" style="margin:8px 0">此页文本块较多，仅显示前 ${num((detail.page.blocks || []).length)} / ${num(detail.page.block_total)} 块；完整内容请在新标签页打开原始文件。</div>`
+          : "";
         const blocks = (detail.page.blocks || []).map((block) => {
           const hits = ranges
             .filter((range) => range.block_id === block.id)
@@ -2604,7 +2986,7 @@ async function mountPairViewer(container, pairId, evidenceId) {
           marked += esc(block.content.slice(cursor));
           return `<div class="original-block">${marked}</div>`;
         }).join("");
-        return `<div class="small muted" style="margin:10px 0 6px">第 ${detail.page.page_index} 页</div>${blocks || `<div class="muted">该页没有文本</div>`}`;
+        return `<div class="small muted" style="margin:10px 0 6px">第 ${detail.page.page_index} 页</div>${truncated}${blocks || `<div class="muted">该页没有文本</div>`}`;
       }).join("");
     } catch (error) {
       bodyEl.innerHTML = `<div class="error-box">${esc(error.message)}</div>`;
@@ -2873,7 +3255,6 @@ function evidenceDetailHtml(evidence) {
     ${renderHistory(evidence.review_records || [])}`;
 }
 
-const REVIEW_STAGE = { 0: "撤回", 1: "一审", 2: "终审" };
 
 /* 线索成员：同一段落的多处命中合并成一条线索后，成员清单可折叠查看 */
 function clusterMembersHtml(evidence) {
@@ -2938,7 +3319,7 @@ function bindClusterReview(root, evidence, view) {
 function renderHistory(records) {
   if (!records.length) return "";
   return `<div class="review-history"><div class="small" style="font-weight:600; margin-bottom:6px">审核记录</div>
-    ${records.map((record) => `<div class="item"><strong>${esc(record.reviewer_name)}</strong> · ${fmtDate(record.created_at)} · <span class="muted">${REVIEW_STAGE[record.stage] || "一审"}</span> · ${REVIEW[record.old_status] || record.old_status} → ${REVIEW[record.new_status] || record.new_status}
+    ${records.map((record) => `<div class="item"><strong>${esc(record.reviewer_name)}</strong> · ${fmtDate(record.created_at)} · ${REVIEW[record.old_status] || record.old_status} → ${REVIEW[record.new_status] || record.new_status}
       ${record.comment ? `<div class="muted">${esc(record.comment)}</div>` : ""}</div>`).join("")}</div>`;
 }
 
@@ -2951,18 +3332,11 @@ function reviewFormHtml(evidence) {
   const revoke = last
     ? `<button class="btn small" data-review-revoke="1" title="以一条新的审核记录把状态改回待审核，历史记录保留">撤回本次审核</button>`
     : "";
-  const stage = evidence.review_stage || 0;
   const label = status === "pending" ? "尚未审核" : `当前结论：${REVIEW[status] || status}`;
-  const stageNote = stage === 1
-    ? `<div class="flag" style="margin-bottom:6px">一审已由 ${esc(evidence.review_records.find((r) => r.stage === 1)?.reviewer_name || "其他审核人")} 完成，当前结论仍是「${REVIEW[status] || status}」，需要另一位审核人复核后终审。</div>`
-    : evidence.review_conflict
-      ? `<div class="warn-box small" style="margin-bottom:6px">一审与终审结论不同：一审为「${REVIEW[evidence.first_review_status] || evidence.first_review_status}」，终审为「${REVIEW[status] || status}」。</div>`
-      : "";
-  const nextLabel = stage === 1 ? "下一条待二审 →" : "下一条待审核 →";
+  const nextLabel = "下一条待审核 →";
   return `<div class="detail-block">
     <div class="small" style="font-weight:600">人工审核</div>
     <div class="small muted" style="margin:4px 0 8px">${esc(label)}${last ? ` · 最近一位审核人 ${esc(last.reviewer_name)} · ${fmtDate(last.created_at)}` : ""}</div>
-    ${stageNote}
     <label class="small">审核说明<span class="muted">（确认异常线索时必填，将写入导出报告）</span>
       <textarea id="review-comment" placeholder="写清判断依据，例如：已核对纸质原件，两份技术标第 4.2 节为同一底稿"></textarea>
     </label>
@@ -3075,7 +3449,7 @@ async function renderWorkbench() {
       <td class="col-secondary">${num(project.company_count)}</td>
       <td class="col-secondary">${fmtDate(project.last_analysis_at)}</td>
       <td>${num(project.pending_review_count)
-        ? `<a href="#/projects/${esc(project.id)}?tab=review&review_queue=pending_first" title="打开本项目的审核页">${num(project.pending_review_count)}</a>`
+        ? `<a href="#/projects/${esc(project.id)}?tab=review&review_queue=pending" title="打开本项目的审核页">${num(project.pending_review_count)}</a>`
         : "0"}</td>
       <td><a class="btn small" href="#/projects/${esc(project.id)}">进入</a></td>
     </tr>`).join("");
@@ -3184,7 +3558,7 @@ async function renderWorkbench() {
         <div class="small muted" style="margin-top:12px">
           ${num(byReview.pending)
             ? `还有 ${num(byReview.pending)} 条证据没有结论。${firstPendingProject
-                ? `<a href="#/projects/${esc(firstPendingProject.id)}?tab=review&review_queue=pending_first">去「${esc(firstPendingProject.project_name)}」的审核页处理 →</a>`
+                ? `<a href="#/projects/${esc(firstPendingProject.id)}?tab=review&review_queue=pending">去「${esc(firstPendingProject.project_name)}」的审核页处理 →</a>`
                 : `<a href="#/projects">进入项目审核 →</a>`}`
             : "所有证据都已给出结论。"}
         </div>
@@ -3254,7 +3628,7 @@ async function renderProjectReview(container, project) {
       <td class="risk-companies">${esc((item.companies || []).join("、"))}</td>
       <td>${riskPill(item.severity)}</td>
       <td class="col-secondary">${fmtDate(item.created_at)}</td>
-      <td>${pill(item.review_status, item.review_status_label)}${item.review_stage === 1 ? ` <span class="pill warn">待二审</span>` : ""}</td>
+      <td>${pill(item.review_status, item.review_status_label)}</td>
       <td class="col-secondary">${esc(item.reviewer_name || "—")}</td>
       <td class="col-secondary">${esc(assigneeName(filters, item.assignee_id))}</td>
       <td class="col-secondary">${item.cluster_size > 1 ? `<span class="pill">线索 ${num(item.cluster_size)} 处</span>` : "—"}</td>
@@ -3314,12 +3688,11 @@ async function renderProjectReview(container, project) {
           </select>
         </div>
         <div class="filter-field filter-field--select">
-          <label for="risk-queue">审核流程</label>
-          <select id="risk-queue" aria-label="按审核流程筛选">
-            <option value="">全部流程</option>
-            <option value="pending_first" ${riskListState.review_queue === "pending_first" ? "selected" : ""}>待审核（一审）</option>
-            <option value="awaiting_second" ${riskListState.review_queue === "awaiting_second" ? "selected" : ""}>待二审</option>
-            <option value="final" ${riskListState.review_queue === "final" ? "selected" : ""}>已终审</option>
+          <label for="risk-queue">审核状态</label>
+          <select id="risk-queue" aria-label="按审核状态筛选">
+            <option value="">全部状态</option>
+            <option value="pending" ${riskListState.review_queue === "pending" ? "selected" : ""}>待审核</option>
+            <option value="reviewed" ${riskListState.review_queue === "reviewed" ? "selected" : ""}>已审核</option>
           </select>
         </div>
         <div class="filter-field filter-field--select">
@@ -3525,7 +3898,7 @@ async function openRiskDetail(evidenceId, onReviewed = null) {
   const files = (detail.files || []).map((file) => `
     <div class="small">${esc(file.company_name || "")} · ${esc(file.file_name || "")} ${file.page_index ? `第 ${num(file.page_index)} 页` : ""}</div>`).join("") || "—";
   const browserLink = projectLevel
-    ? `<a class="btn small" href="#/projects/${esc(detail.project_id)}?tab=quotes">前往报价清单核对</a>`
+    ? `<a class="btn small" href="#/projects/${esc(detail.project_id)}?tab=price-matrix">前往价格比对核对</a>`
     : `<a class="btn small" id="risk-detail-viewer" href="${esc(detail.viewer_link)}">在三栏中查看原文</a>`;
   const modal = openModal({
     title: `证据详情 · ${detail.evidence_code}`,
@@ -3539,8 +3912,8 @@ async function openRiskDetail(evidenceId, onReviewed = null) {
         <dt>涉及企业</dt><dd>${esc((detail.companies || []).join("、") || "—")}</dd>
         <dt>风险等级</dt><dd>${riskPill(detail.severity)}</dd>
         <dt>发现时间</dt><dd>${fmtDate(detail.created_at)}</dd>
-        <dt>审核状态</dt><dd>${pill(detail.review_status, REVIEW[detail.review_status])}</dd>
-        <dt>审核人</dt><dd>${esc(detail.reviewer_name || "—")}</dd>
+        <dt>审核状态</dt><dd id="risk-detail-status">${pill(detail.review_status, REVIEW[detail.review_status])}</dd>
+        <dt>审核人</dt><dd id="risk-detail-reviewer">${esc(detail.reviewer_name || "—")}</dd>
         <dt>分派给</dt><dd>${esc(detail.assignee_name || "—")}</dd>
         <dt>相关文件</dt><dd>${files}</dd>
         <dt>原始证据</dt><dd>${esc(detail.summary || "")}</dd>
@@ -3562,6 +3935,12 @@ async function openRiskDetail(evidenceId, onReviewed = null) {
   const renderReview = () => {
     const host = $("#risk-detail-review", modal.root);
     if (!host) return;
+    /* 顶部状态与审核人也要就地刷新：此前只更新了下方表单与历史，
+       保存后弹窗顶部仍显示「待审核 / —」，要关掉重开才对（QA 首轮第 4 条）。 */
+    const statusEl = $("#risk-detail-status", modal.root);
+    if (statusEl) statusEl.innerHTML = pill(detail.review_status, REVIEW[detail.review_status]);
+    const reviewerEl = $("#risk-detail-reviewer", modal.root);
+    if (reviewerEl) reviewerEl.textContent = detail.reviewer_name || "—";
     host.innerHTML = reviewFormHtml(detail);
     bindReviewForm(host, detail, refresh);
     if (historyHost) historyHost.innerHTML = renderHistory(detail.review_records || []);
@@ -3572,39 +3951,54 @@ async function openRiskDetail(evidenceId, onReviewed = null) {
   return modal;
 }
 
-/* ---------- 系统管理（PRD 4.13） ---------- */
-const SYSTEM_TABS = [["rules", "检测规则"], ["logs", "操作日志"], ["users", "用户管理"]];
+/* ---------- 系统配置 / 审计日志 / 用户管理（PRD 4.13） ----------
+   三者原本是「系统管理」下的标签页；现在各自是一级页面，每次渲染
+   整页内容，不再有共享的外壳与标签栏。 */
 
-async function renderSystem(params) {
-  const main = $("#main");
-  const isAdmin = state.user && state.user.role === "admin";
-
+/* 一级页面共用的标题区：标题 + 说明，返回页面内容容器 */
+function pageShell(main, { title, sub }) {
   main.innerHTML = `
     <div class="page-head">
       <div>
-        <h1>系统管理</h1>
-        <div class="sub">检测规则版本、操作日志与用户账号</div>
+        <h1>${esc(title)}</h1>
+        <div class="sub">${esc(sub)}</div>
       </div>
     </div>
-    <div class="tabs" role="tablist" aria-label="系统管理页面">
-      ${SYSTEM_TABS.map(([key, label]) => `<button type="button" class="tab ${key === systemTab ? "active" : ""}" role="tab" aria-selected="${key === systemTab}" data-system-tab="${key}">${label}</button>`).join("")}
-    </div>
-    <div id="system-content">${skeletonBlock(6)}</div>`;
+    <div id="page-content">${skeletonBlock(6)}</div>`;
+  return $("#page-content");
+}
 
-  $$("[data-system-tab]").forEach((link) => link.addEventListener("click", () => {
-    systemTab = link.dataset.systemTab;
-    renderSystem(null);
-  }));
+async function renderSettingsPage() {
+  const container = pageShell($("#main"), {
+    title: "系统配置",
+    sub: "检测规则与参数版本、OCR 识别配置；修改规则需要填写原因并确认生效",
+  });
+  await renderSystemRules(container);
+}
 
-  const container = $("#system-content");
-  if (systemTab === "rules") await renderSystemRules(container);
-  else if (systemTab === "logs") await renderSystemLogs(container, isAdmin);
-  else await renderSystemUsers(container, isAdmin);
+async function renderAuditPage() {
+  const main = $("#main");
+  const isAdmin = Boolean(state.user && state.user.role === "admin");
+  const container = pageShell(main, {
+    title: "审计日志",
+    sub: "登录退出、项目与文件变更、分析任务、规则修改与审核结论的操作留痕",
+  });
+  await renderSystemLogs(container, isAdmin);
+}
+
+async function renderUsersPage() {
+  const main = $("#main");
+  const isAdmin = Boolean(state.user && state.user.role === "admin");
+  const container = pageShell(main, {
+    title: "用户管理",
+    sub: "账号、角色与启用状态；禁用或重置密码会立即吊销该账号的登录令牌",
+  });
+  await renderSystemUsers(container, isAdmin);
 }
 
 /* ---------- 检测规则：维度切换 + 参数分组 ---------- */
 
-/* 系统管理里选中的检测维度 */
+/* 系统配置里选中的检测维度 */
 let systemRuleDim = "text";
 
 /* 脱敏占位符：与后端 rule_service.SECRET_MASK 保持一致 */
@@ -4099,7 +4493,7 @@ function openRuleVersionModal(dimension, data, container) {
       toast(activate ? "规则版本已生效" : "规则版本已保存为待生效", "success");
       modal.close();
       if (container) renderSystemRules(container);
-      else renderSystem(null);
+      else renderSettingsPage();
     } catch (error) { toast(error.message, "error"); }
   };
   const draftBtn = $("#rule-save-draft", modal.root);
@@ -4122,7 +4516,7 @@ function openRuleVersionModal(dimension, data, container) {
 
 async function renderSystemLogs(container, isAdmin) {
   if (!isAdmin) {
-    container.innerHTML = `<div class="info-box">操作日志需要系统管理员权限。</div>`;
+    container.innerHTML = `<div class="info-box">审计日志需要系统管理员权限。</div>`;
     return;
   }
   container.innerHTML = skeletonBlock(6);
@@ -4197,7 +4591,7 @@ async function renderSystemLogs(container, isAdmin) {
       </div>
       ${rows ? `<div class="table-scroll"><table><thead><tr>
         <th>操作人</th><th>操作时间</th><th>操作类型</th><th>操作对象</th><th>操作结果</th><th>操作来源</th><th>变更前后</th>
-      </tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="empty">暂无操作日志。</div>`}
+      </tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="empty">暂无审计日志。</div>`}
       <div class="row" style="margin-top:12px">
         <span class="small muted">第 ${num(data.page) || 1} / ${logTotalPages} 页，共 ${num(data.total)} 条</span>
         <span class="spacer"></span>
@@ -4236,21 +4630,33 @@ async function renderSystemLogs(container, isAdmin) {
   });
 }
 
+/* 用户列表的筛选条件：重绘表格时不能把已输入的搜索词丢掉 */
+const userListState = { q: "" };
+
 async function renderSystemUsers(container, isAdmin) {
   if (!isAdmin) {
     container.innerHTML = `<div class="info-box">用户管理需要系统管理员权限。</div>`;
     return;
   }
-  container.innerHTML = skeletonBlock(5);
-  const data = await api("/system/users");
+  if (!container.childElementCount) container.innerHTML = skeletonBlock(5);
+  /* 搜索框输入会触发整卡重绘，记下焦点位置，重绘后原样还原 */
+  const active = document.activeElement;
+  const focusId = active && container.contains(active) ? active.id : "";
+  const caret = active && typeof active.selectionStart === "number" ? active.selectionStart : null;
+  const userQuery = new URLSearchParams();
+  if (userListState.q) userQuery.set("q", userListState.q);
+  const data = await api(`/system/users${userQuery.toString() ? `?${userQuery}` : ""}`);
+  const hasUserFilters = Boolean(userListState.q);
   const rows = (data.items || []).map((user) => `
     <tr>
-      <td>${esc(user.username)}</td>
+      <td>${esc(user.username)}${user.employee_no ? `<div class="small muted mono">${esc(user.employee_no)}</div>` : ""}</td>
+      <td class="col-secondary">${esc(user.email || "—")}</td>
       <td>${esc(user.display_name || "—")}</td>
       <td>${pill(user.role, user.role_label)}</td>
       <td>${pill(user.is_active ? "ok" : "bad", user.is_active ? "启用" : "禁用")}</td>
       <td>${fmtDate(user.created_at)}</td>
-      <td>
+      <td class="row" style="gap:6px">
+        <button class="btn small" data-edit-user="${esc(user.id)}" data-username="${esc(user.username)}" data-employee="${esc(user.employee_no || "")}" data-email="${esc(user.email || "")}" data-display="${esc(user.display_name || "")}" data-role="${esc(user.role)}">编辑</button>
         <button class="btn small" data-toggle-user="${esc(user.id)}" data-active="${user.is_active}">${user.is_active ? "禁用" : "启用"}</button>
         <button class="btn small" data-reset-user="${esc(user.id)}" data-name="${esc(user.username)}">重置密码</button>
       </td>
@@ -4262,17 +4668,46 @@ async function renderSystemUsers(container, isAdmin) {
         <span class="spacer"></span>
         <button class="btn primary" id="create-user">${icon("plus")}新增用户</button>
       </div>
-      ${rows ? `<table><thead><tr><th>用户名</th><th>显示名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
-        : `<div class="empty">暂无用户。</div>`}
+      <div class="filter-bar" style="margin-bottom:14px">
+        <div class="filter-field filter-field--search">
+          <label for="user-filter-q">搜索用户</label>
+          <input type="search" id="user-filter-q" aria-label="搜索用户名、工号、邮箱或显示名" placeholder="用户名 / 工号 / 邮箱 / 显示名" value="${esc(userListState.q)}" />
+        </div>
+        ${hasUserFilters ? `<div class="filter-actions"><button type="button" class="btn small" id="user-filter-reset">${icon("refresh")}重置筛选</button></div>` : ""}
+      </div>
+      ${rows ? `<table><thead><tr><th>用户名 / 工号</th><th class="col-secondary">邮箱</th><th>显示名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
+        : hasUserFilters
+          ? `<div class="empty">没有符合当前筛选条件的用户。</div>`
+          : `<div class="empty">暂无用户。</div>`}
     </div>`;
+
+  let userSearchTimer = null;
+  $("#user-filter-q").addEventListener("input", (event) => {
+    userListState.q = event.target.value;
+    clearTimeout(userSearchTimer);
+    userSearchTimer = setTimeout(() => renderSystemUsers(container, isAdmin), 300);
+  });
+  $("#user-filter-reset")?.addEventListener("click", () => {
+    userListState.q = "";
+    renderSystemUsers(container, isAdmin);
+  });
+  const restore = focusId ? $("#" + focusId, container) : null;
+  if (restore) {
+    restore.focus({ preventScroll: true });
+    if (caret !== null && typeof restore.setSelectionRange === "function") {
+      try { restore.setSelectionRange(caret, caret); } catch (_) { /* 数字类输入不支持选区 */ }
+    }
+  }
 
   $("#create-user").addEventListener("click", () => {
     const modal = openModal({
       title: "新增用户",
       body: `<form id="create-user-form">
-        <label class="small">用户名<input type="text" id="new-username" required></label>
+        <label class="small">用户名 *<input type="text" id="new-username" required autocomplete="off"></label>
+        <label class="small">工号<input type="text" id="new-employee" autocomplete="off" placeholder="工号与邮箱至少填写一项"></label>
+        <label class="small">邮箱<input type="email" id="new-email" autocomplete="off"></label>
         <label class="small">显示名<input type="text" id="new-display"></label>
-        <label class="small">初始密码<input type="password" id="new-password" required></label>
+        <label class="small">初始密码<input type="password" id="new-password" required autocomplete="new-password"></label>
         <label class="small">角色<select id="new-role">
           ${Object.entries(USER_ROLE).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}
         </select></label>
@@ -4286,6 +4721,8 @@ async function renderSystemUsers(container, isAdmin) {
           method: "POST",
           body: {
             username: $("#new-username", modal.root).value,
+            employee_no: $("#new-employee", modal.root).value.trim() || null,
+            email: $("#new-email", modal.root).value.trim() || null,
             display_name: $("#new-display", modal.root).value,
             password: $("#new-password", modal.root).value,
             role: $("#new-role", modal.root).value,
@@ -4297,6 +4734,40 @@ async function renderSystemUsers(container, isAdmin) {
       } catch (error) { toast(error.message, "error"); }
     }, "创建中…"));
   });
+
+  $$("[data-edit-user]").forEach((button) => button.addEventListener("click", () => {
+    const modal = openModal({
+      title: `编辑用户 · ${button.dataset.username}`,
+      body: `<form id="edit-user-form">
+        <label class="small">用户名 *<input type="text" id="edit-username" required value="${esc(button.dataset.username)}"></label>
+        <label class="small">工号<input type="text" id="edit-employee" value="${esc(button.dataset.employee)}" placeholder="工号与邮箱至少填写一项"></label>
+        <label class="small">邮箱<input type="email" id="edit-email" value="${esc(button.dataset.email)}"></label>
+        <label class="small">显示名<input type="text" id="edit-display" value="${esc(button.dataset.display)}"></label>
+        <label class="small">角色<select id="edit-role">
+          ${Object.entries(USER_ROLE).map(([value, label]) => `<option value="${value}" ${button.dataset.role === value ? "selected" : ""}>${label}</option>`).join("")}
+        </select></label>
+      </form>`,
+      footer: `<button class="btn" data-close>取消</button><button class="btn primary" id="save-user-edit">保存</button>`,
+    });
+    const saveBtn = $("#save-user-edit", modal.root);
+    saveBtn.addEventListener("click", () => withBusy(saveBtn, async () => {
+      try {
+        await api(`/system/users/${button.dataset.editUser}`, {
+          method: "PATCH",
+          body: {
+            username: $("#edit-username", modal.root).value.trim(),
+            employee_no: $("#edit-employee", modal.root).value.trim() || null,
+            email: $("#edit-email", modal.root).value.trim() || null,
+            display_name: $("#edit-display", modal.root).value,
+            role: $("#edit-role", modal.root).value,
+          },
+        });
+        toast("用户已更新", "success");
+        modal.close();
+        renderSystemUsers(container, isAdmin);
+      } catch (error) { toast(error.message, "error"); }
+    }, "保存中…"));
+  }));
 
   $$("[data-toggle-user]").forEach((button) => button.addEventListener("click", () => {
     const isActive = button.dataset.active === "true";
@@ -4339,17 +4810,71 @@ function enhanceRendered() {
     table.parentNode.insertBefore(wrap, table);
     wrap.appendChild(table);
   });
-  /* 小屏标签栏横向滚动时，让当前标签保持在可视范围内 */
+  /* 标签栏现在换行显示（不再横向滚动），仅把当前标签滚入视口，
+     防止页签变多后在窄屏上落到首屏之外 */
   $$("#main .tabs").forEach((tabs) => {
     const active = tabs.querySelector(".active");
     if (!active) return;
-    if (active.offsetLeft < tabs.scrollLeft || active.offsetLeft + active.clientWidth > tabs.scrollLeft + tabs.clientWidth) {
-      tabs.scrollLeft = Math.max(0, active.offsetLeft - 16);
+    const box = tabs.getBoundingClientRect();
+    const rect = active.getBoundingClientRect();
+    if (rect.top < box.top - 4 || rect.bottom > box.bottom + 4) {
+      active.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
   });
 }
 
 /* ---------- boot ---------- */
+
+/* ---------- 修改密码 ---------- */
+/* 自己改自己的密码：管理员重置密码只能由他人操作，初始口令必须由本人改掉。 */
+function openChangePassword({ forced = false, username = "" } = {}) {
+  const modal = openModal({
+    title: forced ? "请先修改初始密码" : "修改密码",
+    body: `${forced ? `<div class="warn-box small" style="margin-bottom:12px" role="alert">
+        当前账号${username ? `（${esc(username)}）` : ""}仍在使用部署时下发的初始口令。为避免口令泄露，请立即设置新密码。
+      </div>` : ""}
+      <form id="change-password-form">
+        <div class="form-row"><label for="cp-current">原密码 *</label><input id="cp-current" type="password" autocomplete="current-password" required /></div>
+        <div class="form-row"><label for="cp-new">新密码 *</label><input id="cp-new" type="password" autocomplete="new-password" minlength="8" required />
+          <div class="small muted" style="margin-top:4px">至少 8 位，不要与初始口令相同。</div></div>
+        <div class="form-row"><label for="cp-confirm">确认新密码 *</label><input id="cp-confirm" type="password" autocomplete="new-password" minlength="8" required /></div>
+        <div id="cp-error" class="form-error" hidden></div>
+      </form>`,
+    footer: `<button type="button" class="btn" data-close>${forced ? "稍后再说" : "取消"}</button>
+      <button type="button" class="btn primary" id="cp-submit">保存并重新登录</button>`,
+  });
+  const fail = (message) => {
+    const box = $("#cp-error", modal.root);
+    if (!box) return;
+    box.hidden = false;
+    box.textContent = message;
+    box.setAttribute("tabindex", "-1");
+    box.focus();
+  };
+  $("#cp-submit", modal.root)?.addEventListener("click", (event) => {
+    const button = event.currentTarget;
+    withBusy(button, async () => {
+      const current = $("#cp-current", modal.root)?.value || "";
+      const next = $("#cp-new", modal.root)?.value || "";
+      const confirm = $("#cp-confirm", modal.root)?.value || "";
+      if (!current) { fail("请输入原密码"); return; }
+      if (next.length < 8) { fail("新密码至少 8 位"); return; }
+      if (next !== confirm) { fail("两次输入的新密码不一致"); return; }
+      try {
+        await api("/auth/change-password", {
+          method: "POST",
+          body: { current_password: current, new_password: next },
+        });
+        modal.close();
+        toast("密码已修改，请使用新密码重新登录", "success");
+        logout();
+      } catch (error) { fail(error.message); }
+    }, "保存中…");
+  });
+}
+
+$("#change-password-btn")?.addEventListener("click", () => openChangePassword());
+
 $("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -4359,14 +4884,14 @@ $("#login-form").addEventListener("submit", async (event) => {
   const username = $("#login-username")?.value.trim() || "";
   const password = $("#login-password")?.value || "";
   if (!username || !password) {
-    const message = "请输入用户名和密码";
+    const message = "请输入工号/邮箱和密码";
     if (errorBox) { errorBox.hidden = false; errorBox.textContent = message; errorBox.focus(); }
     return;
   }
   await withBusy(button, async () => {
     try {
       const data = Object.fromEntries(new FormData(form).entries());
-      const result = await api("/auth/login", { method: "POST", body: data });
+      const result = await api("/auth/login", { method: "POST", body: data, allow401: true });
       state.token = result.access_token;
       state.user = result.user;
       localStorage.setItem("bid_token", state.token);
@@ -4379,7 +4904,10 @@ $("#login-form").addEventListener("submit", async (event) => {
       }
       await route();
       if (result.user?.warn_default_password) {
-        toast("当前仍在使用部署配置的初始管理员口令，请在「系统管理 → 用户管理」中立即修改密码。", "error");
+        /* 仍在用部署配置的初始口令：登录后强制引导改密（管理员代改做不到，
+           密码只有本人知道）。改密成功会吊销旧令牌，需要重新登录。 */
+        toast("当前仍在使用部署配置的初始管理员口令，请立即修改密码。", "error");
+        openChangePassword({ forced: true, username: result.user.username });
       }
     } catch (error) {
       if (errorBox) {

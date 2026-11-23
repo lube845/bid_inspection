@@ -55,10 +55,10 @@
     <div class="login-panel">
       <section class="login-card" aria-labelledby="login-title">
         <h1 id="login-title">登录工作台</h1>
-        <p class="muted small">使用管理员分配的账号登录系统</p>
+        <p class="muted small">使用工号或邮箱登录系统</p>
         <form id="login-form" novalidate>
           <div class="form-row">
-            <label for="login-username">用户名</label>
+            <label for="login-username">工号 / 邮箱</label>
             <input id="login-username" name="username" autocomplete="username" required />
           </div>
           <div class="form-row">
@@ -121,7 +121,9 @@
       <nav class="side-nav">
         <a href="#/workbench" data-nav="workbench"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-workbench"></use></svg><span>工作台</span></a>
         <a href="#/projects" data-nav="projects"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-projects"></use></svg><span>项目管理</span></a>
-        <a href="#/system" data-nav="system"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-system"></use></svg><span>系统管理</span></a>
+        <a href="#/settings" data-nav="settings"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-system"></use></svg><span>系统配置</span></a>
+        <a href="#/audit" data-nav="audit"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-activity"></use></svg><span>审计日志</span></a>
+        <a href="#/users" data-nav="users"><svg class="icon nav-icon" aria-hidden="true"><use href="#i-users"></use></svg><span>用户管理</span></a>
       </nav>
       <div class="side-foot">
         <a class="side-link" href="/docs" target="_blank" rel="noreferrer">
@@ -130,6 +132,9 @@
         </a>
         <div class="account-row">
           <div id="user-box" class="user-box"></div>
+          <button id="change-password-btn" class="icon-btn side-logout" type="button" title="修改密码" aria-label="修改密码">
+            <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
+          </button>
           <button id="logout-btn" class="icon-btn side-logout" type="button" title="退出登录" aria-label="退出登录">
             <svg class="icon" aria-hidden="true"><use href="#i-logout"></use></svg>
           </button>
