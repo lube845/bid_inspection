@@ -991,6 +991,7 @@ def run_task(db: Session, task_id: str) -> AnalysisTask:
                     template_profile,
                     forensic_context=forensic_context,
                     template_library=template_library,
+                    template_hits=template_hits,
                 )
                 db.commit()
             except Exception as exc:  # 单个企业组合失败不影响其他组合
@@ -1159,6 +1160,10 @@ def _run_pair(
     record_progress: bool = True,
     forensic_context: dict | None = None,
     template_library=None,
+    # 模板命中计数由调用方持有并在任务结束时批量写回，因此逐组累加的是同一个 dict。
+    # 必须显式传入：此前这里直接引用外层局部变量，只在「恰好有模板命中」时抛
+    # NameError，异常又被 per-pair 的兜底捕获，表现为整组静默失败。
+    template_hits: dict[str, int] | None = None,
 ) -> None:
     dimensions = task.analysis_config.get("dimensions", ALL_DIMENSIONS)
     # 本次分析使用的阈值快照（来自启动时生效的检测规则版本）
@@ -1205,10 +1210,11 @@ def _run_pair(
             library=template_library,
         )
         # 模板命中的片段要计入片段统计；一次任务结束时批量写回
-        for draft in drafts:
-            fragment_id = draft.evidence_data.get("template_fragment_id")
-            if fragment_id:
-                template_hits[fragment_id] = template_hits.get(fragment_id, 0) + 1
+        if template_hits is not None:
+            for draft in drafts:
+                fragment_id = draft.evidence_data.get("template_fragment_id")
+                if fragment_id:
+                    template_hits[fragment_id] = template_hits.get(fragment_id, 0) + 1
         excluded = [
             d
             for d in drafts
@@ -1972,6 +1978,7 @@ def retry_pair(db: Session, task: AnalysisTask, pair: ComparisonPair) -> Compari
         if Dimension.TEXT.value in task.analysis_config.get("dimensions", ALL_DIMENSIONS)
         else None
     )
+    template_hits: dict[str, int] = {}
 
     # 结构/错字取证依赖批次上下文（招标标题、批次共性错字），重试单条也要重建
     forensic_context = _prepare_forensic_context(db, task, blocks_by_company, snapshot)
@@ -2006,10 +2013,14 @@ def retry_pair(db: Session, task: AnalysisTask, pair: ComparisonPair) -> Compari
         record_progress=False,
         forensic_context=forensic_context,
         template_library=template_library,
+        # 单组重试同样累加模板命中，否则重试过的组合不会计入片段使用次数
+        template_hits=template_hits,
     )
     # 只重算本组合的聚类，其他组合不受影响
     assign_clusters(db, task.id, pair_ids=[pair.id])
     _apply_price_risk_to_pairs(db, task)
+    if template_hits:
+        template_service.bump_hits(db, template_hits)
 
     pairs = list(
         db.scalars(select(ComparisonPair).where(ComparisonPair.analysis_task_id == task.id))
