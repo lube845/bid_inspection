@@ -23,7 +23,22 @@ def file_payload(file: OriginalFile, company: Company | None = None) -> dict:
     }
 
 
-def page_payload(page: DocumentPage) -> dict:
+def page_payload(
+    page: DocumentPage,
+    *,
+    block_offset: int = 0,
+    block_limit: int | None = None,
+) -> dict:
+    """页面详情。
+
+    大文件（例如 50MB 纯文本）单页可能有上万个文本块，一次全量返回会长时间
+    占用连接甚至超时。这里支持按块分页，同时返回 ``block_total`` 供前端
+    判断是否还有后续内容。
+    """
+    blocks = sorted(page.blocks, key=lambda b: b.block_index)
+    total = len(blocks)
+    start = max(0, block_offset)
+    end = total if block_limit is None else start + max(0, block_limit)
     return {
         "id": page.id,
         "page_index": page.page_index,
@@ -34,7 +49,10 @@ def page_payload(page: DocumentPage) -> dict:
         "page_width": page.page_width,
         "page_height": page.page_height,
         "note": page.note,
-        "blocks": [block_payload(block) for block in page.blocks],
+        "blocks": [block_payload(block) for block in blocks[start:end]],
+        "block_offset": start,
+        "block_total": total,
+        "has_more_blocks": end < total,
     }
 
 

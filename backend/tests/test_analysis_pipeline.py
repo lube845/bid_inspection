@@ -99,9 +99,10 @@ def test_overview_and_review_flow(db):
     evidence = db.scalars(select(ComparisonEvidence)).first()
     reviewer = User(
         username="reviewer",
+        employee_no="R001",
         password_hash=hash_password("secret"),
         display_name="审核员",
-        role="reviewer",
+        role="user",
     )
     db.add(reviewer)
     db.commit()

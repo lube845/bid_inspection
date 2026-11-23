@@ -328,19 +328,8 @@ def collect_todos(db: Session, project: Project, ctx: dict | None = None) -> lis
             f"{pending_review} 条异常证据待审核",
             "请到项目内的「审核」页集中处理",
             "medium",
-            f"#/projects/{project.id}?tab=review&review_queue=pending_first",
+            f"#/projects/{project.id}?tab=review&review_queue=pending",
             created_at=ctx.get("pending_review_at"),
-        )
-
-    awaiting_second = ctx.get("awaiting_second_review_count") or 0
-    if awaiting_second:
-        item(
-            "awaiting_second_review",
-            "证据待二审",
-            f"{awaiting_second} 条证据已完成一审，等待第二位审核人复核",
-            "请到项目内的「审核」页处理待二审队列",
-            "medium",
-            f"#/projects/{project.id}?tab=review&review_queue=awaiting_second",
         )
 
     reappeared = ctx.get("reappeared_evidence_count") or 0
@@ -388,7 +377,7 @@ def _todo_context(db: Session, project: Project) -> dict:
             ComparisonEvidence.project_id == project.id,
             ComparisonEvidence.is_current.is_(True),
             ComparisonEvidence.analysis_task_id == latest_task_id,
-            ComparisonEvidence.review_stage == 0,
+            ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
         )
     ) or 0
     pending_review_at = db.scalar(
@@ -396,19 +385,9 @@ def _todo_context(db: Session, project: Project) -> dict:
             ComparisonEvidence.project_id == project.id,
             ComparisonEvidence.is_current.is_(True),
             ComparisonEvidence.analysis_task_id == latest_task_id,
-            ComparisonEvidence.review_stage == 0,
+            ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
         )
     )
-    awaiting_second = db.scalar(
-        select(func.count())
-        .select_from(ComparisonEvidence)
-        .where(
-            ComparisonEvidence.project_id == project.id,
-            ComparisonEvidence.is_current.is_(True),
-            ComparisonEvidence.analysis_task_id == latest_task_id,
-            ComparisonEvidence.review_stage == 1,
-        )
-    ) or 0
     exported = bool(
         db.scalar(
             select(func.count())
@@ -447,7 +426,6 @@ def _todo_context(db: Session, project: Project) -> dict:
         "last_task": last_task,
         "pending_review_count": pending_review,
         "pending_review_at": pending_review_at,
-        "awaiting_second_review_count": awaiting_second,
         "reappeared_evidence_count": reappeared,
         "exported": exported,
     }
@@ -582,3 +560,181 @@ def company_summary(company: Company, files: list[OriginalFile]) -> dict:
         "updated_at": company.updated_at,
     }
 
+
+
+def purge_project(db: Session, project: Project) -> dict:
+    """物理删除项目及其全部关联数据（不可恢复）。
+
+    「删除项目」默认是软删除（``deleted_at``），原始资料与历史证据仍留在库里——
+    这对客户注销、测试数据清理、合规删除是不够的（QA 首轮第 8 条）。
+    这里按外键顺序显式删除：存储文件 → 证据审核记录 → 证据 / 分析任务 /
+    文件 / 企业 / 报价 / 项目级模板片段 → 项目本身。
+
+    审计日志不删：``audit_log`` 没有外键，保留删除动作本身的记录，便于事后追溯
+    「谁在什么时候彻底删除了哪个项目」。
+    """
+    from app.models import (
+        ComparisonPair,
+        DocumentBlock,
+        DocumentPage,
+        EvidenceParticipant,
+        LogicalDocument,
+        LogicalDocumentItem,
+        LogicalDocumentVersion,
+        PriceQuote,
+        ReviewRecord,
+        TemplateFragment,
+    )
+    from app.storage.local import get_storage
+
+    project_id = project.id
+    stats = {"files": 0, "evidence": 0, "tasks": 0, "companies": 0, "quotes": 0}
+
+    # 1. 原始文件：先删磁盘上的实体，再删页 / 块记录
+    files = list(db.scalars(select(OriginalFile).where(OriginalFile.project_id == project_id)))
+    storage = get_storage()
+    for file in files:
+        try:
+            storage.delete(file.storage_key)
+        except Exception:  # 存储不可用时仍继续清理数据库记录
+            pass
+    page_ids = [
+        page_id
+        for page_id in db.scalars(
+            select(DocumentPage.id)
+            .join(OriginalFile, DocumentPage.original_file_id == OriginalFile.id)
+            .where(OriginalFile.project_id == project_id)
+        ).all()
+    ]
+    if page_ids:
+        for block in db.scalars(
+            select(DocumentBlock).where(DocumentBlock.document_page_id.in_(page_ids))
+        ).all():
+            db.delete(block)
+        db.flush()
+        for page in db.scalars(select(DocumentPage).where(DocumentPage.id.in_(page_ids))).all():
+            db.delete(page)
+        db.flush()
+    stats["files"] = len(files)
+    for file in files:
+        db.delete(file)
+    db.flush()
+
+    # 2. 证据与审核记录
+    evidence_ids = [
+        row_id
+        for row_id in db.scalars(
+            select(ComparisonEvidence.id).where(
+                ComparisonEvidence.project_id == project_id
+            )
+        ).all()
+    ]
+    if evidence_ids:
+        for record in db.scalars(
+            select(ReviewRecord).where(ReviewRecord.evidence_id.in_(evidence_ids))
+        ).all():
+            db.delete(record)
+        for participant in db.scalars(
+            select(EvidenceParticipant).where(
+                EvidenceParticipant.evidence_id.in_(evidence_ids)
+            )
+        ).all():
+            db.delete(participant)
+        db.flush()
+        for evidence in db.scalars(
+            select(ComparisonEvidence).where(ComparisonEvidence.id.in_(evidence_ids))
+        ).all():
+            db.delete(evidence)
+        db.flush()
+    stats["evidence"] = len(evidence_ids)
+
+    # 3. 分析任务与企业组合
+    pair_ids = [
+        pair_id
+        for pair_id in db.scalars(
+            select(ComparisonPair.id)
+            .join(AnalysisTask, ComparisonPair.analysis_task_id == AnalysisTask.id)
+            .where(AnalysisTask.project_id == project_id)
+        ).all()
+    ]
+    if pair_ids:
+        for pair in db.scalars(
+            select(ComparisonPair).where(ComparisonPair.id.in_(pair_ids))
+        ).all():
+            db.delete(pair)
+        db.flush()
+    task_ids = [
+        task_id
+        for task_id in db.scalars(
+            select(AnalysisTask.id).where(AnalysisTask.project_id == project_id)
+        ).all()
+    ]
+    if task_ids:
+        # 任务快照等附属表由外键 CASCADE 处理；这里显式删任务本身
+        for task in db.scalars(
+            select(AnalysisTask).where(AnalysisTask.id.in_(task_ids))
+        ).all():
+            db.delete(task)
+        db.flush()
+    stats["tasks"] = len(task_ids)
+
+    # 4. 逻辑文档、报价、项目级模板片段
+    doc_ids = [
+        doc_id
+        for doc_id in db.scalars(
+            select(LogicalDocument.id).where(LogicalDocument.project_id == project_id)
+        ).all()
+    ]
+    if doc_ids:
+        version_ids = [
+            version_id
+            for version_id in db.scalars(
+                select(LogicalDocumentVersion.id).where(
+                    LogicalDocumentVersion.logical_document_id.in_(doc_ids)
+                )
+            ).all()
+        ]
+        if version_ids:
+            for item in db.scalars(
+                select(LogicalDocumentItem).where(
+                    LogicalDocumentItem.logical_document_version_id.in_(version_ids)
+                )
+            ).all():
+                db.delete(item)
+            db.flush()
+            for version in db.scalars(
+                select(LogicalDocumentVersion).where(
+                    LogicalDocumentVersion.id.in_(version_ids)
+                )
+            ).all():
+                db.delete(version)
+            db.flush()
+    for doc in db.scalars(
+        select(LogicalDocument).where(LogicalDocument.id.in_(doc_ids))
+    ).all():
+        db.delete(doc)
+    db.flush()
+
+    quotes = list(db.scalars(select(PriceQuote).where(PriceQuote.project_id == project_id)))
+    for quote in quotes:
+        db.delete(quote)
+    stats["quotes"] = len(quotes)
+    db.flush()
+
+    for fragment in db.scalars(
+        select(TemplateFragment).where(TemplateFragment.project_id == project_id)
+    ).all():
+        db.delete(fragment)
+    db.flush()
+
+    # 5. 企业
+    companies = list(db.scalars(select(Company).where(Company.project_id == project_id)))
+    for company in companies:
+        db.delete(company)
+    stats["companies"] = len(companies)
+    db.flush()
+
+    # 6. 项目本身
+    db.delete(project)
+    db.flush()
+    return stats

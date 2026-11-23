@@ -1,28 +1,29 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_project
 from app.db.session import get_db
-from app.models import AnalysisTask, ComparisonPair, Project, User
+from app.models import AnalysisTask, ComparisonPair, User
 from app.models.enums import Dimension
 from app.schemas.analysis import StartAnalysisRequest
-from app.services import analysis_service, audit, project_service, results_service
+from app.services import (
+    access_service,
+    analysis_service,
+    audit,
+    project_service,
+    results_service,
+)
 from app.workers import dispatch
 
 router = APIRouter(tags=["analysis"])
 
 
-def _get_project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at:
-        raise HTTPException(404, "项目不存在")
-    return project
-
-
-def _get_task(db: Session, task_id: str) -> AnalysisTask:
+def _get_task(db: Session, task_id: str, user: User, role: str = access_service.VIEW) -> AnalysisTask:
     task = db.get(AnalysisTask, task_id)
     if not task:
         raise HTTPException(404, "分析任务不存在")
+    # 任务本身没有权限模型，一律回落到所属项目
+    get_project(db, task.project_id, user, role)
     return task
 
 
@@ -33,7 +34,7 @@ def prepare_analysis(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     return analysis_service.prepare(db, project, company_ids)
 
 
@@ -44,11 +45,11 @@ def start_analysis(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user, access_service.MANAGE)
     task = analysis_service.create_task(db, project, payload, user)
     dispatch.enqueue_analysis(task.id)
     db.expire_all()
-    task = _get_task(db, task.id)
+    task = _get_task(db, task.id, user)
     return analysis_service.task_detail(db, task)
 
 
@@ -63,7 +64,7 @@ def rerun_analysis(
     用于「报价在任务启动后被修改」「文件替换后需要重算」这类场景：前端只需
     一个按钮，不必再让用户重新选择企业与维度。
     """
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user, access_service.MANAGE)
     companies = [
         company.id
         for company in project_service.active_companies(db, project.id)
@@ -84,7 +85,7 @@ def rerun_analysis(
     task = analysis_service.create_task(db, project, request, user)
     dispatch.enqueue_analysis(task.id)
     db.expire_all()
-    task = _get_task(db, task.id)
+    task = _get_task(db, task.id, user)
     return analysis_service.task_detail(db, task)
 
 
@@ -94,7 +95,7 @@ def list_tasks(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     return {"items": results_service.task_history(db, project.id)}
 
 
@@ -104,7 +105,7 @@ def get_task(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    task = _get_task(db, task_id)
+    task = _get_task(db, task_id, user)
     return analysis_service.task_detail(db, task)
 
 
@@ -114,7 +115,7 @@ def cancel_task(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    task = _get_task(db, task_id)
+    task = _get_task(db, task_id, user, access_service.MANAGE)
     task = analysis_service.cancel_task(db, task, user)
     return analysis_service.task_detail(db, task)
 
@@ -126,7 +127,7 @@ def retry_pair(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    task = _get_task(db, task_id)
+    task = _get_task(db, task_id, user, access_service.MANAGE)
     pair = db.get(ComparisonPair, pair_id)
     if not pair or pair.analysis_task_id != task.id:
         raise HTTPException(404, "企业组合不存在")
@@ -142,5 +143,5 @@ def retry_pair(
     db.commit()
     dispatch.enqueue_retry_pair(task.id, pair.id)
     db.expire_all()
-    task = _get_task(db, task.id)
+    task = _get_task(db, task.id, user)
     return analysis_service.task_detail(db, task)

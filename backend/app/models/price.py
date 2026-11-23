@@ -27,6 +27,46 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
+class PriceItem(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """清单分项单价（企业级，来自价格 Excel 或正文自动识别）。
+
+    与 :class:`PriceQuote` 的关系是「一个总价 + 多个分项」：总价仍走报价表，
+    分项单独成表，这样价格比对矩阵可以跨企业按清单项对齐。
+
+    ``source_kind`` 区分权威程度：``import``（价格 Excel）> ``manual``（补录）
+    > ``auto``（正文识别）。矩阵与证据都按这个顺序取当前有效版本。
+    """
+
+    __tablename__ = "price_item"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "company_id", "item_key", "version_no",
+            name="uq_price_item_version",
+        ),
+    )
+
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("project.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    company_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("company.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # 规范化后的清单项名称，跨企业对齐用
+    item_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    item_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    unit_price: Mapped[float] = mapped_column(Numeric(18, 4), nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quantity: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="import")
+    # 批次号、原始行号、文件与页码定位
+    source_ref: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class PriceQuote(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "price_quote"
     __table_args__ = (

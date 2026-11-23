@@ -11,9 +11,10 @@ import statistics
 from dataclasses import dataclass
 
 from app.analysis.base import EvidenceDraft
-from app.analysis.sources import BlockRef
+from app.analysis.sources import BlockRef, fold_span
 from app.analysis.thresholds import price_thresholds
 from app.models.enums import EvidenceType, RiskLevel
+from app.utils.text import fold_for_match
 
 # 总价标签。除完整的关键词外，还覆盖「投标总价（人民币）：」「投标报价金额」
 # 等常见变体。注意「投标报价」「投标价格」也会出现在分项说明里，因此它们
@@ -351,7 +352,15 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
     """
     candidates: list[tuple[int, int, Quote]] = []
     for order, block in enumerate(blocks):
-        upper_match = _UPPER_PATTERN.search(block.content)
+        # 兼容字符折叠后再匹配：PDF 的 ToUnicode 常把「合、计、报、价」等字
+        # 映射成康熙部首或兼容汉字，渲染一致但码位不同，直接对原文跑正则会
+        # 整份漏识别（同人员抽取的问题，QA 报告第 1 条）。
+        # 折叠逐字符 1:1，匹配偏移可原样映射回原文。
+        text, offsets = fold_for_match(block.content)
+
+        span = fold_span(offsets)
+
+        upper_match = _UPPER_PATTERN.search(text)
         upper_text = upper_match.group(1) if upper_match else None
         has_upper = 1 if upper_match else 0
 
@@ -359,18 +368,18 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
         # 说明表格结构没有按预期解析，该块的所有候选都标记为待确认。
         table_amounts = [
             amount
-            for match in _TABLE_TOTAL_PATTERN.finditer(block.content)
+            for match in _TABLE_TOTAL_PATTERN.finditer(text)
             for amount in [_to_amount(match.group(1), match.group(2) or "元")]
             if amount is not None
         ]
         table_amounts.extend(
             amount
-            for match in _TABLE_TOTAL_AFTER_PATTERN.finditer(block.content)
+            for match in _TABLE_TOTAL_AFTER_PATTERN.finditer(text)
             for amount in [_to_amount(match.group(1), match.group(2) or "元")]
             if amount is not None
         )
 
-        for match in _TOTAL_PATTERN.finditer(block.content):
+        for match in _TOTAL_PATTERN.finditer(text):
             keyword = match.group(0)
             # 单位可能写在括号里（人民币元）、数字后面（万元），也可能省略（按元）
             unit = match.group(3) or match.group(1) or "元"
@@ -387,15 +396,19 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
                 block=block,
                 # group(1) 是可选括号单位，未参与匹配时 start(1) 为 -1，
                 # 会被 source 钳到块首。改为从数字起点（group 2）定位。
-                start=match.start(2) if match.start(2) >= 0 else match.start(0),
-                end=match.end(2),
+                start=span(match.start(2), match.end(2))[0]
+                if match.start(2) >= 0
+                else span(match.start(0), match.end(0))[0],
+                end=span(match.start(2), match.end(2))[1]
+                if match.start(2) >= 0
+                else span(match.start(0), match.end(0))[1],
                 alternatives=table_amounts or None,
             )
             candidates.append((score, -order, quote))
 
         # 表格汇总行：标签在前（合计 | 1,400,000.00 元）或数字在前（1,400,000.00 元（合计））。
         # 权重低于「投标总报价」等显式标签，只在没有更好候选时胜出。
-        for match in _TABLE_TOTAL_PATTERN.finditer(block.content):
+        for match in _TABLE_TOTAL_PATTERN.finditer(text):
             amount = _to_amount(match.group(1), match.group(2) or "元")
             if amount is None:
                 continue
@@ -407,13 +420,13 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
                 raw=match.group(0),
                 upper=upper_text,
                 block=block,
-                start=match.start(1),
-                end=match.end(1),
+                start=span(match.start(1), match.end(1))[0],
+                end=span(match.start(1), match.end(1))[1],
                 alternatives=table_amounts,
             )
             candidates.append((score, -order, quote))
 
-        for match in _TABLE_TOTAL_AFTER_PATTERN.finditer(block.content):
+        for match in _TABLE_TOTAL_AFTER_PATTERN.finditer(text):
             amount = _to_amount(match.group(1), match.group(2) or "元")
             if amount is None:
                 continue
@@ -425,14 +438,14 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
                 raw=match.group(0),
                 upper=upper_text,
                 block=block,
-                start=match.start(1),
-                end=match.end(1),
+                start=span(match.start(1), match.end(1))[0],
+                end=span(match.start(1), match.end(1))[1],
                 alternatives=table_amounts,
             )
             candidates.append((score, -order, quote))
 
         # 只有大写金额的写法（投标总报价：壹仟万元整）
-        for match in _UPPER_TOTAL_PATTERN.finditer(block.content):
+        for match in _UPPER_TOTAL_PATTERN.finditer(text):
             amount = parse_upper_amount(match.group(1))
             if not amount or amount <= 0:
                 continue
@@ -444,8 +457,8 @@ def extract_quote(company_id: str, company_name: str, blocks: list[BlockRef]) ->
                 raw=match.group(0),
                 upper=match.group(1),
                 block=block,
-                start=match.start(1),
-                end=match.end(1),
+                start=span(match.start(1), match.end(1))[0],
+                end=span(match.start(1), match.end(1))[1],
             )
             candidates.append((score, -order, quote))
 
@@ -676,14 +689,26 @@ def analyze_quote_quality(
         alternatives = sorted(
             {round(value, 2) for value in (quote.alternatives or [])}
         )
+        # 候选金额可能为空或只有一个（例如只解析到一个合计、但该块与其它
+        # 候选冲突）：这时不能写成「多个合计金额（ 元）」——QA 报告里出现过
+        # 括号里没有金额、以及仅一个候选却说「多个」的文案。
+        if len(alternatives) > 1:
+            reason = (
+                "自动识别到多个合计金额（"
+                + "、".join(_money(value) for value in alternatives)
+                + " 元）"
+            )
+        elif alternatives:
+            reason = f"自动识别金额 {_money(alternatives[0])} 元与其他合计候选冲突"
+        else:
+            reason = "自动识别的合计金额存在冲突"
         findings.append(
             PriceFinding(
                 rule="quote_needs_confirmation",
                 severity=RiskLevel.LOW.value,
                 summary=(
-                    f"{quote.company_name} 自动识别到多个合计金额（"
-                    + "、".join(_money(value) for value in alternatives)
-                    + f" 元），系统暂取 {_money(quote.amount)} 元，需人工确认"
+                    f"{quote.company_name} {reason}，系统暂取 "
+                    f"{_money(quote.amount)} 元，需人工确认"
                 ),
                 quotes=[quote],
                 metrics={

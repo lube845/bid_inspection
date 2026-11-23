@@ -14,7 +14,7 @@ from app.analysis.base import EvidenceDraft
 from app.analysis.sources import BlockRef
 from app.analysis.thresholds import personnel_thresholds
 from app.models.enums import EvidenceType, RiskLevel
-from app.utils.text import compact_snippet
+from app.utils.text import compact_snippet, fold_for_match
 
 ROLES = (
     "项目负责人",
@@ -32,6 +32,16 @@ ROLES = (
     "质检员",
     "联系人",
     "项目组成员",
+    # 实施/交付类岗位在信息化、设备类标书里很常见，此前不在词表里，
+    # 导致「实施工程师：王强」这类人员整条漏报（QA 报告首轮第 1 条）。
+    "实施工程师",
+    "实施负责人",
+    "实施人员",
+    "运维负责人",
+    "售后负责人",
+    "资料员",
+    "材料员",
+    "施工员",
 )
 
 # 岗位（角色）在文本里可能以更短的称谓出现，例如「项目经理」写成「项目负责人」，
@@ -122,7 +132,20 @@ def extract_people(
     occurrences: list[PersonOccurrence] = []
     seen: set[tuple[str, str, str]] = set()
     for block in blocks:
-        for match in _AFTER_ROLE.finditer(block.content):
+        # 在「折叠兼容字符」后的文本上匹配：PDF 常把「目/人/工」等字映射成
+        # 康熙部首，渲染一样但码位不同，直接对原文跑正则会整份文件漏报。
+        # 折叠是逐字符 1:1 的，匹配偏移可以直接映射回原文。
+        text, offsets = fold_for_match(block.content)
+
+        def span(start: int, end: int) -> tuple[int, int]:
+            """折叠文本上的偏移 → 原文偏移（end 取最后一个字符的下一位）。"""
+            if not offsets:
+                return 0, 0
+            start = max(0, min(start, len(offsets) - 1))
+            end = max(start + 1, min(end, len(offsets)))
+            return offsets[start], offsets[end - 1] + 1
+
+        for match in _AFTER_ROLE.finditer(text):
             role, name = match.group(1), match.group(2)
             if not _valid_name(name) or not role_allowed(role):
                 continue
@@ -130,10 +153,9 @@ def extract_people(
             if key in seen:
                 continue
             seen.add(key)
-            occurrences.append(
-                PersonOccurrence(name, role, block, match.start(2), match.end(2))
-            )
-        for match in _BEFORE_ROLE.finditer(block.content):
+            start, end = span(match.start(2), match.end(2))
+            occurrences.append(PersonOccurrence(name, role, block, start, end))
+        for match in _BEFORE_ROLE.finditer(text):
             name, role = match.group(1), match.group(2)
             if not _valid_name(name) or not role_allowed(role):
                 continue
@@ -141,10 +163,9 @@ def extract_people(
             if key in seen:
                 continue
             seen.add(key)
-            occurrences.append(
-                PersonOccurrence(name, role, block, match.start(1), match.end(1))
-            )
-        for match in _NAME_LABEL.finditer(block.content):
+            start, end = span(match.start(1), match.end(1))
+            occurrences.append(PersonOccurrence(name, role, block, start, end))
+        for match in _NAME_LABEL.finditer(text):
             name = match.group(1)
             if not _valid_name(name):
                 continue
@@ -152,8 +173,9 @@ def extract_people(
             if key in seen:
                 continue
             seen.add(key)
+            start, end = span(match.start(1), match.end(1))
             occurrences.append(
-                PersonOccurrence(name, "未标注岗位", block, match.start(1), match.end(1))
+                PersonOccurrence(name, "未标注岗位", block, start, end)
             )
     return occurrences
 

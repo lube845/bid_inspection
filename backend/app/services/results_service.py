@@ -11,12 +11,49 @@ from app.models import (
     ComparisonEvidence,
     ComparisonPair,
     EvidenceParticipant,
+    PriceQuote,
     Project,
     ReviewRecord,
     User,
 )
 from app.models.enums import EvidenceType, ReviewStatus, RiskLevel, TaskStatus
 from app.services import audit, evidence_context
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.9+ 自带
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+def _display_tz():
+    """报告里的时间统一换算到配置的展示时区。
+
+    数据库存的是 UTC，页面按浏览器本地时间显示；Excel 在服务端生成，
+    若不换算，同一条记录在页面与报告里会相差 8 小时（QA 首轮第 6 条）。
+    """
+    from app.core.config import settings
+
+    name = getattr(settings, "display_timezone", None) or "Asia/Shanghai"
+    if ZoneInfo is None:  # pragma: no cover
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:  # pragma: no cover - 时区库缺失时退回 UTC
+        return None
+
+
+def _format_display_time(value):
+    """UTC datetime → 「YYYY-MM-DD HH:MM」本地时间字符串。"""
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        from datetime import timezone
+
+        value = value.replace(tzinfo=timezone.utc)
+    tz = _display_tz()
+    if tz is not None:
+        value = value.astimezone(tz)
+    return value.strftime("%Y-%m-%d %H:%M")
 
 RISK_LABELS = {
     RiskLevel.NONE.value: "无",
@@ -686,11 +723,9 @@ def pair_evidences(
             continue
         if min_cluster_size and (evidence.cluster_size or 1) < min_cluster_size:
             continue
-        if review_queue == "pending_first" and (evidence.review_stage or 0) != 0:
+        if review_queue == "pending" and evidence.review_status != ReviewStatus.PENDING.value:
             continue
-        if review_queue == "awaiting_second" and (evidence.review_stage or 0) != 1:
-            continue
-        if review_queue == "final" and (evidence.review_stage or 0) != 2:
+        if review_queue == "reviewed" and evidence.review_status == ReviewStatus.PENDING.value:
             continue
         data = evidence.evidence_data or {}
         excluded_tender = bool(data.get("excluded_by_tender"))
@@ -808,15 +843,8 @@ def _evidence_summary(evidence: ComparisonEvidence) -> dict:
         "cluster_index": evidence.cluster_index or 0,
         "cluster_lead_id": evidence.cluster_lead_id,
         "is_cluster_lead": evidence.cluster_lead_id == evidence.id,
-        # 审核流程与分派
-        "review_stage": evidence.review_stage or 0,
+        # 审核与分派
         "assignee_id": evidence.assignee_id,
-        "first_review_status": evidence.first_review_status,
-        "review_conflict": bool(
-            (evidence.review_stage or 0) >= 2
-            and evidence.first_review_status
-            and evidence.first_review_status != evidence.review_status
-        ),
     }
 
 
@@ -881,21 +909,7 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
             for p in evidence.participants
         ],
         "review_status": evidence.review_status,
-        "review_stage": evidence.review_stage or 0,
         "assignee_id": evidence.assignee_id,
-        "first_review": (
-            {
-                "reviewer_id": evidence.first_reviewer_id,
-                "status": evidence.first_review_status,
-            }
-            if evidence.first_reviewer_id or evidence.first_review_status
-            else None
-        ),
-        "review_conflict": bool(
-            (evidence.review_stage or 0) >= 2
-            and evidence.first_review_status
-            and evidence.first_review_status != evidence.review_status
-        ),
         "cluster_id": evidence.cluster_id,
         "cluster_size": evidence.cluster_size or 1,
         "cluster_index": evidence.cluster_index or 0,
@@ -908,7 +922,6 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
                 "old_status": record.old_status,
                 "new_status": record.new_status,
                 "comment": record.comment,
-                "stage": record.stage or 1,
                 "created_at": record.created_at,
             }
             for record in evidence.review_records
@@ -959,13 +972,6 @@ def evidence_context_payload(
         raise ValueError(str(exc))
 
 
-class ReviewConflict(Exception):
-    """审核流程冲突（例如同一审核人试图完成二审）。"""
-
-
-_REVIEW_FINAL_STATUSES = {"confirmed", "excluded"}
-
-
 def _write_review(
     db: Session,
     evidence: ComparisonEvidence,
@@ -973,50 +979,24 @@ def _write_review(
     comment: str | None,
     reviewer: User,
     *,
-    stage: int | None = None,
-    requires_second: bool = False,
     template_fragment_id: str | None = None,
     action: str = "evidence.review",
 ) -> ReviewRecord:
     """写一条审核记录的**唯一入口**（单条 / 批量 / 按线索都走这里）。
 
-    ``review_status`` 始终是最新结论，``review_stage`` 表示流程位置：
-    0 未审、1 一审完成待二审、2 终审。二审只对 confirmed/excluded 生效，
-    且必须由不同的人完成。
+    审核是单级的：一次审核即结论，没有二审。``review_status`` 就是当前结论，
+    ``pending`` 表示撤回审核、回到待审核队列。
     """
-    current_stage = evidence.review_stage or 0
-
-    if stage is None:
-        stage = _resolve_stage(
-            evidence, new_status, reviewer, current_stage, requires_second
-        )
-
     record = ReviewRecord(
         evidence_id=evidence.id,
         reviewer_id=reviewer.id,
-        reviewer_name=reviewer.display_name or reviewer.username,
+        reviewer_name=reviewer.display_name or reviewer.employee_no or reviewer.username,
         old_status=evidence.review_status,
         new_status=new_status,
         comment=comment,
-        stage=stage,
         template_fragment_id=template_fragment_id,
     )
     db.add(record)
-
-    if stage == 0:
-        # 撤回：回到未审队列，清空一审信息
-        evidence.review_stage = 0
-        evidence.first_reviewer_id = None
-        evidence.first_review_status = None
-    elif stage == 1:
-        evidence.review_stage = 1
-        evidence.first_reviewer_id = reviewer.id
-        evidence.first_review_status = new_status
-    else:
-        evidence.review_stage = 2
-        if evidence.first_review_status is None:
-            evidence.first_reviewer_id = reviewer.id
-            evidence.first_review_status = new_status
     evidence.review_status = new_status
 
     audit.log_audit(
@@ -1025,34 +1005,9 @@ def _write_review(
         "comparison_evidence",
         evidence.id,
         reviewer,
-        {
-            "old_status": record.old_status,
-            "new_status": new_status,
-            "stage": stage,
-        },
+        {"old_status": record.old_status, "new_status": new_status},
     )
     return record
-
-
-def _resolve_stage(
-    evidence: ComparisonEvidence,
-    new_status: str,
-    reviewer: User,
-    current_stage: int,
-    requires_second: bool,
-) -> int:
-    if new_status == "pending":
-        return 0
-    if new_status not in _REVIEW_FINAL_STATUSES:
-        # 「暂不判断」是一次分类决定，不再需要二审
-        return 2
-    if current_stage == 1:
-        if evidence.first_reviewer_id == reviewer.id:
-            raise ReviewConflict("二审必须由一审之外的审核人完成")
-        return 2
-    if requires_second:
-        return 1
-    return 2
 
 
 def apply_review(
@@ -1064,15 +1019,12 @@ def apply_review(
     *,
     template_fragment_id: str | None = None,
 ) -> ComparisonEvidence:
-    project = db.get(Project, evidence.project_id)
-    requires_second = bool(project and project.requires_second_review)
     _write_review(
         db,
         evidence,
         new_status,
         comment,
         reviewer,
-        requires_second=requires_second,
         template_fragment_id=template_fragment_id,
     )
     db.commit()
@@ -1210,7 +1162,7 @@ def export_excel(
         if not evidence.review_records:
             return ""
         last = max(evidence.review_records, key=lambda r: r.created_at or evidence.created_at)
-        return last.created_at.isoformat(sep=" ", timespec="minutes") if last.created_at else ""
+        return _format_display_time(last.created_at)
 
     def review_comment(evidence: ComparisonEvidence) -> str:
         return "; ".join(
@@ -1444,6 +1396,17 @@ def export_excel(
     # 只有「价格异常分析表」时，没有异常就只剩表头，自动识别的金额、页码
     # 与覆盖情况都无从复核（QA：覆盖 4/4 却静默报错价，无法被发现）。
     quote_entries = ((task.analysis_config or {}).get("price_snapshot") or {}).get("entries") or {}
+    # 当前有效的人工报价：用于判断自动识别的「待确认」是否已经被人工作答，
+    # 避免页面已改人工报价、导出仍标「待确认」的前后不一致。
+    manual_quotes = {
+        quote.company_id: quote
+        for quote in db.scalars(
+            select(PriceQuote).where(
+                PriceQuote.project_id == project.id,
+                PriceQuote.is_active.is_(True),
+            )
+        )
+    }
     quote_rows = []
     for company in (task.company_snapshot or {}).get("companies", []):
         company_id = company.get("company_id")
@@ -1451,6 +1414,13 @@ def export_excel(
         amount = entry.get("amount")
         source = entry.get("source") or {}
         origin = entry.get("source_kind") or "auto"
+        manual = manual_quotes.get(company_id)
+        # 人工报价等于任务快照里的金额时，待确认项视为已确认
+        confirmed_manually = bool(
+            manual is not None
+            and amount is not None
+            and abs(float(manual.amount) - float(amount)) <= 0.01
+        )
         quote_rows.append(
             [
                 len(quote_rows) + 1,
@@ -1460,7 +1430,7 @@ def export_excel(
                 QUOTE_SOURCE_LABELS.get(origin, origin),
                 source_location(source) if source.get("file_name") else ("人工录入" if origin in {"manual", "import"} else "未记录"),
                 entry.get("raw") or "",
-                "是" if entry.get("needs_confirmation") else "否",
+                "是" if entry.get("needs_confirmation") and not confirmed_manually else "否",
                 "、".join(
                     f"{float(value):,.2f}" for value in (entry.get("alternative_amounts") or [])
                 ),
@@ -1647,7 +1617,6 @@ def export_excel(
 
     # 6. 审核记录表：只追加的审核历史，报告可独立还原审核过程
     review_rows = []
-    stage_labels = {0: "撤回", 1: "一审", 2: "终审"}
     for evidence in evidences:
         records = sorted(
             evidence.review_records, key=lambda r: r.created_at or evidence.created_at
@@ -1660,11 +1629,10 @@ def export_excel(
                     TYPE_LABELS.get(evidence.evidence_type, evidence.evidence_type),
                     evidence.summary,
                     record.reviewer_name,
-                    stage_labels.get(record.stage or 1, "一审"),
                     REVIEW_LABELS.get(record.old_status, record.old_status),
                     REVIEW_LABELS.get(record.new_status, record.new_status),
                     record.comment or "",
-                    record.created_at.isoformat(sep=" ", timespec="minutes")
+                    _format_display_time(record.created_at)
                     if record.created_at
                     else "",
                 ]
@@ -1679,14 +1647,13 @@ def export_excel(
                 "证据类型",
                 "证据摘要",
                 "审核人",
-                "审核环节",
                 "原结论",
                 "新结论",
                 "审核说明",
                 "审核时间",
             ],
             review_rows,
-            [8, 26, 14, 60, 16, 10, 16, 16, 50, 20],
+            [8, 26, 14, 60, 16, 16, 16, 50, 20],
         )
 
     stream = BytesIO()

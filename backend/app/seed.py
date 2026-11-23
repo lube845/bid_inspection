@@ -12,7 +12,8 @@ import tempfile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AnalysisTask, Company, OriginalFile, Project
+from app.core.config import settings
+from app.models import AnalysisTask, Company, OriginalFile, Project, User
 from app.models.enums import (
     FileKind,
     FileParseStatus,
@@ -130,11 +131,16 @@ def seed_demo(db: Session) -> None:
     if existing:
         return
 
+    # 演示项目归到初始管理员名下，否则项目级权限会把所有普通用户都挡在外面
+    owner = db.scalars(
+        select(User).where(User.username == settings.admin_username)
+    ).first()
     project = Project(
         project_name="演示采购项目A",
         project_code=_DEMO_CODE,
         description="系统内置演示项目，覆盖文件解析、企业两两比对、三栏证据与人工审核流程。",
         status=ProjectStatus.PENDING.value,
+        created_by=owner.id if owner else None,
     )
     db.add(project)
     db.flush()

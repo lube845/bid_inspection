@@ -96,11 +96,6 @@ class EvidenceType(str, Enum):
     # 文档元数据：PDF 生产者/作者、DOCX 作者与最后修改人、生成环境指纹
     METADATA = "metadata"
 
-    @classmethod
-    def analysis_types(cls) -> list[str]:
-        """不进入「分析维度」菜单、由文件阶段独立产出的证据类型。"""
-        return [cls.FILE.value, cls.METADATA.value]
-
 
 class RiskLevel(str, Enum):
     NONE = "none"
@@ -117,9 +112,38 @@ class ReviewStatus(str, Enum):
 
 
 class UserRole(str, Enum):
+    # 只有两种角色：管理员可进入系统配置/审计日志/用户管理，普通用户只能做业务。
+    # 旧数据里的 analyst / reviewer 在迁移 0006 里统一收敛为 user。
     ADMIN = "admin"
-    ANALYST = "analyst"
+    USER = "user"
+
+
+USER_ROLE_LABELS = {
+    UserRole.ADMIN.value: "管理员",
+    UserRole.USER.value: "用户",
+}
+
+
+class ProjectRole(str, Enum):
+    """项目级权限。能力依次包含：viewer < reviewer < manager。"""
+
+    VIEWER = "viewer"
     REVIEWER = "reviewer"
+    MANAGER = "manager"
+
+
+PROJECT_ROLE_LABELS = {
+    ProjectRole.VIEWER.value: "查看",
+    ProjectRole.REVIEWER.value: "审批",
+    ProjectRole.MANAGER.value: "管理",
+}
+
+# 数字越大权限越高，便于做「至少需要某级权限」的比较
+PROJECT_ROLE_RANK = {
+    ProjectRole.VIEWER.value: 1,
+    ProjectRole.REVIEWER.value: 2,
+    ProjectRole.MANAGER.value: 3,
+}
 
 
 class RuleStatus(str, Enum):

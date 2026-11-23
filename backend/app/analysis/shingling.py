@@ -93,10 +93,6 @@ class LSHParams:
     threshold: float
     num_perm: int
 
-    @property
-    def used_permutations(self) -> int:
-        return self.bands * self.rows
-
 
 class MinHashLSH:
     """基于 banding 的内存 LSH 索引。

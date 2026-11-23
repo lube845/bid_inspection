@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from app.analysis.base import EvidenceDraft
-from app.analysis.sources import BlockRef
+from app.analysis.sources import BlockRef, BlockSpan
 from app.models.enums import EvidenceType, RiskLevel
 from app.utils.text import normalize
 
@@ -26,7 +26,7 @@ from app.utils.text import normalize
 CONTEXT_CHARS = 12
 CONTEXT_LEVELS = (12, 8, 5)
 @dataclass
-class AnomalyOccurrence:
+class AnomalyOccurrence(BlockSpan):
     term: str
     correction: str
     context: str
@@ -36,10 +36,6 @@ class AnomalyOccurrence:
     # 命中词左右两侧的规范化上下文（各最多 CONTEXT_CHARS 字）
     left: str = ""
     right: str = ""
-
-    @property
-    def source(self) -> dict:
-        return self.block.source(self.start, self.end)
 
 
 def _side_levels(a: AnomalyOccurrence, b: AnomalyOccurrence) -> tuple[int, int]:

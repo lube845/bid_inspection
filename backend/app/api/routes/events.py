@@ -11,14 +11,15 @@ import json
 import time
 from collections import Counter
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
 from app.api.deps import get_current_user, get_stream_user
+from app.db.session import SessionLocal, get_db
+from app.services import access_service
 from app.core.config import settings
 from app.core.security import create_scoped_ticket
-from app.db.session import SessionLocal
 from app.models import (
     AnalysisTask,
     ComparisonEvidence,
@@ -139,9 +140,14 @@ def _build_snapshot(project_id: str) -> dict:
 @router.post("/projects/{project_id}/events/ticket")
 def project_events_ticket(
     project_id: str,
+    db=Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
     """签发限定到该项目的短期事件流票据（EventSource 无法设置请求头）。"""
+    try:
+        access_service.ensure_access_by_id(db, project_id, user)
+    except access_service.ProjectAccessError as exc:
+        raise HTTPException(403 if exc.forbidden else 404, str(exc)) from exc
     ttl = settings.scoped_ticket_expire_seconds
     return {
         "ticket": create_scoped_ticket(
@@ -156,6 +162,14 @@ async def project_events(
     project_id: str,
     user: User = Depends(get_stream_user),
 ) -> StreamingResponse:
+    # 票据只证明「是谁」，可见性仍要按项目再校验一次
+    db = SessionLocal()
+    try:
+        access_service.ensure_access_by_id(db, project_id, user)
+    except access_service.ProjectAccessError as exc:
+        raise HTTPException(403 if exc.forbidden else 404, str(exc)) from exc
+    finally:
+        db.close()
     async def generator():
         last_payload: str | None = None
         last_ping = time.monotonic()

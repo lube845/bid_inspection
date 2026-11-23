@@ -160,7 +160,8 @@ def test_workbench_excludes_deleted_projects(db):
 
 def test_workbench_todos_cover_parse_and_analysis_problems(db):
     project = _project(db, "待办项目", "TODO-001")
-    task = _task(db, project, status=TaskStatus.FAILED.value)
+    # 失败任务要存在（待办靠它的状态触发），但后续断言只用项目与文件
+    _task(db, project, status=TaskStatus.FAILED.value)
     company = _company(db, project, "甲公司")
     _file(db, project, company, "损坏文件.txt", FileParseStatus.FAILED.value)
     _file(db, project, company, "部分文件.txt", FileParseStatus.PARTIAL.value)

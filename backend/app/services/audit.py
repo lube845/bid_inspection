@@ -42,7 +42,7 @@ def log_audit(
         entity_type=entity_type,
         entity_id=entity_id,
         actor_id=actor.id if actor else None,
-        actor_name=actor.display_name or actor.username if actor else "system",
+        actor_name=(actor.display_name or actor.employee_no or actor.username) if actor else "system",
         payload=data,
     )
     db.add(record)

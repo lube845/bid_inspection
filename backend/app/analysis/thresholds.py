@@ -103,6 +103,14 @@ def price_thresholds(thresholds: dict | None) -> dict:
         "price_line_item_min_ratio": threshold(
             thresholds, "price_line_item_min_ratio", 0.6
         ),
+        # 价格比对矩阵：同项单价被视为「完全相同」的容差（相对值），
+        # 以及与同项中位价偏差超过多少判为「偏离」
+        "price_line_item_identical_tolerance": threshold(
+            thresholds, "price_line_item_identical_tolerance", 0.0001
+        ),
+        "price_matrix_outlier_ratio": threshold(
+            thresholds, "price_matrix_outlier_ratio", 0.3
+        ),
         # 尾数特征：特殊尾数取值与尾数集中的最少家数
         "special_tail": threshold(
             thresholds, "special_tail", ["888", "999", "998"]

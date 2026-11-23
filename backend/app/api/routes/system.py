@@ -1,9 +1,7 @@
-from datetime import datetime, time, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, require_admin
+from app.api.deps import error_response, get_current_user, parse_date_bound, require_admin
 from app.db.session import get_db
 from app.models import User
 from app.models.enums import UserRole
@@ -23,10 +21,6 @@ router = APIRouter(prefix="/system", tags=["system"])
 OCR_PROVIDERS = [
     {"value": "baidu", "label": "百度智能云 OCR", "doc": "https://cloud.baidu.com/doc/OCR/s/vk3h7y58v"},
 ]
-
-
-def _handle(exc: Exception) -> HTTPException:
-    return HTTPException(status_code=400, detail=str(exc))
 
 
 # --------------------------------------------------------------------------- 检测规则
@@ -124,7 +118,7 @@ def create_rule_version(
             activate=payload.activate,
         )
     except rule_service.RuleError as exc:
-        raise _handle(exc) from exc
+        raise error_response(exc) from exc
     audit.log_audit(
         db,
         "rule.update",
@@ -154,7 +148,7 @@ def activate_rule_version(
     try:
         record = rule_service.activate(db, version_id, actor=user)
     except rule_service.RuleError as exc:
-        raise _handle(exc) from exc
+        raise error_response(exc) from exc
     audit.log_audit(
         db,
         "rule.update",
@@ -195,8 +189,8 @@ def list_logs(
         entity_type=entity_type,
         result=result,
         source=source,
-        date_from=_parse_date(date_from, end=False),
-        date_to=_parse_date(date_to, end=True),
+        date_from=parse_date_bound(date_from, end=False),
+        date_to=parse_date_bound(date_to, end=True),
         page=page,
         page_size=page_size,
     )
@@ -249,9 +243,11 @@ def create_user(
             payload.display_name,
             payload.role,
             actor=user,
+            employee_no=payload.employee_no,
+            email=payload.email,
         )
     except system_service.SystemError as exc:
-        raise _handle(exc) from exc
+        raise error_response(exc) from exc
     audit.log_audit(
         db,
         "user.create",
@@ -259,7 +255,12 @@ def create_user(
         created["id"],
         user,
         {"username": created["username"], "role": created["role"]},
-        after={"username": created["username"], "role": created["role"]},
+        after={
+            "username": created["username"],
+            "employee_no": created["employee_no"],
+            "email": created["email"],
+            "role": created["role"],
+        },
         entity_name=created["username"],
     )
     db.commit()
@@ -276,7 +277,20 @@ def update_user(
     target = db.get(User, user_id)
     if not target:
         raise HTTPException(404, "用户不存在")
-    before = {"role": target.role, "is_active": target.is_active, "display_name": target.display_name}
+    before = {
+        "username": target.username,
+        "employee_no": target.employee_no,
+        "email": target.email,
+        "role": target.role,
+        "is_active": target.is_active,
+        "display_name": target.display_name,
+    }
+    # PATCH 用 model_fields_set 区分「没传」与「显式传 null」
+    identity_set = {
+        field: getattr(payload, field)
+        for field in ("username", "employee_no", "email")
+        if field in payload.model_fields_set
+    }
     try:
         updated = system_service.update_user(
             db,
@@ -285,9 +299,10 @@ def update_user(
             role=payload.role,
             is_active=payload.is_active,
             actor=user,
+            identity_set=identity_set,
         )
     except system_service.SystemError as exc:
-        raise _handle(exc) from exc
+        raise error_response(exc) from exc
     audit.log_audit(
         db,
         "user.update",
@@ -296,7 +311,14 @@ def update_user(
         user,
         {"username": target.username},
         before=before,
-        after={"role": updated["role"], "is_active": updated["is_active"], "display_name": updated["display_name"]},
+        after={
+            "username": updated["username"],
+            "employee_no": updated["employee_no"],
+            "email": updated["email"],
+            "role": updated["role"],
+            "is_active": updated["is_active"],
+            "display_name": updated["display_name"],
+        },
         entity_name=target.username,
     )
     db.commit()
@@ -326,15 +348,3 @@ def reset_password(
     db.commit()
     return {"message": "密码已重置"}
 
-
-def _parse_date(value: str | None, end: bool = False):
-    """把 YYYY-MM-DD 解析成 UTC 边界，避免 SQLite/Postgres 时区不一致。"""
-    if not value:
-        return None
-    try:
-        parsed = datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        return None
-    if end:
-        parsed = datetime.combine(parsed.date(), time.max)
-    return parsed.replace(tzinfo=timezone.utc)

@@ -5,20 +5,41 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_project
 from app.db.session import get_db
 from app.models import AnalysisTask, ComparisonEvidence, ComparisonPair, Project, User
 from app.schemas.analysis import ReviewRequest
-from app.services import audit, results_service, template_service
+from app.services import access_service, audit, results_service, template_service
 
 router = APIRouter(tags=["results"])
 
 
-def _get_project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at:
-        raise HTTPException(404, "项目不存在")
-    return project
+def _get_evidence(
+    db: Session, evidence_id: str, user: User, role: str = access_service.VIEW
+) -> ComparisonEvidence:
+    """证据、企业组合都挂在项目下，权限一律以所属项目为准。"""
+    evidence = db.get(ComparisonEvidence, evidence_id)
+    if not evidence:
+        raise HTTPException(404, "证据不存在")
+    get_project(db, evidence.project_id, user, role)
+    return evidence
+
+
+def _get_pair(db: Session, pair_id: str, user: User, role: str = access_service.VIEW) -> ComparisonPair:
+    pair = db.get(ComparisonPair, pair_id)
+    if not pair:
+        raise HTTPException(404, "企业组合不存在")
+    _get_task_project(db, pair.analysis_task_id, user, role)
+    return pair
+
+
+def _get_task_project(
+    db: Session, task_id: str, user: User, role: str = access_service.VIEW
+) -> Project:
+    task = db.get(AnalysisTask, task_id)
+    if not task:
+        raise HTTPException(404, "分析任务不存在")
+    return get_project(db, task.project_id, user, role)
 
 
 @router.get("/projects/{project_id}/results/overview")
@@ -28,7 +49,7 @@ def results_overview(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     return results_service.overview(db, project, task_id)
 
 
@@ -40,7 +61,7 @@ def task_diff(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     try:
         return results_service.task_diff(db, project, task_id, against)
     except ValueError as exc:
@@ -53,9 +74,7 @@ def pair_detail(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    pair = db.get(ComparisonPair, pair_id)
-    if not pair:
-        raise HTTPException(404, "企业组合不存在")
+    pair = _get_pair(db, pair_id, user)
     return results_service.pair_detail(db, pair)
 
 
@@ -68,7 +87,7 @@ def pair_evidences(
     tender: str | None = None,
     cluster_lead_only: bool = False,
     min_cluster_size: int | None = Query(default=None, ge=1),
-    review_queue: str | None = Query(default=None, pattern="^(pending_first|awaiting_second|final)$"),
+    review_queue: str | None = Query(default=None, pattern="^(pending|reviewed)$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     before: int = Query(default=100, ge=0, le=2000),
@@ -80,9 +99,7 @@ def pair_evidences(
 
     比对分析页首屏只拉取这一份数据，左右两列不再默认加载完整原文。
     """
-    pair = db.get(ComparisonPair, pair_id)
-    if not pair:
-        raise HTTPException(404, "企业组合不存在")
+    pair = _get_pair(db, pair_id, user)
     return results_service.pair_evidences(
         db,
         pair,
@@ -106,9 +123,7 @@ def evidence_detail(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    evidence = db.get(ComparisonEvidence, evidence_id)
-    if not evidence:
-        raise HTTPException(404, "证据不存在")
+    evidence = _get_evidence(db, evidence_id, user)
     return results_service.evidence_detail(db, evidence)
 
 
@@ -122,9 +137,7 @@ def evidence_context(
     user: User = Depends(get_current_user),
 ) -> dict:
     """按需读取证据某一侧的扩展上下文。"""
-    evidence = db.get(ComparisonEvidence, evidence_id)
-    if not evidence:
-        raise HTTPException(404, "证据不存在")
+    evidence = _get_evidence(db, evidence_id, user)
     try:
         return results_service.evidence_context_payload(db, evidence, side, before, after)
     except ValueError as exc:
@@ -138,9 +151,7 @@ def review_evidence(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    evidence = db.get(ComparisonEvidence, evidence_id)
-    if not evidence:
-        raise HTTPException(404, "证据不存在")
+    evidence = _get_evidence(db, evidence_id, user, access_service.REVIEW)
     template_fragment_id = None
     if payload.learn_as_template:
         if payload.status != "excluded":
@@ -157,17 +168,14 @@ def review_evidence(
         except template_service.TemplateError as exc:
             raise HTTPException(400, detail=str(exc)) from exc
         template_fragment_id = fragment.id
-    try:
-        results_service.apply_review(
-            db,
-            evidence,
-            payload.status,
-            payload.comment,
-            user,
-            template_fragment_id=template_fragment_id,
-        )
-    except results_service.ReviewConflict as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    results_service.apply_review(
+        db,
+        evidence,
+        payload.status,
+        payload.comment,
+        user,
+        template_fragment_id=template_fragment_id,
+    )
     return results_service.evidence_detail(db, evidence)
 
 
@@ -184,7 +192,7 @@ def review_center(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     return results_service.list_reviews(
         db,
         project.id,
@@ -205,15 +213,11 @@ def export_pair_excel(
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """导出单个企业组合的证据 Excel（比对分析页使用）。"""
-    pair = db.get(ComparisonPair, pair_id)
-    if not pair:
-        raise HTTPException(404, "企业组合不存在")
+    pair = _get_pair(db, pair_id, user)
     task = db.get(AnalysisTask, pair.analysis_task_id)
     if not task:
         raise HTTPException(404, "分析任务不存在")
-    project = db.get(Project, task.project_id)
-    if not project or project.deleted_at:
-        raise HTTPException(404, "项目不存在")
+    project = get_project(db, task.project_id, user)
     try:
         content, filename = results_service.export_excel(
             db, project, task_id=task.id, pair_id=pair_id
@@ -249,7 +253,7 @@ def export_excel(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     try:
         content, filename = results_service.export_excel(db, project, task_id)
     except ValueError as exc:

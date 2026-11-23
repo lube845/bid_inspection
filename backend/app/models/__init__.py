@@ -16,8 +16,9 @@ from app.models.logical import (
     LogicalDocumentItem,
     LogicalDocumentVersion,
 )
-from app.models.price import PriceQuote
+from app.models.price import PriceItem, PriceQuote
 from app.models.project import Project
+from app.models.project_member import ProjectMember
 from app.models.review import AuditLog, ReviewRecord
 from app.models.rule import DetectionRuleVersion
 from app.models.template import TemplateFragment
@@ -41,8 +42,10 @@ __all__ = [
     "LogicalDocumentItem",
     "LogicalDocumentVersion",
     "OriginalFile",
+    "PriceItem",
     "PriceQuote",
     "Project",
+    "ProjectMember",
     "ReviewRecord",
     "TemplateFragment",
     "TextSimilarityResult",

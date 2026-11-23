@@ -92,15 +92,19 @@ def list_risks(
     include_history: bool = False,
     page: int = 1,
     page_size: int = 20,
+    user_id: str | None = None,
 ) -> dict:
     query = select(ComparisonEvidence).where(ComparisonEvidence.is_current.is_(True))
-    # 只统计未删除的项目，与工作台的项目口径保持一致
-    visible_project_ids = [
-        project_id
-        for project_id in db.scalars(
-            select(Project.id).where(Project.deleted_at.is_(None))
-        ).all()
-    ]
+    # 只统计未删除、且当前用户可见的项目，与项目列表口径保持一致
+    visible_query = select(Project.id).where(Project.deleted_at.is_(None))
+    if user_id is not None:
+        # 延迟导入避免 access_service ↔ risk_service 的循环依赖
+        from app.services.access_service import visible_project_ids
+
+        allowed = visible_project_ids(db, db.get(User, user_id))
+        if allowed is not None:
+            visible_query = visible_query.where(Project.id.in_(allowed))
+    visible_project_ids = [pid for pid in db.scalars(visible_query).all()]
     if visible_project_ids:
         query = query.where(ComparisonEvidence.project_id.in_(visible_project_ids))
     else:
@@ -150,12 +154,10 @@ def list_risks(
         )
     if assignee_id:
         query = query.where(ComparisonEvidence.assignee_id == assignee_id)
-    if review_queue == "pending_first":
-        query = query.where(ComparisonEvidence.review_stage == 0)
-    elif review_queue == "awaiting_second":
-        query = query.where(ComparisonEvidence.review_stage == 1)
-    elif review_queue == "final":
-        query = query.where(ComparisonEvidence.review_stage == 2)
+    if review_queue == "pending":
+        query = query.where(ComparisonEvidence.review_status == ReviewStatus.PENDING.value)
+    elif review_queue == "reviewed":
+        query = query.where(ComparisonEvidence.review_status != ReviewStatus.PENDING.value)
     if cluster_lead_only:
         query = query.where(
             or_(
@@ -275,7 +277,6 @@ def _enrich(db: Session, rows: list[ComparisonEvidence]) -> list[dict]:
                 "cluster_id": row.cluster_id,
                 "cluster_size": row.cluster_size or 1,
                 "is_cluster_lead": row.cluster_lead_id in (None, row.id),
-                "review_stage": row.review_stage or 0,
                 "assignee_id": row.assignee_id,
                 "assigned_at": row.assigned_at,
             }
@@ -435,7 +436,9 @@ def risk_detail(db: Session, evidence: ComparisonEvidence) -> dict:
         "task_no": task.task_no if task else None,
         "task_status": task.status if task else None,
         "companies": [p.get("company_name") for p in participants if p.get("company_name")],
-        "reviewer_name": latest_record[0]["reviewer_name"] if latest_record else "",
+        # review_records 按 created_at 升序，最近一次审核是最后一条。
+        # 取 [0] 会把审核人显示成最早那次的操作者（QA 首轮第 4 条）。
+        "reviewer_name": latest_record[-1]["reviewer_name"] if latest_record else "",
         # 分派人姓名供详情弹窗展示；证据只存 assignee_id，这里一次性解析
         "assignee_name": _assignee_name(db, evidence.assignee_id),
         "files": files,
@@ -449,7 +452,7 @@ def _assignee_name(db: Session, assignee_id: str | None) -> str:
     user = db.get(User, assignee_id)
     if user is None:
         return ""
-    return user.display_name or user.username
+    return user.display_name or user.employee_no or user.username
 
 
 def batch_review(
@@ -490,11 +493,7 @@ def batch_review(
         if skip_reviewed and evidence.review_status != ReviewStatus.PENDING.value:
             skipped_reviewed.append(evidence.id)
             continue
-        # 「暂不判断」是一次分类决定，直接终审，不走二审队列——
-        # 否则现有批量入口就成了双人复核的绕过通道。
-        results_service._write_review(
-            db, evidence, new_status, comment, reviewer, stage=2
-        )
+        results_service._write_review(db, evidence, new_status, comment, reviewer)
         updated += 1
     skipped = [eid for eid in evidence_ids if eid not in {row.id for row in rows}]
     return {
@@ -540,7 +539,7 @@ def batch_assign(
         {
             "count": len(rows),
             "assignee_id": assignee.id if assignee else None,
-            "assignee_name": (assignee.display_name or assignee.username) if assignee else None,
+            "assignee_name": (assignee.display_name or assignee.employee_no or assignee.username) if assignee else None,
         },
     )
     return {"updated": len(rows), "assignee_id": assignee.id if assignee else None}
@@ -555,10 +554,9 @@ def cluster_review(
     *,
     skip_reviewed: bool = False,
 ) -> dict:
-    """按线索审核：一条操作覆盖同一线索下的全部证据.
+    """按线索审核：一条操作覆盖同一线索下的全部证据。
 
-    每条成员仍各自写一条 ``review_record``（与单条审核同构），只是入口不同；
-    二审要求每个成员的 ``first_reviewer_id`` 都不是当前审核人，否则整批拒绝。
+    每条成员仍各自写一条 ``review_record``（与单条审核同构），只是入口不同。
     """
     if new_status not in {"confirmed", "excluded", "undecided"}:
         raise RiskValidationError("按线索审核只支持确认 / 排除 / 暂不判断")
@@ -574,42 +572,34 @@ def cluster_review(
     )
     if not rows:
         raise RiskValidationError("没有可处理的证据")
-    conflict = [
-        row.id
-        for row in rows
-        if (row.review_stage or 0) == 1 and row.first_reviewer_id == reviewer.id
-    ]
-    if new_status in {"confirmed", "excluded"} and conflict:
-        raise RiskValidationError("线索中有证据的一审由本人完成，二审必须由其他审核人处理")
-    projects = {
-        project.id: project
-        for project in db.scalars(
-            select(Project).where(Project.id.in_({row.project_id for row in rows}))
-        )
-    }
     updated = 0
     skipped: list[str] = []
     for evidence in rows:
         if skip_reviewed and evidence.review_status != ReviewStatus.PENDING.value:
             skipped.append(evidence.id)
             continue
-        project = projects.get(evidence.project_id)
         results_service._write_review(
             db,
             evidence,
             new_status,
             comment,
             reviewer,
-            requires_second=bool(project and project.requires_second_review),
             action="evidence.review_cluster",
         )
         updated += 1
     return {"updated": updated, "skipped_reviewed": skipped, "status": new_status}
 
 
-def risk_filters(db: Session) -> dict:
-    """筛选下拉的可选项。"""
-    projects = list(db.scalars(select(Project).where(Project.deleted_at.is_(None))))
+def risk_filters(db: Session, user: User | None = None) -> dict:
+    """筛选下拉的可选项（限定在当前用户可见的项目内）。"""
+    projects_query = select(Project).where(Project.deleted_at.is_(None))
+    if user is not None:
+        from app.services.access_service import visible_project_ids
+
+        allowed = visible_project_ids(db, user)
+        if allowed is not None:
+            projects_query = projects_query.where(Project.id.in_(allowed))
+    projects = list(db.scalars(projects_query))
     project_ids = [project.id for project in projects]
     companies = list(
         db.scalars(

@@ -25,6 +25,7 @@ from app.models import (
     ComparisonEvidence,
     OriginalFile,
     Project,
+    User,
 )
 from app.models.enums import (
     PROJECT_STATUS_LABELS,
@@ -44,10 +45,21 @@ def summary(
     project_limit: int = 8,
     task_limit: int = 8,
     todo_limit: int = 30,
+    user: User | None = None,
 ) -> dict:
-    projects = list(
-        db.scalars(select(Project).where(Project.deleted_at.is_(None)))
-    )
+    """全局工作台。
+
+    ``user`` 非空时只统计该用户可见的项目（自己创建的 + 被分享的）；
+    系统管理员传 None，统计全部项目。
+    """
+    project_query = select(Project).where(Project.deleted_at.is_(None))
+    if user is not None:
+        from app.services.access_service import visible_project_ids
+
+        allowed = visible_project_ids(db, user)
+        if allowed is not None:
+            project_query = project_query.where(Project.id.in_(allowed))
+    projects = list(db.scalars(project_query))
     project_ids = [project.id for project in projects]
     # 所有统计都限定在未删除的项目内，保证「项目总数」与证据/任务口径一致
     in_projects = (
@@ -83,21 +95,14 @@ def summary(
         )
         or 0
     )
-    # 待办口径按「流程位置」而不是「结论状态」：一审已完成待二审的证据
-    # 不应继续算在待审核里，否则开启二审后待办数会虚高。
     evidence_pending = (
         db.scalar(
             select(func.count())
             .select_from(ComparisonEvidence)
-            .where(current_filter, ComparisonEvidence.review_stage == 0)
-        )
-        or 0
-    )
-    evidence_awaiting_second = (
-        db.scalar(
-            select(func.count())
-            .select_from(ComparisonEvidence)
-            .where(current_filter, ComparisonEvidence.review_stage == 1)
+            .where(
+                current_filter,
+                ComparisonEvidence.review_status == ReviewStatus.PENDING.value,
+            )
         )
         or 0
     )
@@ -105,7 +110,9 @@ def summary(
     by_severity = _count_by(db, ComparisonEvidence.severity, current_filter)
     by_review = _count_by(db, ComparisonEvidence.review_status, current_filter)
     by_project = _count_by(db, ComparisonEvidence.project_id, current_filter)
-    pending_filter = and_(current_filter, ComparisonEvidence.review_stage == 0)
+    pending_filter = and_(
+        current_filter, ComparisonEvidence.review_status == ReviewStatus.PENDING.value
+    )
     pending_by_project = dict(
         db.execute(
             select(ComparisonEvidence.project_id, func.count())
@@ -123,14 +130,6 @@ def summary(
             .group_by(ComparisonEvidence.project_id)
         ).all()
     )
-    awaiting_second_by_project = dict(
-        db.execute(
-            select(ComparisonEvidence.project_id, func.count())
-            .where(and_(current_filter, ComparisonEvidence.review_stage == 1))
-            .group_by(ComparisonEvidence.project_id)
-        ).all()
-    )
-
     # ---- 文件解析状态 ----------------------------------------------------
     file_rows = db.execute(
         select(OriginalFile.project_id, OriginalFile.parse_status, func.count())
@@ -236,7 +235,6 @@ def summary(
             "last_task": last_task,
             "pending_review_count": pending_by_project.get(project.id, 0),
             "pending_review_at": pending_at_by_project.get(project.id),
-            "awaiting_second_review_count": awaiting_second_by_project.get(project.id, 0),
             "reappeared_evidence_count": reappeared_by_project.get(project.id, 0),
             "exported": project.id in exported_projects,
         }
@@ -268,7 +266,6 @@ def summary(
                     (last_task.finished_at or last_task.created_at) if last_task else None
                 ),
                 "pending_review_count": pending_by_project.get(project.id, 0),
-                "awaiting_second_review_count": awaiting_second_by_project.get(project.id, 0),
                 "evidence_count": by_project.get(project.id, 0),
                 "updated_at": project.updated_at,
                 "link": f"#/projects/{project.id}",
@@ -332,7 +329,6 @@ def summary(
             "task_partial": task_partial,
             "evidence_total": evidence_total,
             "evidence_pending_review": evidence_pending,
-            "evidence_awaiting_second_review": evidence_awaiting_second,
         },
         "todos": todos,
         "recent_projects": recent_projects,

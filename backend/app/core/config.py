@@ -25,7 +25,14 @@ class Settings(BaseSettings):
 
     max_upload_size_mb: int = 500
     max_companies_per_project: int = 20
-    allowed_file_extensions: str = "pdf,docx,doc,txt,md,wps"
+    # 只登记「解析器真正支持」的格式。旧版 DOC 与二进制 WPS 无法解析，
+    # 列入允许名单只会在解析阶段失败，因此在上传时就拒绝。
+    allowed_file_extensions: str = "pdf,docx,txt,md,wps"
+
+    # 展示与导出使用的时区。数据库统一存 UTC，页面按浏览器本地时间显示；
+    # Excel 由服务端生成，必须显式换算，否则同一条记录会比页面早/晚 8 小时
+    # （QA 首轮第 6 条）。默认东八区，部署到其他时区时改这里即可。
+    display_timezone: str = "Asia/Shanghai"
 
     # Run background jobs inline (useful for local development / tests).
     sync_tasks: bool = False

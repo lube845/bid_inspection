@@ -23,6 +23,8 @@ def ensure_admin(db) -> None:
         return
     admin = User(
         username=settings.admin_username,
+        # 初始管理员用配置里的账号当工号，满足「工号或邮箱至少一个」
+        employee_no=settings.admin_username,
         password_hash=hash_password(settings.admin_password),
         display_name="系统管理员",
         role=UserRole.ADMIN.value,

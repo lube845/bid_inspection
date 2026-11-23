@@ -32,14 +32,20 @@ class RuleVersionActivate(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=2, max_length=64)
+    # 工号与邮箱至少填一个，具体在服务层校验（两者都为空时报错）
+    employee_no: str | None = Field(default=None, max_length=64)
+    email: str | None = Field(default=None, max_length=254)
     password: str = Field(min_length=4, max_length=64)
     display_name: str = Field(default="", max_length=128)
-    role: str = Field(default="analyst", pattern="^(admin|analyst|reviewer)$")
+    role: str = Field(default="user", pattern="^(admin|user)$")
 
 
 class UserUpdate(BaseModel):
+    username: str | None = Field(default=None, min_length=2, max_length=64)
+    employee_no: str | None = Field(default=None, max_length=64)
+    email: str | None = Field(default=None, max_length=254)
     display_name: str | None = Field(default=None, max_length=128)
-    role: str | None = Field(default=None, pattern="^(admin|analyst|reviewer)$")
+    role: str | None = Field(default=None, pattern="^(admin|user)$")
     is_active: bool | None = None
 
 

@@ -23,3 +23,11 @@ def test_legacy_doc_is_rejected_with_clear_message(tmp_path):
     path.write_bytes(b"\xd0\xcf\x11\xe0")
     with pytest.raises(ParseError, match="DOC"):
         parse_document(path, "doc")
+
+
+def test_doc_is_not_in_allowed_upload_extensions():
+    """上传就拒绝旧版 DOC，而不是等解析阶段失败（QA 报告第 3 条）。"""
+    from app.core.config import settings
+
+    assert "doc" not in settings.allowed_extensions
+    assert {"pdf", "docx", "txt", "md", "wps"} <= settings.allowed_extensions

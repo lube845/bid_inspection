@@ -151,8 +151,8 @@ def test_stale_evidence_is_excluded(db):
 def test_reviewer_is_latest_review_record(db):
     project, task, companies = _world(db)
     evidence = _evidence(db, project, task, EvidenceType.TEXT.value)
-    first = User(username="first", password_hash=hash_password("x"), display_name="第一审核人", role="reviewer")
-    second = User(username="second", password_hash=hash_password("x"), display_name="第二审核人", role="reviewer")
+    first = User(username="first", employee_no="U001", password_hash=hash_password("x"), display_name="第一审核人", role="user")
+    second = User(username="second", employee_no="U002", password_hash=hash_password("x"), display_name="第二审核人", role="user")
     db.add_all([first, second])
     db.commit()
     db.add(ReviewRecord(evidence_id=evidence.id, reviewer_id=first.id, reviewer_name="第一审核人",
@@ -174,7 +174,7 @@ def test_reviewer_is_latest_review_record(db):
 def test_batch_review_rejects_confirm_and_exclude(db):
     project, task, companies = _world(db)
     evidence = _evidence(db, project, task, EvidenceType.TEXT.value)
-    reviewer = User(username="reviewer", password_hash=hash_password("x"), display_name="审核人", role="reviewer")
+    reviewer = User(username="reviewer", employee_no="U003", password_hash=hash_password("x"), display_name="审核人", role="user")
     db.add(reviewer)
     db.commit()
 
@@ -194,7 +194,7 @@ def test_batch_review_rejects_confirm_and_exclude(db):
 def test_batch_review_marks_undecided(db):
     project, task, companies = _world(db)
     evidence = _evidence(db, project, task, EvidenceType.TEXT.value)
-    reviewer = User(username="reviewer", password_hash=hash_password("x"), display_name="审核人", role="reviewer")
+    reviewer = User(username="reviewer", employee_no="U003", password_hash=hash_password("x"), display_name="审核人", role="user")
     db.add(reviewer)
     db.commit()
 
@@ -214,7 +214,7 @@ def test_batch_review_can_skip_existing_conclusions(db):
     evidence = _evidence(db, project, task, EvidenceType.TEXT.value)
     evidence.review_status = ReviewStatus.CONFIRMED.value
     db.commit()
-    reviewer = User(username="reviewer2", password_hash=hash_password("x"), display_name="审核人", role="reviewer")
+    reviewer = User(username="reviewer2", employee_no="U004", password_hash=hash_password("x"), display_name="审核人", role="user")
     db.add(reviewer)
     db.commit()
 

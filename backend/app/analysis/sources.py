@@ -12,6 +12,40 @@ LOCATOR_PRECISION_BLOCK = "block"
 
 
 @dataclass
+class BlockSpan:
+    """判定命中的统一定位接口：三个判定模块的命中项都只需给出 block 与偏移。
+
+    以 dataclass 而非 mixin 提供：子类把 ``block/start/end`` 排在自身字段之后声明，
+    这里只补一个 ``source`` 便捷属性，不参与字段顺序。
+    """
+
+    block: BlockRef
+    start: int
+    end: int
+
+    @property
+    def source(self) -> dict:
+        return self.block.source(self.start, self.end)
+
+
+def fold_span(offsets: list[int]):
+    """返回把「折叠文本偏移」映射回原文的 span(start, end) 闭包。
+
+    折叠（康熙部首 / 兼容汉字）逐字符 1:1，匹配偏移可原样映射回原文；
+    没有 index_map 时退回 (0, 0)，调用方据此放弃该命中。
+    """
+
+    def span(start: int, end: int) -> tuple[int, int]:
+        if not offsets:
+            return 0, 0
+        start = max(0, min(start, len(offsets) - 1))
+        end = max(start + 1, min(end, len(offsets)))
+        return offsets[start], offsets[end - 1] + 1
+
+    return span
+
+
+@dataclass
 class BlockRef:
     company_id: str
     company_name: str
@@ -26,6 +60,9 @@ class BlockRef:
     content: str
     normalized: str
     block_type: str
+    # 该块文本的真实来源：native（PDF/DOCX 原生文本）或 ocr（扫描页识别）。
+    # 证据链必须如实反映来源，否则复核人会把 OCR 结果当成原生文本。
+    extraction_method: str = "native"
 
     def source(self, start: int | None = None, end: int | None = None) -> dict:
         """构造可回溯到原始文件的证据位置。start/end 为原文偏移量。"""
@@ -53,7 +90,7 @@ class BlockRef:
             "bbox": None,
             # 当前解析器没有文本坐标时，至少保证页码/文本块可定位
             "locator_precision": LOCATOR_PRECISION_BLOCK,
-            "extraction_method": "native",
+            "extraction_method": self.extraction_method,
         }
 
 
@@ -105,6 +142,7 @@ def load_company_blocks(
                     content=block.content,
                     normalized=block.normalized_content,
                     block_type=block.block_type,
+                    extraction_method=page.extraction_method or "native",
                 )
             )
             if len(refs) >= limit:

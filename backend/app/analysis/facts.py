@@ -30,8 +30,9 @@ import re
 from dataclasses import dataclass
 
 from app.analysis.base import EvidenceDraft
-from app.analysis.sources import BlockRef
+from app.analysis.sources import BlockRef, BlockSpan, fold_span
 from app.models.enums import EvidenceType, RiskLevel
+from app.utils.text import fold_for_match
 
 # ---- 工期 ----
 _DURATION = re.compile(
@@ -72,7 +73,7 @@ _NAME_STOP = {"负责", "代表", "人员", "经理", "总监", "项目", "技�
 
 
 @dataclass
-class FactValue:
+class FactValue(BlockSpan):
     """一条从正文抽出的事实。"""
 
     kind: str  # duration / date / phone / email / role_name
@@ -81,10 +82,6 @@ class FactValue:
     block: BlockRef
     start: int
     end: int
-
-    @property
-    def source(self) -> dict:
-        return self.block.source(self.start, self.end)
 
 
 def _valid_chinese_name(name: str) -> bool:
@@ -109,7 +106,12 @@ def extract_facts(blocks: list[BlockRef]) -> list[FactValue]:
     """从一家企业的文本块里抽取全部事实。"""
     facts: list[FactValue] = []
     for block in blocks:
-        content = block.content
+        # 与人员/报价一致：在折叠兼容字符后的文本上匹配（PDF 会把「人」「工」
+        # 等字映射成康熙部首），偏移再映射回原文。
+        content, offsets = fold_for_match(block.content)
+
+        span = fold_span(offsets)
+
         for match in _DURATION.finditer(content):
             facts.append(
                 FactValue(
@@ -117,8 +119,8 @@ def extract_facts(blocks: list[BlockRef]) -> list[FactValue]:
                     key="工期",
                     value=f"{match.group(1)} {match.group(2)}",
                     block=block,
-                    start=match.start(),
-                    end=match.end(),
+                    start=span(match.start(), match.end())[0],
+                    end=span(match.start(), match.end())[1],
                 )
             )
         for pattern in (_DATE_CN, _DATE_ISO):
@@ -131,8 +133,8 @@ def extract_facts(blocks: list[BlockRef]) -> list[FactValue]:
                             key=normalized,
                             value=match.group(0),
                             block=block,
-                            start=match.start(),
-                            end=match.end(),
+                            start=span(match.start(), match.end())[0],
+                            end=span(match.start(), match.end())[1],
                         )
                     )
         for pattern, kind in ((_MOBILE, "phone"), (_LANDLINE, "phone"), (_EMAIL, "email")):
@@ -143,8 +145,8 @@ def extract_facts(blocks: list[BlockRef]) -> list[FactValue]:
                         key=match.group(0).replace(" ", "").replace("-", ""),
                         value=match.group(0),
                         block=block,
-                        start=match.start(),
-                        end=match.end(),
+                        start=span(match.start(), match.end())[0],
+                        end=span(match.start(), match.end())[1],
                     )
                 )
         for match in _ROLE_NAME.finditer(content):
@@ -156,8 +158,8 @@ def extract_facts(blocks: list[BlockRef]) -> list[FactValue]:
                         key=role,
                         value=name,
                         block=block,
-                        start=match.start(2),
-                        end=match.end(2),
+                        start=span(match.start(2), match.end(2))[0],
+                        end=span(match.start(2), match.end(2))[1],
                     )
                 )
     return facts

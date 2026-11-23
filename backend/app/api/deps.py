@@ -1,10 +1,52 @@
+from datetime import datetime, time, timezone
+
 from fastapi import Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token, decode_scoped_ticket
 from app.db.session import SessionLocal, get_db
-from app.models import User
+from app.models import Company, Project, User
 from app.models.enums import UserRole
+from app.services import access_service
+
+
+def error_response(exc: Exception) -> HTTPException:
+    """把服务层校验异常统一包成 400（各路由的 except 分支共用）。"""
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+def parse_date_bound(value: str | None, end: bool = False):
+    """把 YYYY-MM-DD 解析成 UTC 边界，避免 SQLite/Postgres 时区不一致。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+    if end:
+        parsed = datetime.combine(parsed.date(), time.max)
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def get_project(
+    db: Session, project_id: str, user: User, role: str = access_service.VIEW
+) -> Project:
+    """按项目权限取项目；无权访问时统一转成 403/404，避免暴露项目是否存在。"""
+    try:
+        return access_service.ensure_access_by_id(db, project_id, user, role)
+    except access_service.ProjectAccessError as exc:
+        raise HTTPException(403 if exc.forbidden else 404, str(exc)) from exc
+
+
+def get_company(
+    db: Session, company_id: str, user: User, role: str = access_service.VIEW
+) -> Company:
+    """企业挂在项目下：权限一律以所属项目为准。"""
+    company = db.get(Company, company_id)
+    if not company or company.deleted_at:
+        raise HTTPException(404, "企业不存在")
+    get_project(db, company.project_id, user, role)
+    return company
 
 
 def _user_from_token(token: str | None, db: Session) -> User:

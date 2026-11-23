@@ -235,13 +235,14 @@ def test_rule_version_endpoints_require_admin():
             headers=headers,
             json={
                 "username": "analyst1",
+                "employee_no": "A001",
                 "password": "analyst123",
                 "display_name": "分析员",
-                "role": "analyst",
+                "role": "user",
             },
         )
         assert created.status_code == 201, created.text
-        analyst_headers = _login(client, "analyst1", "analyst123")
+        analyst_headers = _login(client, "A001", "analyst123")
 
         forbidden = client.post(
             "/api/v1/system/rules/versions",
@@ -309,16 +310,17 @@ def test_user_management_lifecycle():
             headers=headers,
             json={
                 "username": "reviewer1",
+                "email": "reviewer1@example.com",
                 "password": "review123",
                 "display_name": "审核员",
-                "role": "reviewer",
+                "role": "user",
             },
         )
         assert created.status_code == 201, created.text
         user_id = created.json()["id"]
 
-        # 新账号可以登录
-        _login(client, "reviewer1", "review123")
+        # 新账号用工号/邮箱登录（用户名不作为登录凭证）
+        _login(client, "reviewer1@example.com", "review123")
 
         # 禁用后不能登录
         disabled = client.patch(
@@ -327,7 +329,8 @@ def test_user_management_lifecycle():
         assert disabled.status_code == 200
         assert disabled.json()["is_active"] is False
         blocked = client.post(
-            "/api/v1/auth/login", json={"username": "reviewer1", "password": "review123"}
+            "/api/v1/auth/login",
+            json={"username": "reviewer1@example.com", "password": "review123"},
         )
         assert blocked.status_code == 401
 
@@ -339,7 +342,7 @@ def test_user_management_lifecycle():
         )
         assert reset.status_code == 200
         client.patch(f"/api/v1/system/users/{user_id}", headers=headers, json={"is_active": True})
-        _login(client, "reviewer1", "newpass123")
+        _login(client, "reviewer1@example.com", "newpass123")
 
 
 def test_admin_cannot_disable_own_account():
@@ -364,6 +367,7 @@ def test_last_admin_cannot_be_disabled(db):
 
     other = User(
         username="admin2",
+        employee_no="ADM002",
         password_hash=hash_password("x"),
         display_name="第二管理员",
         role=UserRole.ADMIN.value,
@@ -380,22 +384,26 @@ def test_last_admin_cannot_be_disabled(db):
         raise AssertionError("禁用最后一个管理员应当被拒绝")
 
 
-def test_user_service_rejects_duplicate_username(db):
+def test_user_service_rejects_duplicate_employee_no(db):
     existing = User(
         username="dup",
+        employee_no="D001",
         password_hash="x",
         display_name="重复",
-        role=UserRole.ANALYST.value,
+        role=UserRole.USER.value,
         is_active=True,
     )
     db.add(existing)
     db.commit()
+    # 同名允许
+    system_service.create_user(db, "dup", "pass123", "重复", "user", employee_no="D002")
+    # 同工号拒绝
     try:
-        system_service.create_user(db, "dup", "pass123", "重复", "analyst")
+        system_service.create_user(db, "other", "pass123", "另一个", "user", employee_no="D001")
     except system_service.SystemError as exc:
-        assert "已存在" in str(exc)
+        assert "已被其他账号使用" in str(exc)
     else:
-        raise AssertionError("重复用户名应当被拒绝")
+        raise AssertionError("重复工号应当被拒绝")
 
 
 def test_rule_thresholds_actually_affect_detection():
@@ -489,3 +497,280 @@ def test_price_thresholds_come_from_rule_snapshot():
         rule.rule for rule in analyze_prices(quotes, thresholds={"price_cv": 0.0})
     }
     assert "high_concentration" not in relaxed
+
+
+# --------------------------------------------------------------------------- 身份字段与两种角色
+
+
+def test_create_user_requires_employee_no_or_email():
+    """工号与邮箱必须至少填一个。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        headers = _login(client)
+        neither = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={"username": "no_identity", "password": "pass1234", "role": "user"},
+        )
+        assert neither.status_code == 400
+        assert "至少" in neither.json()["detail"]
+
+        only_employee = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={
+                "username": "emp_only",
+                "employee_no": "E1001",
+                "password": "pass1234",
+                "role": "user",
+            },
+        )
+        assert only_employee.status_code == 201, only_employee.text
+        assert only_employee.json()["employee_no"] == "E1001"
+
+        only_email = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={
+                "username": "mail_only",
+                "email": "Mail.Only@Example.com",
+                "password": "pass1234",
+                "role": "user",
+            },
+        )
+        assert only_email.status_code == 201, only_email.text
+        # 邮箱统一小写存储
+        assert only_email.json()["email"] == "mail.only@example.com"
+
+
+def test_login_accepts_employee_no_and_email_only():
+    """登录只认工号与邮箱；用户名仅作展示，允许重复，不能登录。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        headers = _login(client)
+        client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={
+                "username": "three_keys",
+                "employee_no": "E2002",
+                "email": "three@example.com",
+                "password": "pass1234",
+                "role": "user",
+            },
+        )
+        for account in ("E2002", "three@example.com", "THREE@example.com"):
+            response = client.post(
+                "/api/v1/auth/login",
+                json={"username": account, "password": "pass1234"},
+            )
+            assert response.status_code == 200, f"{account}: {response.text}"
+            assert response.json()["user"]["username"] == "three_keys"
+
+        by_username = client.post(
+            "/api/v1/auth/login",
+            json={"username": "three_keys", "password": "pass1234"},
+        )
+        assert by_username.status_code == 401
+
+        wrong = client.post(
+            "/api/v1/auth/login", json={"username": "E2002", "password": "nope"}
+        )
+        assert wrong.status_code == 401
+
+
+def test_identity_fields_are_unique():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        headers = _login(client)
+        client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={
+                "username": "u1",
+                "employee_no": "E3003",
+                "email": "dup@example.com",
+                "password": "pass1234",
+            },
+        )
+        # 用户名允许重复（同名同事是常态）
+        same_name = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={"username": "u1", "employee_no": "E3004", "password": "pass1234"},
+        )
+        assert same_name.status_code == 201, same_name.text
+
+        for payload, label in (
+            ({"username": "u2", "employee_no": "E3003"}, "工号"),
+            ({"username": "u3", "email": "dup@example.com"}, "邮箱"),
+            ({"username": "u4", "email": "DUP@example.com"}, "邮箱"),
+        ):
+            response = client.post(
+                "/api/v1/system/users",
+                headers=headers,
+                json={"password": "pass1234", **payload},
+            )
+            assert response.status_code == 400, response.text
+            assert label in response.json()["detail"]
+
+
+def test_login_credentials_are_unique_across_fields():
+    """工号与邮箱都能登录，二者之间不能重名，否则登录结果取决于查询顺序。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        headers = _login(client)
+        with_mail = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={"username": "beta", "email": "beta@example.com", "password": "pass1234"},
+        ).json()
+        # 把别人的邮箱当成自己的工号
+        clash = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={
+                "username": "gamma",
+                "employee_no": "beta@example.com",
+                "password": "pass1234",
+            },
+        )
+        assert clash.status_code == 400
+        assert "已被其他账号使用" in clash.json()["detail"]
+        assert with_mail["email"] == "beta@example.com"
+
+        # 用户名与别人的工号同名不冲突（用户名不参与登录）
+        shadow = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={"username": "beta@example.com", "employee_no": "E6006", "password": "pass1234"},
+        )
+        assert shadow.status_code == 201, shadow.text
+
+
+def test_update_user_identity_fields():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        headers = _login(client)
+        created = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={"username": "editable", "employee_no": "E4004", "password": "pass1234"},
+        ).json()
+        user_id = created["id"]
+
+        # 三项都能改
+        updated = client.patch(
+            f"/api/v1/system/users/{user_id}",
+            headers=headers,
+            json={
+                "username": "editable2",
+                "employee_no": "E4005",
+                "email": "editable@example.com",
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        body = updated.json()
+        assert body["username"] == "editable2"
+        assert body["employee_no"] == "E4005"
+        assert body["email"] == "editable@example.com"
+
+        # 改后用新工号登录；用户名不参与登录
+        assert (
+            client.post(
+                "/api/v1/auth/login",
+                json={"username": "E4005", "password": "pass1234"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/v1/auth/login",
+                json={"username": "editable2", "password": "pass1234"},
+            ).status_code
+            == 401
+        )
+
+        # 清空工号后仍有邮箱，允许
+        cleared = client.patch(
+            f"/api/v1/system/users/{user_id}", headers=headers, json={"employee_no": None}
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["employee_no"] is None
+
+        # 再把邮箱也清空就违反「至少一项」
+        denied = client.patch(
+            f"/api/v1/system/users/{user_id}", headers=headers, json={"email": None}
+        )
+        assert denied.status_code == 400
+        assert "至少" in denied.json()["detail"]
+
+
+def test_roles_are_only_admin_and_user():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        headers = _login(client)
+        for bad_role in ("analyst", "reviewer", "superuser"):
+            response = client.post(
+                "/api/v1/system/users",
+                headers=headers,
+                json={
+                    "username": f"bad_{bad_role}",
+                    "employee_no": f"R{bad_role}",
+                    "password": "pass1234",
+                    "role": bad_role,
+                },
+            )
+            assert response.status_code == 422, response.text
+
+        created = client.post(
+            "/api/v1/system/users",
+            headers=headers,
+            json={
+                "username": "plain_user",
+                "employee_no": "U9001",
+                "password": "pass1234",
+                "role": "user",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["role_label"] == "用户"
+
+
+def test_last_admin_cannot_be_demoted(db):
+    """把最后一个启用的管理员降级同样会把系统锁死。"""
+    other = User(
+        username="admin3",
+        employee_no="ADM003",
+        password_hash="x",
+        display_name="第三管理员",
+        role=UserRole.ADMIN.value,
+        is_active=True,
+    )
+    db.add(other)
+    db.commit()
+
+    try:
+        system_service.update_user(db, other, role=UserRole.USER.value, actor=None)
+    except system_service.SystemError as exc:
+        assert "管理员" in str(exc)
+    else:
+        raise AssertionError("降级最后一个管理员应当被拒绝")

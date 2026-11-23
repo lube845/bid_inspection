@@ -337,28 +337,6 @@ def ensure_missing_params(
     return records
 
 
-def ensure_missing_text_params(db: Session, actor: User | None = None) -> DetectionRuleVersion | None:
-    """兼容旧调用：只补齐文本维度。"""
-    active = active_version(db, "text")
-    if active is None:
-        return None
-    params = dict(active.params or {})
-    factory = default_params("text")
-    missing = {key: value for key, value in factory.items() if key not in params}
-    if not missing:
-        return None
-    merged = dict(params)
-    merged.update(missing)
-    return create_version(
-        db,
-        "text",
-        merged,
-        "补齐文本相似新增参数：" + "、".join(sorted(missing)),
-        actor,
-        activate=True,
-    )
-
-
 def list_versions(db: Session, dimension: str | None = None) -> list[DetectionRuleVersion]:
     query = select(DetectionRuleVersion)
     if dimension:
@@ -402,7 +380,7 @@ def ensure_initial_version(db: Session, actor: User | None = None) -> list[Detec
             previous_params={},
             change_reason="出厂初始版本",
             created_by=actor.id if actor else None,
-            created_by_name=(actor.display_name or actor.username) if actor else "system",
+            created_by_name=(actor.display_name or actor.employee_no or actor.username) if actor else "system",
             activated_at=utcnow(),
         )
         db.add(record)
@@ -531,7 +509,7 @@ def create_version(
         change_reason=change_reason.strip(),
         supersedes_id=current.id if current else None,
         created_by=actor.id if actor else None,
-        created_by_name=(actor.display_name or actor.username) if actor else "system",
+        created_by_name=(actor.display_name or actor.employee_no or actor.username) if actor else "system",
     )
     db.add(record)
     db.flush()

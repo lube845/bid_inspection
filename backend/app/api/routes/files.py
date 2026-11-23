@@ -1,16 +1,16 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_file_access_user
+from app.api.deps import get_company, get_current_user, get_file_access_user, get_project
 from app.core.security import create_scoped_ticket
 from app.api.serializers import file_payload, page_payload
 from app.core.config import settings
 from app.db.session import get_db
-from app.models import Company, DocumentPage, OriginalFile, Project, User
+from app.models import Company, DocumentPage, OriginalFile, User
 from app.models.enums import FileKind, FileParseStatus
-from app.services import audit, file_service
+from app.services import access_service, audit, file_service
 from app.storage.local import get_storage
 from app.workers import dispatch
 
@@ -24,24 +24,12 @@ _MEDIA_TYPES = {
 }
 
 
-def _get_project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at:
-        raise HTTPException(404, "项目不存在")
-    return project
-
-
-def _get_company(db: Session, company_id: str) -> Company:
-    company = db.get(Company, company_id)
-    if not company or company.deleted_at:
-        raise HTTPException(404, "企业不存在")
-    return company
-
-
-def _get_file(db: Session, file_id: str) -> OriginalFile:
+def _get_file(db: Session, file_id: str, user: User, role: str = access_service.VIEW) -> OriginalFile:
     file = db.get(OriginalFile, file_id)
     if not file:
         raise HTTPException(404, "文件不存在")
+    # 文件必然属于某个项目：可见性由项目权限决定
+    get_project(db, file.project_id, user, role)
     return file
 
 
@@ -52,7 +40,7 @@ async def upload_tender_files(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user, access_service.MANAGE)
     created = []
     for upload in files:
         record = await file_service.create_file(
@@ -69,8 +57,8 @@ async def upload_company_files(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    company = _get_company(db, company_id)
-    project = _get_project(db, company.project_id)
+    company = get_company(db, company_id, user, access_service.MANAGE)
+    project = get_project(db, company.project_id)
     created = []
     for upload in files:
         record = await file_service.create_file(
@@ -89,7 +77,7 @@ def list_files(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     query = select(OriginalFile).where(OriginalFile.project_id == project.id)
     if kind:
         query = query.where(OriginalFile.kind == kind)
@@ -117,7 +105,7 @@ def get_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user)
     company = db.get(Company, file.company_id) if file.company_id else None
     payload = file_payload(file, company)
     payload["pages"] = [
@@ -140,7 +128,7 @@ def delete_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user, access_service.MANAGE)
     if not file.is_active:
         raise HTTPException(400, "文件已失效")
     file_service.delete_file(db, file, user)
@@ -154,7 +142,7 @@ async def replace_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user, access_service.MANAGE)
     if not file.is_active:
         raise HTTPException(400, "只能替换当前有效文件")
     new_file = await file_service.replace_file(db, file, upload, user)
@@ -168,7 +156,7 @@ def parse_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user, access_service.MANAGE)
     if not file.is_active:
         raise HTTPException(400, "文件已失效，不能解析")
     if file.parse_status == FileParseStatus.PARSING.value:
@@ -188,7 +176,7 @@ def parse_project_files(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user, access_service.MANAGE)
     file_ids = file_service.trigger_parse_for_project(db, project.id)
     for file_id in file_ids:
         dispatch.enqueue_parse(file_id)
@@ -201,7 +189,7 @@ def parse_center(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = _get_project(db, project_id)
+    project = get_project(db, project_id, user)
     return file_service.parse_center(db, project.id)
 
 
@@ -211,7 +199,7 @@ def list_pages(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user)
     return {
         "items": [
             {
@@ -233,10 +221,20 @@ def list_pages(
 def get_page(
     file_id: str,
     page_index: int,
+    block_offset: int = Query(default=0, ge=0),
+    block_limit: int = Query(default=2000, ge=1, le=5000),
+    page_text_limit: int = Query(default=200_000, ge=1000, le=2_000_000),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    file = _get_file(db, file_id)
+    """页面详情（文本块分页）。
+
+    50MB 纯文本可能被解析成单页内上万个文本块，一次返回整页会让请求长时间
+    不返回（QA 报告第 2 条：超过 240 秒未完成）。这里默认只返回前 2000 个块，
+    前端按 ``has_more_blocks`` / ``block_total`` 继续加载，并提供降级提示。
+    ``page_text`` 也做截断，但保留完整字符数与是否截断的标记。
+    """
+    file = _get_file(db, file_id, user)
     page = db.scalars(
         select(DocumentPage).where(
             DocumentPage.original_file_id == file.id,
@@ -245,11 +243,20 @@ def get_page(
     ).first()
     if not page:
         raise HTTPException(404, "页面不存在")
+    payload = page_payload(page, block_offset=block_offset, block_limit=block_limit)
+    full_text = payload.get("page_text") or ""
+    if len(full_text) > page_text_limit:
+        payload["page_text"] = full_text[:page_text_limit]
+        payload["page_text_truncated"] = True
+        payload["page_text_total"] = len(full_text)
+    else:
+        payload["page_text_truncated"] = False
+        payload["page_text_total"] = len(full_text)
     return {
         "file_id": file.id,
         "file_name": file.file_name,
         "file_type": file.file_type,
-        "page": page_payload(page),
+        "page": payload,
     }
 
 
@@ -263,7 +270,7 @@ def file_original(
 
     只返回地址与定位信息，不在比对结果页初始化时加载文件内容。
     """
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user)
     pages = sorted(file.pages, key=lambda p: p.page_index)
     return {
         "file_id": file.id,
@@ -293,7 +300,7 @@ def file_ticket(
     user: User = Depends(get_current_user),
 ) -> dict:
     """签发限定到该文件的短期访问票据，供 <a>/<iframe> 直接打开原文。"""
-    _get_file(db, file_id)
+    _get_file(db, file_id, user)
     ttl = settings.scoped_ticket_expire_seconds
     return {
         "ticket": create_scoped_ticket(
@@ -309,7 +316,7 @@ def file_content(
     db: Session = Depends(get_db),
     user: User = Depends(get_file_access_user),
 ) -> FileResponse:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user)
     try:
         path = get_storage().local_path(file.storage_key)
     except FileNotFoundError:
@@ -327,7 +334,7 @@ def download_file(
     db: Session = Depends(get_db),
     user: User = Depends(get_file_access_user),
 ) -> FileResponse:
-    file = _get_file(db, file_id)
+    file = _get_file(db, file_id, user)
     try:
         path = get_storage().local_path(file.storage_key)
     except FileNotFoundError:

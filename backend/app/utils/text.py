@@ -94,6 +94,38 @@ def normalize(text: str) -> str:
     return normalize_with_map(text)[0]
 
 
+def fold_for_match(text: str) -> tuple[str, list[int]]:
+    """只做「兼容字符折叠」，保留标点与空白，并给出偏移映射。
+
+    与 :func:`normalize_with_map` 的区别：后者会删掉标点、空白并转小写，适合
+    相似度计算；这里保留原结构，只把渲染上等价、码位不同的字符折叠成标准
+    汉字/字母，供人员、报价等**基于正则的关键词抽取**使用。
+
+    典型场景是 PDF 的 ToUnicode 表把「目、人、工」映射成康熙部首（U+2F6C
+    U+2F08 U+2F2F），肉眼与打印完全一样，正则里的 ``[一-龥]`` 却匹配不到，
+    导致整份 PDF 的人员重复全部漏报（QA 报告第 1 条）。
+
+    折叠是逐字符进行的：NFKC 在同一码位上通常也是 1:1（康熙部首、兼容汉字、
+    全角字母数字均如此），因此返回值与原文按下标一一对应，可以把匹配到的
+    位置直接还原成原文偏移。少数会展开成多个字符的码位（如 ㈱）保持原样，
+    换取映射的稳定性。
+    """
+    chars: list[str] = []
+    index_map: list[int] = []
+    for index, char in enumerate(text):
+        folded = unicodedata.normalize("NFKC", char)
+        if len(folded) != 1:
+            folded = char
+        folded = folded.translate(_HOMOGLYPHS)
+        chars.append(folded)
+        index_map.append(index)
+    return "".join(chars), index_map
+
+
+def fold(text: str) -> str:
+    return fold_for_match(text)[0]
+
+
 def shingles(text: str, size: int) -> set[str]:
     if len(text) < size:
         return {text} if text else set()

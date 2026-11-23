@@ -54,12 +54,6 @@ class ComparisonEvidence(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     assignee_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # ---- 二审流程（与 review_status 正交：status 是最新结论，stage 是流程位置） ----
-    # 0 未审 / 1 一审完成待二审 / 2 终审
-    review_stage: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
-    first_reviewer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    first_review_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
-
     pair = relationship("ComparisonPair", back_populates="evidences")
     participants = relationship(
         "EvidenceParticipant", back_populates="evidence", cascade="all, delete-orphan"

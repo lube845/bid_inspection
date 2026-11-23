@@ -594,15 +594,16 @@ def test_rules_api_masks_secrets_for_analyst(db):
     db.add(
         User(
             username="analyst",
+            employee_no="A001",
             password_hash=hash_password("secret"),
             display_name="分析员",
-            role="analyst",
+            role="user",
         )
     )
     db.commit()
 
     with TestClient(app) as client:
-        headers = _login(client, "analyst", "secret")
+        headers = _login(client, "A001", "secret")
         payload = client.get("/api/v1/system/rules", headers=headers).json()
         ocr_dimension = next(
             item for item in payload["dimensions"] if item["dimension"] == "ocr"
@@ -629,13 +630,14 @@ def test_ocr_test_endpoint_requires_admin(db):
     db.add(
         User(
             username="reviewer",
+            employee_no="R001",
             password_hash=hash_password("secret"),
             display_name="审核员",
-            role="reviewer",
+            role="user",
         )
     )
     db.commit()
     with TestClient(app) as client:
-        headers = _login(client, "reviewer", "secret")
+        headers = _login(client, "R001", "secret")
         response = client.post("/api/v1/system/ocr/test", json={}, headers=headers)
         assert response.status_code == 403

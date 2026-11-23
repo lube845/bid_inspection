@@ -24,9 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.analysis.price import parse_upper_amount
-from app.models import AnalysisTask, Company, PriceQuote, Project, User
+from app.models import AnalysisTask, Company, PriceItem, PriceQuote, Project, User
 from app.models.base import utcnow
 from app.services import audit
+from app.utils.text import normalize
 
 # 模板列：企业名称与信用代码二选一即可
 TEMPLATE_HEADERS = ["企业名称", "统一社会信用代码", "投标总报价（元）", "大写金额", "备注"]
@@ -429,4 +430,124 @@ def import_quotes(
             commit=False,
         )
     db.commit()
+    return result
+
+
+# --------------------------------------------------------------------------- 清单分项单价
+
+
+def _active_items(db: Session, project_id: str, company_id: str) -> list[PriceItem]:
+    return list(
+        db.scalars(
+            select(PriceItem).where(
+                PriceItem.project_id == project_id,
+                PriceItem.company_id == company_id,
+                PriceItem.is_active.is_(True),
+            )
+        )
+    )
+
+
+def set_price_items(
+    db: Session,
+    project: Project,
+    company: Company,
+    items: list[dict],
+    *,
+    source_kind: str = "import",
+    source_ref: dict | None = None,
+    actor: User | None = None,
+    commit: bool = True,
+) -> list[PriceItem]:
+    """用一批分项单价替换该企业当前有效的清单。
+
+    ``items`` 里每项需含 ``name`` 与 ``unit_price``，可选 ``unit`` / ``quantity``。
+    旧版本置为无效并保留（追加式，与报价总价一致），新版本号 +1。
+
+    整表替换而不是逐项合并：同一份 Excel 重传应得到与文件完全一致的清单，
+    残留的旧分项会污染矩阵的「同项对齐」。
+    """
+    if not items:
+        return []
+    current = _active_items(db, project.id, company.id)
+    next_version = max((item.version_no for item in current), default=0) + 1
+    for item in current:
+        item.is_active = False
+        item.superseded_at = utcnow()
+    db.flush()
+
+    created: list[PriceItem] = []
+    for index, entry in enumerate(items, start=1):
+        name = str(entry.get("name") or "").strip()
+        price = entry.get("unit_price")
+        if not name or price is None or float(price) <= 0:
+            continue
+        key = entry.get("key") or normalize(name)
+        if len(key) < 2:
+            continue
+        created.append(
+            PriceItem(
+                project_id=project.id,
+                company_id=company.id,
+                item_key=key,
+                item_name=name,
+                unit_price=round(float(price), 4),
+                unit=(str(entry.get("unit") or "").strip() or None),
+                quantity=(
+                    round(float(entry["quantity"]), 4)
+                    if entry.get("quantity") not in (None, "")
+                    else None
+                ),
+                source_kind=source_kind,
+                source_ref=source_ref or {},
+                version_no=next_version,
+                is_active=True,
+            )
+        )
+    db.add_all(created)
+    db.flush()
+    audit.log_audit(
+        db,
+        "price_item.import" if source_kind == "import" else "price_item.manual_entry",
+        "price_item",
+        company.id,
+        actor,
+        {
+            "company_name": company.company_name,
+            "count": len(created),
+            "version_no": next_version,
+            "source_kind": source_kind,
+        },
+        entity_name=company.company_name,
+    )
+    if commit:
+        db.commit()
+    return created
+
+
+def list_price_items(db: Session, project: Project) -> dict[str, list[dict]]:
+    """按企业汇总当前有效的分项单价（`{company_id: [...]}`）。"""
+    rows = db.scalars(
+        select(PriceItem)
+        .where(
+            PriceItem.project_id == project.id,
+            PriceItem.is_active.is_(True),
+        )
+        .order_by(PriceItem.item_key)
+    )
+    result: dict[str, list[dict]] = {}
+    for row in rows:
+        result.setdefault(row.company_id, []).append(
+            {
+                "id": row.id,
+                "key": row.item_key,
+                "name": row.item_name,
+                "unit_price": float(row.unit_price),
+                "unit": row.unit,
+                "quantity": float(row.quantity) if row.quantity is not None else None,
+                "source_kind": row.source_kind,
+                "source_ref": row.source_ref or {},
+                "version_no": row.version_no,
+            }
+        )
     return result

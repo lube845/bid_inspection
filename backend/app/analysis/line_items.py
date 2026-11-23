@@ -20,20 +20,21 @@ import re
 from dataclasses import dataclass, field
 
 from app.analysis.base import EvidenceDraft
-from app.analysis.sources import BlockRef
+from app.analysis.sources import BlockRef, BlockSpan
 from app.models.enums import EvidenceType, RiskLevel
-from app.utils.text import normalize
+from app.utils.text import fold_for_match, normalize
 
 # 行内单价识别：形如「1  土方开挖  1200  12.50」或「土方开挖\t12.50元」
-# 只认小数点后 1～4 位的小数，避免把序号、数量、总价当成单价。
-_PRICE_TOKEN = re.compile(r"(?:^|[\t\s|])(\d{1,9}(?:\.\d{1,4}))(?=$|[\t\s|元])")
+# 小数优先。整数也接受（工程量清单里「钢筋制安 4200」很常见），但只有在
+# 整行没有小数时才启用——否则「序号 1 / 数量 100」会被误当成单价。
+_PRICE_TOKEN = re.compile(r"(?:^|[\t\s|])(\d{1,9}(?:\.\d{1,4})?)(?=$|[\t\s|元])")
 _ROW_SPLIT = re.compile(r"[\t|]+|\s{2,}")
 # 这些词出现在行里说明是表头或合计行，不做单品比价
 _HEADER_WORDS = ("序号", "项目名称", "单位", "数量", "单价", "合价", "合计", "小计", "备注")
 
 
 @dataclass
-class LineItem:
+class LineItem(BlockSpan):
     """清单里的一行：项目名称 + 单价。"""
 
     company_id: str
@@ -44,10 +45,6 @@ class LineItem:
     block: BlockRef
     start: int
     end: int
-
-    @property
-    def source(self) -> dict:
-        return self.block.source(self.start, self.end)
 
 
 @dataclass
@@ -87,7 +84,15 @@ def _row_cells(line: str) -> list[str]:
     return [cell.strip() for cell in _ROW_SPLIT.split(line) if cell.strip()]
 
 
-def _parse_row(line: str, company_id: str, company_name: str, block: BlockRef) -> LineItem | None:
+def _parse_row(
+    line: str,
+    company_id: str,
+    company_name: str,
+    block: BlockRef,
+    *,
+    line_start: int = 0,
+    offsets: list[int] | None = None,
+) -> LineItem | None:
     """从一行里拆出「项目名称 + 单价」。
 
     规则：行内至少有一个小数形式的数字，取**最后一个**小数作为单价
@@ -101,14 +106,19 @@ def _parse_row(line: str, company_id: str, company_name: str, block: BlockRef) -
     if len(cells) < 2:
         return None
 
-    price_positions = [
-        (index, float(match.group(1)))
+    tokens = [
+        (index, match.group(1))
         for index, cell in enumerate(cells)
         for match in [_PRICE_TOKEN.fullmatch(f" {cell}")]
         if match
     ]
-    if not price_positions:
+    if not tokens:
         return None
+    # 小数优先：只要行内出现小数，就只在小数里挑，序号/数量/整额合价都被排除
+    decimals = [(index, value) for index, value in tokens if "." in value]
+    price_positions = [
+        (index, float(value)) for index, value in (decimals or tokens)
+    ]
 
     # 优先取「倒数第二个小数」：倒数第一个往往是合价
     position, unit_price = price_positions[-2] if len(price_positions) >= 2 else price_positions[-1]
@@ -128,9 +138,22 @@ def _parse_row(line: str, company_id: str, company_name: str, block: BlockRef) -
     if len(key) < 2:
         return None
 
-    start = block.content.find(raw_name)
-    if start < 0:
-        start = 0
+    # raw_name 来自「折叠兼容字符」后的文本，必须用同一份文本定位，
+    # 再映射回原文偏移；直接在原文里 find 会因为康熙部首而找不到。
+    position_in_line = line.find(raw_name)
+    if position_in_line < 0:
+        position_in_line = 0
+    if offsets:
+        folded_start = line_start + position_in_line
+        folded_end = folded_start + len(raw_name)
+        folded_start = max(0, min(folded_start, len(offsets) - 1))
+        folded_end = max(folded_start + 1, min(folded_end, len(offsets)))
+        start = offsets[folded_start]
+        end = offsets[folded_end - 1] + 1
+    else:  # pragma: no cover - 仅在调用方未提供映射时兜底
+        start = block.content.find(raw_name)
+        start = 0 if start < 0 else start
+        end = start + len(raw_name)
     return LineItem(
         company_id=company_id,
         company_name=company_name,
@@ -139,7 +162,7 @@ def _parse_row(line: str, company_id: str, company_name: str, block: BlockRef) -
         unit_price=unit_price,
         block=block,
         start=start,
-        end=start + len(raw_name),
+        end=end,
     )
 
 
@@ -147,10 +170,25 @@ def extract_line_items(blocks: list[BlockRef]) -> dict[str, LineItem]:
     """抽取一家企业的清单行，同一项目名称保留第一条。"""
     items: dict[str, LineItem] = {}
     for block in blocks:
-        for line in block.content.splitlines():
-            item = _parse_row(line, block.company_id, block.company_name, block)
+        # 折叠兼容字符后再按行解析（PDF 常把汉字映射成康熙部首）。折叠是逐字符
+        # 1:1 的，因此行内偏移可以映射回原文偏移。
+        text, offsets = fold_for_match(block.content)
+        cursor = 0
+        # 用 keepends=True 取得含换行符的原始行，游标才与文本下标一致
+        # （\r\n 会被普通 splitlines 当成一个分隔符，长度不能靠 +1 推算）。
+        for raw_line in text.splitlines(keepends=True):
+            line = raw_line.rstrip("\r\n")
+            item = _parse_row(
+                line,
+                block.company_id,
+                block.company_name,
+                block,
+                line_start=cursor,
+                offsets=offsets,
+            )
             if item and item.key not in items:
                 items[item.key] = item
+            cursor += len(raw_line)
     return items
 
 

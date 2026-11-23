@@ -144,17 +144,6 @@ class TextChunk:
     def first_block(self) -> BlockRef:
         return self.segments[0].block
 
-    def _locate(self, offset: int) -> tuple[ChunkSegment, int]:
-        """规范化偏移量 -> (片段, 片段内偏移)。"""
-        offset = max(0, min(offset, max(0, len(self.normalized) - 1)))
-        cursor = 0
-        for segment in self.segments:
-            size = len(segment.normalized)
-            if offset < cursor + size:
-                return segment, offset - cursor
-            cursor += size
-        return self.segments[-1], len(self.segments[-1].normalized)
-
     def _iter_original(self, start: int, end: int):
         """遍历 [start, end) 规范化区间覆盖的原文片段。"""
         start = max(0, min(start, len(self.normalized)))

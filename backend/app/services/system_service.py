@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from sqlalchemy import func, select
@@ -15,15 +16,17 @@ from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
 from app.models import AuditLog, User
-from app.models.enums import UserRole
+from app.models.enums import USER_ROLE_LABELS, UserRole
 
 # 操作类型的中文标签，对齐 PRD 4.13.4 列举的事件
 ACTION_LABELS = {
     "auth.login": "登录系统",
     "auth.logout": "退出系统",
+    "auth.change_password": "修改密码",
     "project.create": "创建项目",
     "project.update": "修改项目",
     "project.delete": "删除项目",
+    "project.purge": "彻底删除项目",
     "project.archive": "归档项目",
     "project.unarchive": "取消归档",
     "company.create": "创建企业",
@@ -45,6 +48,8 @@ ACTION_LABELS = {
     "price_quote.manual_entry": "补录报价",
     "price_quote.import": "导入报价",
     "price_quote.delete": "删除报价",
+    "price_item.import": "导入清单单价",
+    "price_item.manual_entry": "补录清单单价",
     "evidence.assign": "分派证据",
     "evidence.review_cluster": "按线索审核",
     "template_fragment.create": "标记模板片段",
@@ -67,6 +72,7 @@ ENTITY_LABELS = {
     "detection_rule_version": "检测规则",
     "company": "投标企业",
     "price_quote": "投标报价",
+    "price_item": "清单分项",
     "template_fragment": "模板片段",
 }
 
@@ -87,7 +93,12 @@ def list_users(
     query = select(User)
     if q:
         pattern = f"%{q}%"
-        query = query.where(User.username.ilike(pattern) | User.display_name.ilike(pattern))
+        query = query.where(
+            User.username.ilike(pattern)
+            | User.display_name.ilike(pattern)
+            | User.employee_no.ilike(pattern)
+            | User.email.ilike(pattern)
+        )
     if role:
         query = query.where(User.role == role)
     if is_active is not None:
@@ -103,17 +114,69 @@ def user_payload(user: User) -> dict:
     return {
         "id": user.id,
         "username": user.username,
+        "employee_no": user.employee_no,
+        "email": user.email,
         "display_name": user.display_name,
         "role": user.role,
-        "role_label": {
-            UserRole.ADMIN.value: "系统管理员",
-            UserRole.ANALYST.value: "项目分析人员",
-            UserRole.REVIEWER.value: "风险审核人员",
-        }.get(user.role, user.role),
+        "role_label": USER_ROLE_LABELS.get(user.role, user.role),
         "is_active": user.is_active,
         "created_at": user.created_at,
         "last_login_at": getattr(user, "last_login_at", None),
     }
+
+
+# 邮箱只做轻量格式校验：项目不引入 email-validator 依赖，够挡住手滑写错即可
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _normalize_identity(
+    db: Session,
+    fields: dict,
+    *,
+    exclude_id: str | None = None,
+) -> dict:
+    """清洗并校验用户名 / 工号 / 邮箱。
+
+    ``fields`` 只包含调用方**显式设置**的字段：值为 None 表示清空，
+    键不存在表示不改。这样才能区分「没传」与「传空」。
+
+    只有**登录凭证**（工号、邮箱）要求唯一；用户名是展示用的，允许重复（同名同事）。
+    邮箱统一转小写存储，空值不参与冲突判断。
+    """
+    data: dict = {}
+    if "username" in fields:
+        username = (fields["username"] or "").strip()
+        if not username:
+            raise SystemError("用户名不能为空")
+        data["username"] = username
+    if "employee_no" in fields:
+        data["employee_no"] = (fields["employee_no"] or "").strip() or None
+    if "email" in fields:
+        email = (fields["email"] or "").strip().lower() or None
+        if email is not None and not _EMAIL_RE.match(email):
+            raise SystemError("邮箱格式不正确")
+        data["email"] = email
+
+    # 工号与邮箱都能登录，必须**跨字段**互不重复：否则 A 的工号可能等于 B 的邮箱，
+    # 登录时到底登进哪个账号就取决于查询顺序。
+    for field, label in (("employee_no", "工号"), ("email", "邮箱")):
+        value = data.get(field)
+        if not value:
+            continue
+        query = select(User.id).where(
+            (User.employee_no == value) | (func.lower(User.email) == value.lower())
+        )
+        if exclude_id:
+            query = query.where(User.id != exclude_id)
+        if db.scalar(query):
+            raise SystemError(f"{label}「{value}」已被其他账号使用")
+    return data
+
+
+def _check_identity_required(employee_no: str | None, email: str | None) -> None:
+    """工号与邮箱必须至少填一个。"""
+    if not (employee_no or email):
+        raise SystemError("工号与邮箱至少填写一项")
 
 
 def create_user(
@@ -123,16 +186,20 @@ def create_user(
     display_name: str,
     role: str,
     actor: User | None = None,
+    *,
+    employee_no: str | None = None,
+    email: str | None = None,
 ) -> dict:
-    username = username.strip()
-    if db.scalar(select(User).where(User.username == username)):
-        raise SystemError(f"用户名 {username} 已存在")
+    identity = _normalize_identity(
+        db, {"username": username, "employee_no": employee_no, "email": email}
+    )
+    _check_identity_required(identity.get("employee_no"), identity.get("email"))
     if role not in {r.value for r in UserRole}:
         raise SystemError("用户角色不正确")
     user = User(
-        username=username,
+        **identity,
         password_hash=hash_password(password),
-        display_name=display_name.strip() or username,
+        display_name=display_name.strip() or identity["username"],
         role=role,
         is_active=True,
     )
@@ -148,6 +215,8 @@ def update_user(
     role: str | None = None,
     is_active: bool | None = None,
     actor: User | None = None,
+    *,
+    identity_set: dict | None = None,
 ) -> dict:
     if role is not None and role not in {r.value for r in UserRole}:
         raise SystemError("用户角色不正确")
@@ -157,8 +226,9 @@ def update_user(
             raise SystemError("不能修改自己的管理员角色")
         if is_active is False:
             raise SystemError("不能禁用自己的账号")
-    # 不允许禁用最后一个可用的管理员
-    if is_active is False and user.role == UserRole.ADMIN.value:
+    # 不允许禁用或降级最后一个可用的管理员
+    losing_admin = (is_active is False or (role is not None and role != UserRole.ADMIN.value))
+    if losing_admin and user.role == UserRole.ADMIN.value:
         remaining = db.scalar(
             select(func.count())
             .select_from(User)
@@ -171,6 +241,16 @@ def update_user(
         if not remaining:
             raise SystemError("系统至少需要保留一个启用的管理员账号")
 
+    if identity_set:
+        identity = _normalize_identity(db, identity_set, exclude_id=user.id)
+        merged = {
+            "employee_no": user.employee_no,
+            "email": user.email,
+            **identity,
+        }
+        _check_identity_required(merged["employee_no"], merged["email"])
+        for field, value in identity.items():
+            setattr(user, field, value)
     if display_name is not None:
         user.display_name = display_name.strip()
     if role is not None:
