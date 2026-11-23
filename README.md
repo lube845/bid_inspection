@@ -1,6 +1,6 @@
 # 投标文件智能比对与风险分析系统（V1 框架）
 
-依据 [prd.md](prd.md) / [prd_v2.md](prd_v2.md) 实现的 Python 全栈项目框架，跑通 PRD 定义的完整业务闭环：
+依据 PRD（`prd.md` / `prd_v2.md`，随交付文档单独提供，不入版本库）实现的 Python 全栈项目框架，跑通 PRD 定义的完整业务闭环：
 
 > 创建项目 → 上传招标文件 → 创建投标企业 → 上传企业文件 → 人工排序 → 解析（解析完成后自动开始两两比对）→ 查看比对进展 → 企业两两比对 → 三栏查看证据 → 人工审核 → 导出报告。
 
@@ -348,8 +348,6 @@ Bid_Inspection/
 ├── docker-compose.prod.yml       # 生产模式覆盖（显式 -f 才生效）
 ├── Makefile                      # dev / prod / logs / watch / test / reset 等命令
 ├── .env.example
-├── prd.md
-├── prd_v2.md                      # 系统级模块（工作台/风险管理/系统管理）的产品需求；风险管理已并入项目
 ├── backend/
 │   ├── Dockerfile                 # 生产镜像
 │   ├── Dockerfile.dev             # 开发镜像（多装 pytest / watchdog）
