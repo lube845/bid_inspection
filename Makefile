@@ -5,7 +5,7 @@ PROD_COMPOSE ?= docker compose -f docker-compose.yml -f docker-compose.prod.yml
 
 .DEFAULT_GOAL := help
 
-.PHONY: help dev prod up down restart logs ps watch rebuild reset test shell db-shell migrate revision stamp schema-check
+.PHONY: help dev prod up down restart logs ps watch rebuild reset test lint format shell db-shell migrate revision stamp schema-check
 
 help: ## 显示可用命令
 	@echo "投标文件智能比对系统 —— 常用命令"
@@ -54,6 +54,12 @@ reset: ## 清空数据库与上传文件并重新初始化（会删除所有数�
 
 test: ## 在容器内运行后端测试
 	$(DEV_COMPOSE) exec api pytest -q
+
+lint: ## 静态检查（ruff：未定义名、重复导入等基础错误）
+	$(DEV_COMPOSE) exec api ruff check app tests
+
+format: ## 格式化检查（只报告，不自动改）
+	$(DEV_COMPOSE) exec api ruff format --check app tests
 
 shell: ## 进入后端容器
 	$(DEV_COMPOSE) exec api bash
