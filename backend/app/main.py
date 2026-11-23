@@ -14,7 +14,6 @@ from app.api.routes import (
     projects,
     quotes,
     results,
-    risks,
     system,
     workbench,
 )
@@ -23,8 +22,8 @@ from app.db.init_db import init_db
 from app.services.analysis_service import AnalysisValidationError
 from app.services.company_service import CompanyError
 from app.services.file_service import FileValidationError
+from app.services.results_service import ReviewError
 from app.services.rule_service import RuleError
-from app.services.risk_service import RiskValidationError
 from app.services.system_service import SystemError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -85,8 +84,8 @@ async def rule_error_handler(request: Request, exc: RuleError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
-@app.exception_handler(RiskValidationError)
-async def risk_error_handler(request: Request, exc: RiskValidationError):
+@app.exception_handler(ReviewError)
+async def review_error_handler(request: Request, exc: ReviewError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
@@ -114,5 +113,4 @@ app.include_router(analysis.router, prefix=settings.api_prefix)
 app.include_router(results.router, prefix=settings.api_prefix)
 app.include_router(events.router, prefix=settings.api_prefix)
 app.include_router(workbench.router, prefix=settings.api_prefix)
-app.include_router(risks.router, prefix=settings.api_prefix)
 app.include_router(system.router, prefix=settings.api_prefix)

@@ -7,8 +7,9 @@
 同时提供 PRD v2 定义的**系统级模块**，一级菜单为
 `工作台 · 项目管理 · 系统配置 · 审计日志 · 用户管理`，登录后默认进入工作台。
 
-> PRD §4.11 的「风险管理」已并入项目管理：审核是项目内的工作（`?tab=review`），
-> 不再设独立的跨项目页面，避免与项目内的「比对分析」出现两套审核入口。
+> PRD §4.11 的「风险管理」已并入项目管理：审核是项目内的工作，集中在「比对分析」
+> （按企业组合深看原文并审核）与「比对结果」（项目级证据与重点异常证据）两页完成，
+> 不再设独立的审核页签或跨项目页面。
 
 V1 不接入真实模型或 OCR：文档解析、文本相似、人员重复、价格异常均为**可运行的确定性规则/轻量算法**，接口与数据结构按后续替换模型的方式预留。重点验证的是框架、数据模型、证据溯源和页面闭环。
 
@@ -153,9 +154,9 @@ cd backend
 .venv/bin/pytest -q
 ```
 
-测试覆盖：端到端种子流程（解析 → 3 组比对 → 三级证据 → Excel 导出）、审核记录追加、20 家企业上限、文本规范化偏移映射；文本引擎的结构化分块、MinHash/LSH 召回、Jaccard/有效相似度、招标文件基准排除、局部对齐与块对结果入库；以及系统级模块——工作台防重复计数与待办、风险清单筛选分页与证据编号、批量审核限制、规则版本生命周期与阈值真正生效、操作日志、用户管理与管理员鉴权。
+测试覆盖：端到端种子流程（解析 → 3 组比对 → 三级证据 → Excel 导出）、审核记录追加、20 家企业上限、文本规范化偏移映射；文本引擎的结构化分块、MinHash/LSH 召回、Jaccard/有效相似度、招标文件基准排除、局部对齐与块对结果入库；以及系统级模块——工作台防重复计数与待办、证据编号与详情、按线索审核、规则版本生命周期与阈值真正生效、操作日志、用户管理与管理员鉴权。
 
-新增覆盖（`pytest` 共 271 项）：迁移脚本与模型一致性（`test_migrations.py`）、报价导入与快照优先级（`test_price_quotes.py`）、尾数参数与大小写一致性（`test_price_rules.py`）、证据聚类边界（`test_clusters.py`）、分派/审核/按线索审核（`test_review_workflow.py`）、结构指纹与错字一致性（`test_structure.py`）、经验模板库（`test_template_library.py`）、跨任务对比（`test_task_diff.py`）、QA 报告（`prd_kimi_test.md`）缺陷回归（`test_qa_1117_regressions.py`）：退出登录令牌吊销、重复分析只看最新任务、千分位/表格合计行报价识别（含「分项在合计之前」的布局）、合计候选矛盾时标记待确认、统一社会信用代码校验位、封面字段雷同降级、关键岗位范围参数生效、取整尾数不报异常、招标正文变化后旧任务标记基准过期、报价清单展示自动识别金额；第三轮 QA 回归（`test_qa_test3_regressions.py`）；项目权限（`test_project_access.py`）、价格矩阵（`test_price_matrix.py`）、单家价格文件（`test_company_price_file.py`）、模板命中计数（`test_template_hits_regression.py`）。
+新增覆盖（`pytest` 共 261 项）：迁移脚本与模型一致性（`test_migrations.py`）、报价导入与快照优先级（`test_price_quotes.py`）、尾数参数与大小写一致性（`test_price_rules.py`）、证据聚类边界（`test_clusters.py`）、单级审核与按线索审核（`test_review_workflow.py`）、证据编号与详情（`test_evidence_code.py`）、结构指纹与错字一致性（`test_structure.py`）、经验模板库（`test_template_library.py`）、跨任务对比（`test_task_diff.py`）、QA 报告（`prd_kimi_test.md`）缺陷回归（`test_qa_1117_regressions.py`）：退出登录令牌吊销、重复分析只看最新任务、千分位/表格合计行报价识别（含「分项在合计之前」的布局）、合计候选矛盾时标记待确认、统一社会信用代码校验位、封面字段雷同降级、关键岗位范围参数生效、取整尾数不报异常、招标正文变化后旧任务标记基准过期、报价清单展示自动识别金额；第三轮 QA 回归（`test_qa_test3_regressions.py`）；项目权限（`test_project_access.py`）、价格矩阵（`test_price_matrix.py`）、单家价格文件（`test_company_price_file.py`）、模板命中计数（`test_template_hits_regression.py`）。
 
 ---
 
@@ -181,7 +182,7 @@ GET  /api/v1/projects/{project_id}/events?ticket=<scoped_ticket>
 | 一级菜单 | 路由 | 内容 |
 | --- | --- | --- |
 | 工作台 | `#/workbench` | 全局统计卡片（可点击跳转）、待办事项、最近项目、最近分析任务、风险统计（PRD §4.1） |
-| 项目管理 | `#/projects` | 项目列表、创建/编辑/归档，进入项目后有 10 个子页（见下），含审核页与权限管理 |
+| 项目管理 | `#/projects` | 项目列表、创建/编辑/归档，进入项目后有 9 个子页（见下），含权限管理 |
 | 系统配置 | `#/settings` | 检测规则版本与参数、OCR 识别配置（PRD §4.13.3） |
 | 审计日志 | `#/audit` | 全量操作留痕与筛选（PRD §4.13.4） |
 | 用户管理 | `#/users` | 账号（用户名/工号/邮箱）、角色、启用状态与密码重置（PRD §4.13.1） |
@@ -203,20 +204,20 @@ GET  /api/v1/projects/{project_id}/events?ticket=<scoped_ticket>
 - **三种权限**（逐级包含）：
   | 级别 | 能力 |
   | --- | --- |
-  | 查看 `viewer` | 查看项目全部内容（含审核列表），不能审核、不能改动 |
-  | 审批 `reviewer` | 查看 + 审核/分派证据 |
+  | 查看 `viewer` | 查看项目全部内容，不能审核、不能改动 |
+  | 审批 `reviewer` | 查看 + 审核证据、按线索审核 |
   | 管理 `manager` | 审批 + 改项目、管企业/文件/报价、发起分析、继续分享 |
-- **防越权**：不能授予高于自己的级别；创建者不可被移除或降级；批量审核/分派会逐条校验所属项目，任一越权即整体拒绝，伪造证据 id 直接 404。
+- **防越权**：不能授予高于自己的级别；创建者不可被移除或降级；按线索审核会逐条校验所属项目，任一越权即整体拒绝，伪造证据 id 直接 404。
 - **演示数据**：内置演示项目归初始管理员所有；历史无归属的项目按「仅管理员可见」处理。
 
-### 5.2 项目审核页（PRD §4.11，路由 `?tab=review`）
+### 5.2 证据审核（并入「比对分析」与「比对结果」）
 
-- 证据列表字段：证据编号、分析任务编号、证据类型、涉及企业、风险等级、发现时间、审核状态、审核人、分派给、操作。
-- 筛选：企业 / 证据类型 / 风险等级 / 审核状态 / 审核人员 / 审核流程 / 分派给 / 发现时间区间 / 仅最新任务或含历史任务。
-- 证据编号按 PRD §5.7 计算：`项目编号-任务编号-证据类型-序号`，例 `DEMO-2026-001-T03-TEXT-0001`。序号在同一 (任务, 类型) 内跨历史行一起编号，重跑后编号不漂移。
-- 详情弹窗展示证据基本信息、相关文件与原始页码、涉及企业、分派人、历史审核记录，并直接给出审核表单；需要对照原文时点行内「三栏原文」。
-- 与「比对分析」的分工：比对分析按**企业组合**组织，适合逐对深看原文；审核页按**证据**组织，一个页面看全项目待审条目，并支持分派、批量标记与导出。
-- **批量操作仅允许「批量标记为待进一步核查」**；批量确认 / 批量排除按 PRD §4.11.5 明确禁用并给出提示。
+- 原先的项目内「审核」页签已删除，审核动作收敛到两个页面，避免两套审核入口：
+  - **比对分析**：按企业组合深看原文，逐条审核或按线索批量审核（三栏右栏给出审核表单与历史记录）。
+  - **比对结果**：「重点异常证据」列出风险最高的条目；「项目级证据」列出所有无企业组合的证据（价格/报价质量项），点「查看详情与审核」弹窗直接审核。
+- 证据编号按 PRD §5.7 计算：`项目编号-任务编号-证据类型-序号`，例 `DEMO-2026-001-T03-TEXT-0001`。序号在同一 (任务, 类型) 内跨历史行一起编号，重跑后编号不漂移；详情弹窗与 Excel 报告使用同一套编号。
+- 审核为**单级**：一次审核即结论，可随时撤回（追加一条「改回待审核」记录，历史保留）；「确认异常线索」必须填写审核说明并二次确认。审核记录只追加，不覆盖历史。
+- 批量分派审核人与批量标记已随审核页一并删除，审核按条或按线索进行。
 
 ### 5.3 系统配置 / 审计日志 / 用户管理（PRD §4.13）
 
@@ -225,7 +226,7 @@ GET  /api/v1/projects/{project_id}/events?ticket=<scoped_ticket>
 - **审计日志**（`#/audit`）：记录登录退出、项目增删改归档、文件上传下载替换删除、启动分析、重试任务、修改检测规则、审核证据、导出报告。操作结果 / 操作来源 / 变更前后信息写在 `audit_log.payload` JSON 中（不改表结构）。
 - **用户管理**（`#/users`）：新增 / 编辑 / 禁用 / 重置密码 / 分配角色。系统至少保留一个启用的管理员账号，管理员不能禁用自己，也不能把最后一个管理员降级。
 - **账号身份**：每个账号有用户名、工号、邮箱三项。**登录只认工号或邮箱**（邮箱不区分大小写）；用户名仅作展示，**允许重复**（同名同事）。工号与邮箱**至少填一项**、各自唯一且互不重复；用户管理页可以修改这三项，清空后仍需满足「至少一项」。
-- **角色只有两种**：管理员（可进入系统配置 / 审计日志 / 用户管理）与用户（只做业务）。原先「项目分析人员 / 风险审核人员」的区分已取消，审核权限不再由角色决定，而是按证据逐一审核/分派。
+- **角色只有两种**：管理员（可进入系统配置 / 审计日志 / 用户管理）与用户（只做业务）。原先「项目分析人员 / 风险审核人员」的区分已取消，审核权限不再由角色决定，而是按证据逐一审核。
 - **自助修改密码**：侧边栏账户区的盾牌按钮可改自己的密码（需原密码）。改密后令牌版本号递增，旧会话立即失效。仍使用部署初始口令的账号登录后会被强制引导改密。
 - **项目彻底删除**：删除项目默认是软删除（原始资料保留，便于恢复）；勾选「同时彻底删除全部资料」并输入项目名称确认后，磁盘文件、解析文本、分析任务、证据与审核记录、报价、项目级模板片段一并物理删除，审计日志保留删除动作本身。
 
@@ -275,7 +276,7 @@ PDF 康熙部首/兼容汉字折叠（人员、报价、事实、逐项单价均
 
 ### 5.5 项目内子页面
 
-进入项目后有 10 个子页面（Tab），其中「审核」按项目权限显示、「权限管理」仅管理者可见：
+进入项目后有 9 个子页面（Tab），其中「权限管理」仅管理者可见：
 
 | 子页面 | 内容 |
 | --- | --- |
@@ -283,9 +284,8 @@ PDF 康熙部首/兼容汉字折叠（人员、报价、事实、逐项单价均
 | 文件管理 | 招标文件（招标说明）与按公司管理的投标文件，支持排序、替换、重新解析；每家企业还可单独上传**价格 Excel**（总价 + 清单分项） |
 | 解析中心 | 招标说明与投标文件的解析进展、失败原因、重试 |
 | 分析任务 | 项目内企业两两比对的进展状态：任务列表、维度实时进度、执行日志；文件解析完成后自动开始，无需人工勾选范围 |
-| 比对分析 | **选取任意两家企业**查看三栏对比：左侧企业A原文、中间企业B原文、右侧证据列表与详情 |
-| 审核 | **按证据**列出本项目全部待审条目：筛选、逐条审核、分派、批量标记、导出；需看原文时跳转三栏 |
-| 比对结果 | 全部企业组合的统计概览：各维度证据数、风险等级分布、企业组合矩阵、**与上次分析对比** |
+| 比对分析 | **选取任意两家企业**查看三栏对比：左侧企业A原文、中间企业B原文、右侧证据列表与详情（含逐条审核与按线索审核） |
+| 比对结果 | 全部企业组合的统计概览：各维度证据数、风险等级分布、企业组合矩阵、**与上次分析对比**、重点异常证据与**项目级证据**（逐条弹窗审核） |
 | 价格比对 | **总价一览 + 逐项单价矩阵**：企业为列、清单项为行，单元格按「与其他企业相同 / 接近 / 偏离同项中位价 / 同行价 / 仅此一家」着色，悬浮显示同行价与原文位置 |
 | 分析报告 | 导出整体统计报告（Excel，含文件取证与逐项单价表） |
 | 权限管理 | 查看当前成员与权限，按工号/邮箱分享项目、调整级别、移除成员；仅管理者可见 |
@@ -315,9 +315,8 @@ PDF 康熙部首/兼容汉字折叠（人员、报价、事实、逐项单价均
 - 支持「整条线索确认 / 排除」，一次性覆盖全部成员，每条成员仍各留一条审核记录；
 - `cluster_id` 由「企业组合 + 字典序最小的块对」派生，重跑后仍可复现。
 
-### 审核分派与结论
+### 审核结论
 
-- **分派**：风险清单支持勾选后分派给分析员/审核人，可按「分派给」筛选；可分派名单只需登录即可获取（不暴露账号敏感信息）。
 - **单级审核**：一次审核即结论，没有二审。任何有「审批」权限的人都可以给出或改判结论，改判同样是追加一条审核记录，历史不覆盖。
 - **待办口径**：工作台与项目待办按 `review_status` 统计（待审核），已给出结论的证据不再进入待办。
 
@@ -415,9 +414,8 @@ Bid_Inspection/
 | --- | --- |
 | 工作台：全局统计 / 待办 / 最近项目任务 / 风险统计 | `api/routes/workbench.py`、`services/workbench_service.py` |
 | 跨项目待办清单（规则唯一真源） | `services/project_service.py#collect_todos` |
-| 项目审核页：证据清单 / 筛选 / 分页 / 详情 | `api/routes/risks.py`、`services/risk_service.py` |
-| 证据编号（PRD §5.7） | `services/risk_service.py#evidence_code` |
-| 批量审核（仅允许「待进一步核查」） | `services/risk_service.py#batch_review` |
+| 证据编号（PRD §5.7） | `services/results_service.py#evidence_code` |
+| 按线索审核 | `services/results_service.py#review_cluster`、`api/routes/results.py` |
 | 系统配置：检测规则版本管理 / 生效确认 | `services/rule_service.py`、`api/routes/system.py` |
 | 规则版本真正作用于检测引擎 | `analysis/thresholds.py` + 各分析函数的 `thresholds` 参数 |
 | 审计日志查询（管理员） | `services/system_service.py#list_logs`、`api/routes/system.py` |
@@ -449,7 +447,7 @@ Bid_Inspection/
 - **BR-22** 审核是单级的：一次审核即结论，不要求第二位审核人复核。
 - **BR-23** 证据聚类只在同一企业组合内进行，`cluster_id` 由块对派生，重跑可复现。
 - **BR-24** 项目默认只对创建者与系统管理员可见；不可见的项目在列表里不出现、直连详情返回 404（与「不存在」一致，避免探测）。
-- **BR-25** 项目分享只能授予不高于自己的级别；创建者不可被移除或降级；批量审核/分派逐条校验所属项目，任一越权整体拒绝。
+- **BR-25** 项目分享只能授予不高于自己的级别；创建者不可被移除或降级；按线索审核逐条校验所属项目，任一越权整体拒绝。
 
 ### 7.4 核心数据模型
 
@@ -481,14 +479,15 @@ template_fragment           # 经验模板库：审核人确认的行业范本�
 project_member              # 项目授权：user × project → viewer/reviewer/manager
 ```
 
-`comparison_evidence` 新增列：`cluster_id/cluster_size/cluster_index/cluster_lead_id`（线索）、
-`assignee_id/assigned_at`（分派）。
+`comparison_evidence` 新增线索列 `cluster_id/cluster_size/cluster_index/cluster_lead_id`；
+分派列 `assignee_id/assigned_at` 已随审核页删除（迁移 `0009`）。
 `analysis_task.template_snapshot` 固化任务使用的模板片段 id。
 `app_user` 的身份字段为 `username`（可重复，仅展示）/ `employee_no`（唯一，可空）/ `email`（唯一、小写，可空），登录只认后两项。
 `project` 记录 `created_by`（创建者即项目管理者），`project.deleted_at` 为软删除标记。
 表结构由 Alembic 管理（`backend/alembic/`），当前版本链为
 `0001_baseline` → `0002_features` → `0003_token_revocation` → `0004_credit_code_type` →
-`0005_price_item` → `0006_user_identity` → `0007_project_member` → `0008_drop_second_review`。
+`0005_price_item` → `0006_user_identity` → `0007_project_member` → `0008_drop_second_review` →
+`0009_drop_evidence_assignment`。
 
 ---
 
@@ -500,7 +499,7 @@ project_member              # 项目授权：user × project → viewer/reviewer
 | --- | --- |
 | 认证 | `POST /auth/login`、`POST /auth/logout`、`GET /auth/me`、`POST /auth/change-password`（自助改密，需原密码） |
 | 工作台 | `GET /workbench` |
-| 风险 | `GET /risks`（支持 `assignee_id` / `review_queue` / `cluster_lead_only`）、`GET /risks/filters`、`GET /risks/{id}`、`POST /risks/batch-review`、`POST /risks/batch-assign`、`POST /risks/cluster-review` |
+| 审核 | `POST /evidences/cluster-review`（按线索审核）、`POST /evidences/{id}/review` |
 | 报价 | `GET /projects/{id}/quotes`、`GET /projects/{id}/quotes/template`、`POST /projects/{id}/quotes/import?dry_run=`、`PUT /companies/{id}/quote`、`DELETE /companies/{id}/quote` |
 | 价格矩阵 | `GET /projects/{id}/price-matrix`（总价一览 + 逐项单价矩阵，无分析任务时只用价格 Excel） |
 | 价格文件 | `POST /companies/{id}/price-file?dry_run=`（单家企业价格 Excel：总价 + 清单分项） |
@@ -512,7 +511,7 @@ project_member              # 项目授权：user × project → viewer/reviewer
 | 实时 | `POST /projects/{id}/events/ticket`、`GET /projects/{id}/events?ticket=`（SSE，见 §4） |
 | 分析 | `GET /projects/{id}/analysis/prepare`、`POST /projects/{id}/analysis/tasks`、`GET /projects/{id}/tasks`、`GET /tasks/{id}`、`POST /tasks/{id}/cancel`、`POST /tasks/{id}/pairs/{pairId}/retry` |
 | 结果 | `GET /projects/{id}/results/overview`、`GET /pairs/{id}`、`GET /pairs/{id}/evidences`（证据 + 默认上下文，分页）、`GET /evidences/{id}`、`GET /evidences/{id}/context`（按需扩展上下文） |
-| 审核 | `POST /evidences/{id}/review`（支持 `learn_as_template`）、`GET /projects/{id}/reviews` |
+| 审核 | `POST /evidences/{id}/review`（支持 `learn_as_template`）、`GET /evidences/{id}`（`include_code=true` 附带证据编号） |
 | 对比 | `GET /projects/{id}/tasks/{task_id}/diff?against=` |
 | 报告 | `GET /projects/{id}/reports/excel`、`GET /pairs/{id}/reports/excel`（单组合证据导出） |
 
@@ -681,11 +680,11 @@ rsid 均在解析时一次性抽取（`services/document_metadata.py`、`service
 4. **DOCX 页码**：DOCX 当前按单页组织提取文本，分页与印刷页码不精确；投标文件建议以 PDF 提交。
 5. ~~**OCR**~~：已接入百度智能云 OCR 并跑通（含按页拆分与体积压缩），见 §9.8。仍缺的是：只处理「无文本层的扫描页」，图片型表格的结构还原（行列关系）依赖 OCR 返回的位置信息，尚未做表格重建。
 6. **任务恢复**：Celery 任务失败可重试，但容器重启时运行中任务不会自动恢复；当前由任务日志和“重跑任务”兜底。
-7. ~~**项目级数据权限**~~：已实现，见 §5.1.1「项目权限」。项目默认只有创建者与系统管理员可见，可按工号/邮箱分享为查看 / 审批 / 管理三级；`/workbench` 与 `/risks` 也只统计当前用户可见的项目。
+7. ~~**项目级数据权限**~~：已实现，见 §5.1.1「项目权限」。项目默认只有创建者与系统管理员可见，可按工号/邮箱分享为查看 / 审批 / 管理三级；`/workbench` 与项目列表也只统计当前用户可见的项目。
 8. **大数据量性能**：企业/文件/文本块查询为基础实现；20 家企业 × 大文本时建议对文本块加倒排索引与分批任务。
 9. **分项报价**：已支持人工导入 / 补录投标总报价，并有逐项单价雷同识别；**工程量清单的结构化导入**（多行分项 + 合计校验）尚未实现。
 10. **PDF 报告**：PRD 中列为可后置，本版本只实现 Excel 导出（含逐项单价对比表）。
-11. ~~批量分配审核人员~~：已实现证据级分派（`POST /risks/batch-assign`）与按指派人筛选。
+11. ~~批量分配审核人员~~：已随审核页删除（不支持证据级分派）。
 12. **规则参数覆盖度**：~~大小写金额一致性~~ 已接入（`amount_case_mismatch`，质量项）；`special_tail` / `tail_concentration_min_count` / `price_line_item_min_*` 均已真正生效；人员维度的关键岗位范围（`key_positions`）自 2026-11-17 起也已接入检测引擎（非空时只比对命中岗位的人员）。
 13. **报告导出待办的初值**：工作台的「报告尚未导出」依赖新增的 `report.export` 审计记录，历史导出无该记录的项目会多显示一次此待办，导出一次后即消失。
 14. **语义相似（embedding）**：当前仍是字面 + 结构 + 事实三层；同义改写只能靠结构指纹与错字一致部分覆盖。接入向量召回时必须保留原文偏移回填，否则三栏高亮与报告定位会失效。

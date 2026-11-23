@@ -32,3 +32,12 @@ class ReviewRequest(BaseModel):
     # 「排除并记为模板」：当前结论是 excluded 时生效
     learn_as_template: bool = False
     template_scope: str = Field(default="project", pattern="^(project|global)$")
+
+
+class ClusterReviewRequest(BaseModel):
+    """按线索审核：一次操作覆盖同一线索下的全部证据。"""
+
+    evidence_ids: list[str] = Field(min_length=1)
+    status: str = Field(pattern="^(confirmed|excluded|undecided)$")
+    comment: str | None = Field(default=None, max_length=1000)
+    skip_reviewed: bool = Field(default=True)

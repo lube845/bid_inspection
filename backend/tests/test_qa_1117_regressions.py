@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from app.analysis.price import Quote, analyze_prices, extract_quote
 from app.analysis.sources import BlockRef
 from app.models import AnalysisTask, Company, ComparisonEvidence, Project
-from app.services import company_service, risk_service
+from app.services import company_service, task_scope
 from app.services.company_service import CompanyError
 from app.utils.credit_code import credit_code_error
 
@@ -243,15 +243,12 @@ def test_risk_list_only_shows_latest_task_evidence(db):
     )
     db.add(second)
     db.commit()
-    latest = _evidence(db, project, second)
+    _evidence(db, project, second)
 
-    result = risk_service.list_risks(db, project_id=project.id)
-    assert result["total"] == 1
-    assert result["items"][0]["id"] == latest.id
-
-    # 显式查看历史时才包含旧任务证据
-    history = risk_service.list_risks(db, project_id=project.id, include_history=True)
-    assert history["total"] == 2
+    # 「当前待办 / 当前风险」口径：每个项目只取最新任务的证据，
+    # 重复分析不会让同一处雷同以多个任务版本反复进入待办。
+    assert task_scope.latest_task_id(db, project.id) == second.id
+    assert task_scope.latest_task_ids(db, [project.id]) == {project.id: second.id}
 
 
 def test_tender_content_change_marks_task_stale(db):

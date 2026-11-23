@@ -234,7 +234,7 @@ def collect_todos(db: Session, project: Project, ctx: dict | None = None) -> lis
     | parse_partial     | 部分解析成功   | 有有效投标文件部分成功                                      | ?tab=parse    |
     | confirm_scope     | 未确认分析范围 | ≥2 家企业文件已可用但未确认，且没有运行中的分析任务          | ?tab=files    |
     | analysis_failed   | 分析任务失败   | 最近一个分析任务失败                                        | ?tab=task     |
-    | pending_review    | 证据待审核     | 项目内存在待审核证据                                        | ?tab=review   |
+    | pending_review    | 证据待审核     | 项目内存在待审核证据                                        | ?tab=results  |
     | report_not_exported | 报告未导出   | 有已完成任务但没有导出过报告                                | ?tab=report   |
     """
     if ctx is None:
@@ -326,9 +326,9 @@ def collect_todos(db: Session, project: Project, ctx: dict | None = None) -> lis
             "pending_review",
             "证据待审核",
             f"{pending_review} 条异常证据待审核",
-            "请到项目内的「审核」页集中处理",
+            "请到项目内的「比对结果」页集中审核",
             "medium",
-            f"#/projects/{project.id}?tab=review&review_queue=pending",
+            f"#/projects/{project.id}?tab=results",
             created_at=ctx.get("pending_review_at"),
         )
 

@@ -1,6 +1,4 @@
-from datetime import datetime
-
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -49,10 +47,6 @@ class ComparisonEvidence(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     cluster_lead_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # exact_chunk_pair | adjacent_continuation
     cluster_rule: Mapped[str] = mapped_column(String(32), nullable=False, default="")
-
-    # ---- 审核分派 ----
-    assignee_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     pair = relationship("ComparisonPair", back_populates="evidences")
     participants = relationship(

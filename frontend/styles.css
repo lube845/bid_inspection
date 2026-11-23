@@ -399,7 +399,6 @@ button { cursor: pointer; }
 .grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .grid.cols-auto { grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); }
 .nowrap { white-space: nowrap; }
-.risk-companies { min-width: 220px; }
 
 /* ---------- 按钮 ---------- */
 .btn {
@@ -542,19 +541,6 @@ label.small textarea { width: 100%; margin-top: 6px; }
 .filter-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 
 /* 多条件筛选：用固定列宽的网格，保证第二行与第一行严格对齐 */
-.filter-bar--risk {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  align-items: end;
-}
-.filter-bar--risk .filter-field--wide,
-.filter-bar--risk .filter-field--select,
-.filter-bar--risk .filter-field--date { min-width: 0; }
-.filter-bar--risk .filter-field--date { grid-column: span 1; }
-.filter-bar--risk .filter-actions { grid-column: span 1; margin-left: 0; }
-.filter-bar--risk .filter-actions .btn,
-.filter-bar--logs .filter-actions .btn { flex: 1 1 0; }
-
 .filter-bar--logs {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -564,16 +550,14 @@ label.small textarea { width: 100%; margin-top: 6px; }
 .filter-bar--logs .filter-field--date { min-width: 0; }
 .filter-bar--logs .filter-field--date { grid-column: span 1; }
 .filter-bar--logs .filter-actions { grid-column: span 1; margin-left: 0; }
+.filter-bar--logs .filter-actions .btn { flex: 1 1 0; }
 
 @media (max-width: 1180px) {
-  .filter-bar--risk { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .filter-bar--risk .filter-actions { grid-column: span 1; }
   .filter-bar--logs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 720px) {
   .filter-bar,
-  .filter-bar--risk,
   .filter-bar--logs { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
   .filter-field--search,
   .filter-field--select,

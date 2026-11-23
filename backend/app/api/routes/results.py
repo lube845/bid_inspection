@@ -3,12 +3,13 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_project
 from app.db.session import get_db
 from app.models import AnalysisTask, ComparisonEvidence, ComparisonPair, Project, User
-from app.schemas.analysis import ReviewRequest
+from app.schemas.analysis import ClusterReviewRequest, ReviewRequest
 from app.services import access_service, audit, results_service, template_service
 
 router = APIRouter(tags=["results"])
@@ -40,6 +41,28 @@ def _get_task_project(
     if not task:
         raise HTTPException(404, "分析任务不存在")
     return get_project(db, task.project_id, user, role)
+
+
+def _guard_batch(db: Session, evidence_ids: list[str], user: User) -> None:
+    """按线索审核等批量操作逐条校验所属项目权限。
+
+    两条规则都必要：
+    - 不存在的证据直接 404——否则传一批伪造 id 就能绕过校验；
+    - 只要有一条越权就整体拒绝，不做「部分成功」，避免用户以为全都生效。
+    """
+    wanted = list(dict.fromkeys(evidence_ids))
+    found = dict(
+        db.execute(
+            select(ComparisonEvidence.id, ComparisonEvidence.project_id).where(
+                ComparisonEvidence.id.in_(wanted)
+            )
+        ).all()
+    ) if wanted else {}
+    missing = [item for item in wanted if item not in found]
+    if missing:
+        raise HTTPException(404, f"证据不存在：{missing[0]}")
+    for project_id in set(found.values()):
+        get_project(db, project_id, user, access_service.REVIEW)
 
 
 @router.get("/projects/{project_id}/results/overview")
@@ -120,11 +143,12 @@ def pair_evidences(
 @router.get("/evidences/{evidence_id}")
 def evidence_detail(
     evidence_id: str,
+    include_code: bool = Query(default=False, description="是否附带全系统一致的证据编号"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
     evidence = _get_evidence(db, evidence_id, user)
-    return results_service.evidence_detail(db, evidence)
+    return results_service.evidence_detail(db, evidence, include_code=include_code)
 
 
 @router.get("/evidences/{evidence_id}/context")
@@ -179,31 +203,27 @@ def review_evidence(
     return results_service.evidence_detail(db, evidence)
 
 
-@router.get("/projects/{project_id}/reviews")
-def review_center(
-    project_id: str,
-    evidence_type: str | None = None,
-    severity: str | None = None,
-    review_status: str | None = None,
-    company_id: str | None = None,
-    task_id: str | None = None,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=200),
+@router.post("/evidences/cluster-review")
+def cluster_review(
+    payload: ClusterReviewRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    project = get_project(db, project_id, user)
-    return results_service.list_reviews(
-        db,
-        project.id,
-        evidence_type=evidence_type,
-        severity=severity,
-        review_status=review_status,
-        company_id=company_id,
-        task_id=task_id,
-        page=page,
-        page_size=page_size,
-    )
+    """按线索审核：一次操作覆盖整条线索的证据（比对分析页使用）。"""
+    _guard_batch(db, payload.evidence_ids, user)
+    try:
+        result = results_service.review_cluster(
+            db,
+            payload.evidence_ids,
+            payload.status,
+            payload.comment,
+            user,
+            skip_reviewed=payload.skip_reviewed,
+        )
+    except results_service.ReviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    return result
 
 
 @router.get("/pairs/{pair_id}/reports/excel")

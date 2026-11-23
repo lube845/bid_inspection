@@ -56,22 +56,6 @@ const RULE_DIM = { text: "文本相似", personnel: "人员重复", price: "价�
 let pollTimer = null;
 let eventSource = null;
 let projectListState = { q: "", status: "", include_archived: false };
-// 审核页已收进项目内（?tab=review），筛选状态不再跨项目保留：
-// 每次进入项目都把 project_id 钉死，避免带着上一个项目的筛选串味。
-let riskListState = {
-  include_history: "",
-  project_id: "", company_id: "", evidence_type: "", severity: "",
-  review_status: "", reviewer_id: "", assignee_id: "", review_queue: "",
-  date_from: "", date_to: "", page: 1, page_size: 20,
-};
-function resetRiskListState(projectId) {
-  riskListState = {
-    include_history: "",
-    project_id: projectId || "", company_id: "", evidence_type: "", severity: "",
-    review_status: "", reviewer_id: "", assignee_id: "", review_queue: "",
-    date_from: "", date_to: "", page: 1, page_size: 20,
-  };
-}
 let logFilterState = { action: "", result: "", source: "", actor_id: "", date_from: "", date_to: "", page: 1, page_size: 50 };
 let selectedCompanyByProject = {};
 
@@ -479,18 +463,12 @@ async function route() {
       setNav("workbench");
       await renderWorkbench();
     } else if (path === "/risks") {
-      /* 旧的一级菜单「风险管理 / 审核队列」已收进项目内：
-         带 project_id 的旧链接直接转到该项目的审核页，否则回项目列表。 */
+      /* 旧的「风险管理 / 审核队列」入口已删除：审核改在项目内完成。
+         带 project_id 的旧链接转到该项目的比对结果页，否则回项目列表。 */
       const legacyProject = params.get("project_id");
       setNav("projects");
       if (legacyProject) {
-        const search = new URLSearchParams();
-        search.set("tab", "review");
-        const queue = params.get("review_queue");
-        if (queue) search.set("review_queue", queue);
-        const status = params.get("review_status");
-        if (status) search.set("review_status", status);
-        location.replace(`#/projects/${legacyProject}?${search.toString()}`);
+        location.replace(`#/projects/${legacyProject}?tab=results`);
       } else {
         location.replace("#/projects");
       }
@@ -519,15 +497,14 @@ async function route() {
     } else if ((match = path.match(/^\/projects\/([^/]+)$/))) {
       const tab = params.get("tab") || "overview";
       setNav("projects");
-      /* 「审核」是项目内的独立标签页（原为系统级风险管理/审核队列） */
-      let target = tab;
       /* 分析任务与启动已独立成「分析任务」标签页，旧的 ?tab=analysis&task= 链接自动转到分析任务 */
+      let target = tab;
       if (target === "analysis" && params.get("task")) target = "task";
+      /* 项目内「审核」页已删除：旧链接统一落到比对结果页 */
+      if (target === "review") target = "results";
       await renderProject(match[1], target, {
         pairId: params.get("pair"),
         evidenceId: params.get("evidence"),
-        reviewQueue: params.get("review_queue"),
-        reviewStatus: params.get("review_status"),
       });
     } else {
       main.innerHTML = errorPageHtml("页面不存在。");
@@ -813,8 +790,8 @@ const PROJECT_ROLE = { viewer: "查看", reviewer: "审批", manager: "管理" }
 /* 当前项目是否可写：查看者只能浏览，页面上所有写操作按钮都要隐藏 */
 const canEditProject = () => state.projectRole === "manager";
 const PROJECT_ROLE_HINT = {
-  viewer: "查看：看项目全部内容（含比对结果、价格比对、审核列表、导出报告），不能审核、不能改任何资料",
-  reviewer: "审批：在「查看」基础上，可审核证据、按线索审核、批量标记与分派",
+  viewer: "查看：看项目全部内容（含比对结果、价格比对、导出报告），不能审核、不能改任何资料",
+  reviewer: "审批：在「查看」基础上，可审核证据、按线索审核",
   manager: "管理：在「审批」基础上，可改项目设置、增删企业、上传/解析/删除文件、导入报价、发起分析、分享给他人",
 };
 
@@ -864,7 +841,7 @@ async function renderProjectPermissions(container, project, perms) {
         权限逐级包含（管理 ⊃ 审批 ⊃ 查看），且不能授予高于自己的级别。
         <ul class="small" style="margin:8px 0 0;padding-left:18px">
           <li><strong>查看</strong>：看项目全部内容与导出，不能审核或改动</li>
-          <li><strong>审批</strong>：查看 + 审核证据、按线索审核、批量标记与分派</li>
+          <li><strong>审批</strong>：查看 + 审核证据、按线索审核</li>
           <li><strong>管理</strong>：审批 + 改项目设置、管企业与文件、导入报价、发起分析、继续分享</li>
         </ul>
       </div>
@@ -983,18 +960,16 @@ async function renderProject(projectId, tab, options = {}) {
   state.lastProjectId = projectId;
   localStorage.setItem("bid_last_project", projectId);
   const project = await api(`/projects/${projectId}`);
-  /* 权限决定页签与按钮：查看者只能看，审批者多一个审核页，管理者才有全部页签 */
+  /* 权限决定页签与按钮：管理者才有权限管理页，其余页签所有人可见 */
   const perms = await api(`/projects/${projectId}/permissions`).catch(() => null);
   state.projectRole = perms?.my_role || null;
-  const canReview = Boolean(perms?.can_review);
   const canManage = Boolean(perms?.can_manage);
   const tabs = [
     ["overview", "项目概览"], ["files", "文件管理"], ["parse", "解析中心"],
-    ["task", "分析任务"], ["analysis", "比对分析"], ["review", "审核"],
+    ["task", "分析任务"], ["analysis", "比对分析"],
     ["results", "比对结果"], ["price-matrix", "价格比对"],
     ["report", "分析报告"], ["permissions", "权限管理"],
   ].filter(([key]) => {
-    if (key === "review") return canReview;
     /* 管理类页签（文件/解析/任务/报价）对查看者仍然可见，只是写操作会 403；
        这里只隐藏纯管理入口，避免查看者一进页面就点到一堆报错 */
     if (key === "permissions") return canManage;
@@ -1045,14 +1020,6 @@ async function renderProject(projectId, tab, options = {}) {
   else if (tab === "parse") await renderParseCenter(content, project);
   else if (tab === "task") await renderTaskPage(content, project);
   else if (tab === "analysis") await renderCompare(content, project, { pairId: options.pairId, evidenceId: options.evidenceId });
-  else if (tab === "review") {
-    /* 每次进入审核页都从干净筛选开始，避免带到下一个项目；
-       页面内的重渲染（rerender）不经过这里，所以筛选不会被清掉。 */
-    resetRiskListState(project.id);
-    if (options.reviewQueue) riskListState.review_queue = options.reviewQueue;
-    if (options.reviewStatus) riskListState.review_status = options.reviewStatus;
-    await renderProjectReview(content, project);
-  }
   else if (tab === "results") await renderResults(content, project);
   else if (tab === "price-matrix") await renderPriceMatrix(content, project);
   else if (tab === "report") await renderReport(content, project);
@@ -1133,8 +1100,8 @@ async function renderOverview(container, project) {
         "clock",
         num(stats.pending_review_count) ? "high" : "",
         stats.pending_review_count == null ? "暂无分析结果" : "与结果页同口径（最新任务）",
-        /* 直接进本项目的审核页（项目内 tab），不经由全局页面 */
-        num(stats.pending_review_count) ? `#/projects/${project.id}?tab=review&review_queue=pending` : ""
+        /* 进本项目的比对结果页，在「重点异常证据」与「项目级证据」里逐条审核 */
+        num(stats.pending_review_count) ? `#/projects/${project.id}?tab=results` : ""
       )}
     </div>
     <div class="next-step">
@@ -2247,12 +2214,35 @@ async function renderResults(container, project) {
     <div class="card">
       <div class="row" style="justify-content:space-between"><h2 style="margin:0">重点异常证据</h2><span class="small muted">待审核 ${stats.pending_review_count} 条</span></div>
       <div class="evidence-list" style="margin-top:10px">${top}</div>
-    </div>`;
+    </div>
+    ${projectLevelCard(project, data.project_level_evidences)}`;
 
   $("#task-diff-open")?.addEventListener("click", () => openTaskDiff(project, data.task.id));
   $$("[data-evidence-detail]", container).forEach((button) => button.addEventListener("click", () => {
     openRiskDetail(button.dataset.evidenceDetail, () => renderResults(container, project));
   }));
+}
+
+/* 项目级证据（无企业组合，如价格/报价质量项）：不会出现在任何一个企业组合的
+   三栏视图中，因此在这里给出完整清单，保证每条证据都有审核入口。 */
+function projectLevelCard(project, evidences) {
+  const items = evidences || [];
+  if (!items.length) return "";
+  const rows = items.map((evidence) => `
+    <div class="evidence-item">
+      <div class="row"><span class="pill ${esc(evidence.severity)}">${RISK[evidence.severity] || "无"}</span>
+        <span class="small muted mono">${esc(evidence.evidence_code || "")}</span>
+        <span class="small muted">${TYPE[evidence.evidence_type] || evidence.evidence_type} · ${esc((evidence.companies || []).join("、") || "项目级")}</span>
+        <span class="spacer"></span><span class="pill">${REVIEW[evidence.review_status] || evidence.review_status}</span></div>
+      <div class="summary">${esc(evidence.summary)}</div>
+      <div class="meta"><button type="button" class="link-btn" data-evidence-detail="${esc(evidence.id)}">${evidence.review_status === "pending" ? "查看详情与审核" : "查看详情"} →</button></div>
+    </div>`).join("");
+  return `
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2 style="margin:0">项目级证据</h2><span class="small muted">${num(items.length)} 条 · 无企业组合，只能在此审核</span></div>
+      <div class="small muted" style="margin-top:4px">价格异常与报价质量项针对单家企业或整批报价，不属于任何企业组合，因此单独列出。</div>
+      <div class="evidence-list" style="margin-top:10px">${rows}</div>
+    </div>`;
 }
 
 /* 与上次分析对比：输入变化 / 证据增减 / 风险变化 / 上次已排除本次重现 */
@@ -3305,7 +3295,7 @@ function bindClusterReview(root, evidence, view) {
     if (!ok) return;
     await withBusy(button, async () => {
       try {
-        const result = await api("/risks/cluster-review", {
+        const result = await api("/evidences/cluster-review", {
           method: "POST",
           body: { evidence_ids: ids, status, comment: comment || null, skip_reviewed: false },
         });
@@ -3409,7 +3399,7 @@ function bindReviewForm(root, evidence, refresh) {
 }
 
 /* ---------- 工作台（PRD 4.1） ---------- */
-/* 审核队列已收进项目内：工作台的证据类指标都落到「审核进度」卡片，
+/* 审核入口在项目内（比对结果页）：工作台的证据类指标落到「审核进度」卡片，
    该卡片里按项目列出待审条数，点进哪个项目就审哪个项目的。 */
 const WORKBENCH_STAT_LINKS = {
   project_total: "#/projects",
@@ -3436,7 +3426,7 @@ async function renderWorkbench() {
       <td><a class="btn small" href="${esc(todo.link)}">去处理</a></td>
     </tr>`).join("");
 
-  /* 审核入口已收进项目内：取待审最多的项目作为「去处理」的落点 */
+  /* 审核入口在项目内（比对结果页）：取待审最多的项目作为「去处理」的落点 */
   const firstPendingProject = (data.recent_projects || [])
     .filter((project) => num(project.pending_review_count) > 0)
     .sort((a, b) => num(b.pending_review_count) - num(a.pending_review_count))[0] || null;
@@ -3449,7 +3439,7 @@ async function renderWorkbench() {
       <td class="col-secondary">${num(project.company_count)}</td>
       <td class="col-secondary">${fmtDate(project.last_analysis_at)}</td>
       <td>${num(project.pending_review_count)
-        ? `<a href="#/projects/${esc(project.id)}?tab=review&review_queue=pending" title="打开本项目的审核页">${num(project.pending_review_count)}</a>`
+        ? `<a href="#/projects/${esc(project.id)}?tab=results" title="打开本项目的比对结果页审核">${num(project.pending_review_count)}</a>`
         : "0"}</td>
       <td><a class="btn small" href="#/projects/${esc(project.id)}">进入</a></td>
     </tr>`).join("");
@@ -3558,7 +3548,7 @@ async function renderWorkbench() {
         <div class="small muted" style="margin-top:12px">
           ${num(byReview.pending)
             ? `还有 ${num(byReview.pending)} 条证据没有结论。${firstPendingProject
-                ? `<a href="#/projects/${esc(firstPendingProject.id)}?tab=review&review_queue=pending">去「${esc(firstPendingProject.project_name)}」的审核页处理 →</a>`
+                ? `<a href="#/projects/${esc(firstPendingProject.id)}?tab=results">去「${esc(firstPendingProject.project_name)}」的比对结果页审核 →</a>`
                 : `<a href="#/projects">进入项目审核 →</a>`}`
             : "所有证据都已给出结论。"}
         </div>
@@ -3587,313 +3577,14 @@ async function renderWorkbench() {
   refreshBtn.addEventListener("click", () => withBusy(refreshBtn, renderWorkbench, "刷新中…"));
 }
 
-/* ---------- 项目内「审核」页（PRD 4.11） ---------- */
-function assigneeName(filters, assigneeId) {
-  if (!assigneeId) return "—";
-  const person = (filters.assignees || []).find((item) => item.id === assigneeId);
-  return person ? person.display_name : "—";
-}
-
-function riskQueryString() {
-  const params = new URLSearchParams();
-  Object.entries(riskListState).forEach(([key, value]) => {
-    if (value !== "" && value !== null && value !== undefined && key !== "page" && key !== "page_size") {
-      params.set(key, value);
-    }
-  });
-  params.set("page", riskListState.page || 1);
-  params.set("page_size", riskListState.page_size || 20);
-  return params.toString();
-}
-
-/* 项目内「审核」页：本项目全部企业组合的证据清单，在一个页面里完成
-   逐条审核、分派、批量标记与导出，不必先选企业组合再进三栏。 */
-async function renderProjectReview(container, project) {
-  /* 筛选状态由路由进入时初始化（见 renderProject 的 review 分支）：
-     本函数也会被页内筛选变更重复调用，不能在这里重置，否则筛选一改就丢。 */
-  container.innerHTML = skeletonPage(4);
-  const [filters, data] = await Promise.all([
-    api("/risks/filters"),
-    api(`/risks?${riskQueryString()}`),
-  ]);
-
-  const companyOptions = filters.companies
-    .filter((company) => !riskListState.project_id || company.project_id === riskListState.project_id);
-  const rows = (data.items || []).map((item) => `
-    <tr>
-      <td><input type="checkbox" data-evidence-check="${esc(item.id)}" data-review-status="${esc(item.review_status)}" aria-label="选择证据 ${esc(item.evidence_code)}"></td>
-      <td class="mono small nowrap">${esc(item.evidence_code)}</td>
-      <td class="col-secondary">#${num(item.task_no)}</td>
-      <td>${pill(item.evidence_type, item.evidence_type_label)}</td>
-      <td class="risk-companies">${esc((item.companies || []).join("、"))}</td>
-      <td>${riskPill(item.severity)}</td>
-      <td class="col-secondary">${fmtDate(item.created_at)}</td>
-      <td>${pill(item.review_status, item.review_status_label)}</td>
-      <td class="col-secondary">${esc(item.reviewer_name || "—")}</td>
-      <td class="col-secondary">${esc(assigneeName(filters, item.assignee_id))}</td>
-      <td class="col-secondary">${item.cluster_size > 1 ? `<span class="pill">线索 ${num(item.cluster_size)} 处</span>` : "—"}</td>
-      <td class="nowrap">
-        <button class="btn small primary" data-risk-detail="${esc(item.id)}">${item.review_status === "pending" ? "审核" : "查看"}</button>
-        ${item.pair_id ? `<a class="btn small" href="${esc(item.viewer_link)}">三栏原文</a>` : ""}
-      </td>
-    </tr>`).join("");
-
-  const totalPages = Math.max(1, Math.ceil((num(data.total)) / (riskListState.page_size || 20)));
-  const activeFilterCount = ["company_id", "evidence_type", "severity", "review_status",
-    "reviewer_id", "assignee_id", "review_queue", "date_from", "date_to", "include_history"]
-    .filter((key) => riskListState[key]).length;
-
-  container.innerHTML = `
-    <div class="card">
-      <div class="row" style="align-items:baseline;margin-bottom:4px">
-        <strong>本项目审核清单</strong>
-        <span class="small muted">共 ${num(data.total)} 条疑似异常证据${activeFilterCount ? ` · 已应用 ${activeFilterCount} 个筛选条件` : ""}${riskListState.include_history ? " · 含历史任务" : " · 仅最新任务"}</span>
-        <span class="spacer"></span>
-        <span class="small muted">系统输出仅为线索，不构成违规认定</span>
-      </div>
-      <div class="filter-bar filter-bar--risk">
-        <div class="filter-field filter-field--select filter-field--wide">
-          <label for="risk-company">涉及企业</label>
-          <select id="risk-company" aria-label="按企业筛选">
-            <option value="">全部企业</option>
-            ${companyOptions.map((company) => `<option value="${esc(company.company_id)}" ${riskListState.company_id === company.company_id ? "selected" : ""}>${esc(company.company_name)}</option>`).join("")}
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-type">证据类型</label>
-          <select id="risk-type" aria-label="按证据类型筛选">
-            <option value="">全部类型</option>
-            ${Object.entries(TYPE).map(([value, label]) => `<option value="${value}" ${riskListState.evidence_type === value ? "selected" : ""}>${label}</option>`).join("")}
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-severity">风险等级</label>
-          <select id="risk-severity" aria-label="按风险等级筛选">
-            <option value="">全部等级</option>
-            ${Object.entries(RISK).map(([value, label]) => `<option value="${value}" ${riskListState.severity === value ? "selected" : ""}>${label}</option>`).join("")}
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-review">审核状态</label>
-          <select id="risk-review" aria-label="按审核状态筛选">
-            <option value="">全部审核状态</option>
-            ${Object.entries(REVIEW).map(([value, label]) => `<option value="${value}" ${riskListState.review_status === value ? "selected" : ""}>${label}</option>`).join("")}
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-reviewer">审核人</label>
-          <select id="risk-reviewer" aria-label="按审核人筛选">
-            <option value="">全部审核人</option>
-            ${(filters.reviewers || []).map((reviewer) => `<option value="${esc(reviewer.id)}" ${riskListState.reviewer_id === reviewer.id ? "selected" : ""}>${esc(reviewer.name)}</option>`).join("")}
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-queue">审核状态</label>
-          <select id="risk-queue" aria-label="按审核状态筛选">
-            <option value="">全部状态</option>
-            <option value="pending" ${riskListState.review_queue === "pending" ? "selected" : ""}>待审核</option>
-            <option value="reviewed" ${riskListState.review_queue === "reviewed" ? "selected" : ""}>已审核</option>
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-history">数据范围</label>
-          <select id="risk-history" aria-label="选择数据范围">
-            <option value="" ${!riskListState.include_history ? "selected" : ""}>仅最新任务</option>
-            <option value="true" ${riskListState.include_history === "true" ? "selected" : ""}>含历史任务（只读）</option>
-          </select>
-        </div>
-        <div class="filter-field filter-field--select">
-          <label for="risk-assignee">分派给</label>
-          <select id="risk-assignee" aria-label="按分派审核人筛选">
-            <option value="">全部分派</option>
-            ${(filters.assignees || []).map((person) => `<option value="${esc(person.id)}" ${riskListState.assignee_id === person.id ? "selected" : ""}>${esc(person.display_name)}</option>`).join("")}
-          </select>
-        </div>
-        <div class="filter-field filter-field--date">
-          <label for="risk-from">发现时间</label>
-          <div class="filter-date-range">
-            <input type="date" id="risk-from" aria-label="发现时间起" value="${esc(riskListState.date_from)}" title="发现时间起">
-            <span class="sep" aria-hidden="true">至</span>
-            <input type="date" id="risk-to" aria-label="发现时间止" value="${esc(riskListState.date_to)}" title="发现时间止">
-          </div>
-        </div>
-        <div class="filter-actions">
-          <button class="btn primary" id="risk-query">${icon("filter")}查询</button>
-          <button class="btn" id="risk-reset">${icon("refresh")}重置</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      ${riskListState.include_history ? `<div class="warn-box small" style="margin-bottom:12px" role="status">
-        当前显示<b>含历史任务</b>的证据：重复分析产生的旧任务证据也会列出，其中部分可能已被新任务取代，仅供追溯，不应作为当前待办处理。
-      </div>` : ""}
-      <div class="row" style="margin-bottom:12px">
-        <label class="small muted"><input type="checkbox" id="risk-select-all"> 全选本页</label>
-        <span class="small muted" id="risk-selected">已选 0 条</span>
-        <span class="spacer"></span>
-        <span class="small muted">证据较多时可按维度筛选后逐条审核；需要对照原文时点行内「三栏原文」</span>
-        <select id="risk-assign-select" aria-label="选择分派审核人" class="small">
-          <option value="">分派给…</option>
-          ${(filters.assignees || []).map((person) => `<option value="${esc(person.id)}">${esc(person.display_name)}</option>`).join("")}
-        </select>
-        <button class="btn small" id="risk-assign" disabled>分派所选</button>
-        <button class="btn small primary" id="risk-batch" disabled>批量标记为待进一步核查</button>
-        <button class="btn small" id="risk-export">${icon("download")}导出本页筛选结果</button>
-      </div>
-      <div class="small muted" style="margin:-4px 0 12px">
-        批量确认 / 批量排除按审计要求不提供：每条证据的结论必须逐条给出并写明依据。
-      </div>
-      ${rows ? `<div class="table-scroll"><table><thead><tr>
-          <th style="width:32px"></th><th>证据编号</th><th class="col-secondary">任务</th><th>证据类型</th>
-          <th>涉及企业</th><th>风险等级</th><th class="col-secondary">发现时间</th><th>审核状态</th><th class="col-secondary">审核人</th><th class="col-secondary">分派给</th><th class="col-secondary">线索</th><th>操作</th>
-        </tr></thead><tbody>${rows}</tbody></table></div>`
-        : `<div class="empty">没有符合条件的证据。</div>`}
-      <div class="row" style="margin-top:12px">
-        <span class="small muted">第 ${num(data.page)} / ${totalPages} 页，共 ${num(data.total)} 条</span>
-        <span class="spacer"></span>
-        <button class="btn small" id="risk-prev" ${num(data.page) <= 1 ? "disabled" : ""}>上一页</button>
-        <button class="btn small" id="risk-next" ${num(data.page) >= totalPages ? "disabled" : ""}>下一页</button>
-      </div>
-    </div>`;
-
-  /* 重渲染只刷新本页内容，不动项目外壳 */
-  const rerender = () => renderProjectReview(container, project);
-  const bind = (selector, key) => {
-    const element = $(selector);
-    if (element) element.addEventListener("change", () => {
-      /* 历史任务是只读视图：开关状态要立即同步回列表状态，避免筛选串味 */
-      riskListState[key] = element.value;
-      riskListState.page = 1;
-      rerender();
-    });
-  };
-  bind("#risk-company", "company_id");
-  bind("#risk-type", "evidence_type");
-  bind("#risk-severity", "severity");
-  bind("#risk-review", "review_status");
-  bind("#risk-reviewer", "reviewer_id");
-  bind("#risk-queue", "review_queue");
-  bind("#risk-history", "include_history");
-  bind("#risk-assignee", "assignee_id");
-  $("#risk-from")?.addEventListener("change", (event) => { riskListState.date_from = event.target.value; riskListState.page = 1; rerender(); });
-  $("#risk-to")?.addEventListener("change", (event) => { riskListState.date_to = event.target.value; riskListState.page = 1; rerender(); });
-  $("#risk-query")?.addEventListener("click", rerender);
-  $("#risk-reset")?.addEventListener("click", () => {
-    /* 重置只清筛选，项目归属不变 */
-    resetRiskListState(project.id);
-    rerender();
-  });
-
-  $("#risk-prev")?.addEventListener("click", () => { riskListState.page = Math.max(1, riskListState.page - 1); rerender(); });
-  $("#risk-next")?.addEventListener("click", () => { riskListState.page = riskListState.page + 1; rerender(); });
-
-  $("#risk-assign")?.addEventListener("click", async () => {
-    const ids = $$("[data-evidence-check]").filter((box) => box.checked).map((box) => box.dataset.evidenceCheck);
-    if (!ids.length) return;
-    const assigneeId = $("#risk-assign-select")?.value || "";
-    try {
-      const result = await api("/risks/batch-assign", {
-        method: "POST",
-        body: { evidence_ids: ids, assignee_id: assigneeId || null },
-      });
-      toast(assigneeId ? `已分派 ${result.updated} 条证据` : `已取消分派 ${result.updated} 条证据`, "success");
-      rerender();
-    } catch (error) { toast(error.message, "error"); }
-  });
-
-  const updateSelection = () => {
-    const checked = $$("[data-evidence-check]").filter((box) => box.checked);
-    const reviewed = checked.filter((box) => (box.dataset.reviewStatus || "pending") !== "pending");
-    $("#risk-selected").textContent = reviewed.length
-      ? `已选 ${checked.length} 条（其中 ${reviewed.length} 条已有审核结论）`
-      : `已选 ${checked.length} 条`;
-    $("#risk-batch").disabled = checked.length === 0;
-    const assignBtn = $("#risk-assign");
-    if (assignBtn) assignBtn.disabled = checked.length === 0;
-  };
-  $$("[data-evidence-check]").forEach((box) => box.addEventListener("change", updateSelection));
-  $("#risk-select-all")?.addEventListener("change", (event) => {
-    $$("[data-evidence-check]").forEach((box) => { box.checked = event.target.checked; });
-    updateSelection();
-  });
-
-  const batchBtn = $("#risk-batch");
-  batchBtn?.addEventListener("click", () => {
-    const selected = $$("[data-evidence-check]").filter((box) => box.checked);
-    const ids = selected.map((box) => box.dataset.evidenceCheck);
-    if (!ids.length) return;
-    const reviewedCount = selected.filter((box) => (box.dataset.reviewStatus || "pending") !== "pending").length;
-    const warning = reviewedCount
-      ? `<div class="warn-box" style="margin-top:10px">其中 <strong>${reviewedCount}</strong> 条已有审核结论（确认异常 / 正常排除 / 暂不判断）。批量标记会覆盖这些结论，历史审核记录仍会保留。</div>`
-      : "";
-    const modal = openModal({
-      title: "批量标记证据",
-      body: `<p style="margin:0">确认把选中的 <strong>${ids.length}</strong> 条证据标记为「待进一步核查」？</p>
-        ${warning}
-        ${reviewedCount ? `<label class="small" style="display:flex;align-items:center;gap:6px;margin-top:10px">
-          <input type="checkbox" id="batch-skip-reviewed" checked> 跳过已有审核结论（推荐）
-        </label>` : ""}`,
-      footer: `<button type="button" class="btn" data-close>取消</button>
-        <button type="button" class="btn primary" id="batch-confirm">确认标记</button>`,
-    });
-    $("#batch-confirm", modal.root)?.addEventListener("click", () => {
-      const skip = reviewedCount ? ($("#batch-skip-reviewed", modal.root)?.checked ?? true) : false;
-      modal.close();
-      withBusy(batchBtn, async () => {
-        try {
-          const result = await api("/risks/batch-review", {
-            method: "POST",
-            body: { evidence_ids: ids, status: "undecided", skip_reviewed: skip },
-          });
-          const skipped = (result.skipped_reviewed || []).length;
-          toast(
-            skipped ? `已标记 ${result.updated} 条，跳过 ${skipped} 条已有审核结论` : `已处理 ${result.updated} 条证据`,
-            "success",
-          );
-          rerender();
-        } catch (error) { toast(error.message, "error"); }
-      }, "处理中…");
-    });
-  });
-
-  /* 审核完成后刷新列表，让「待审核」计数与行内状态立即反映最新结论 */
-  $$("[data-risk-detail]").forEach((button) => button.addEventListener("click", () => openRiskDetail(button.dataset.riskDetail, rerender)));
-
-  /* 导出：后端报告是项目级的。这里已是项目页内，直接导出本项目，
-     并说明当前筛选只影响清单展示、报告仍是项目级汇总。 */
-  const exportBtn = $("#risk-export");
-  exportBtn?.addEventListener("click", () => {
-    const scope = [
-      riskListState.evidence_type && `类型：${TYPE[riskListState.evidence_type] || riskListState.evidence_type}`,
-      riskListState.severity && `等级：${RISK[riskListState.severity] || riskListState.severity}`,
-      riskListState.review_status && `审核：${REVIEW[riskListState.review_status] || riskListState.review_status}`,
-      riskListState.company_id && "已限定企业",
-      (riskListState.date_from || riskListState.date_to) && `时间：${riskListState.date_from || "不限"} 至 ${riskListState.date_to || "不限"}`,
-    ].filter(Boolean).join("；") || "全部证据";
-    if (!confirm(`将导出「${project.project_name}」的项目分析报告（含当前任务的全部证据）。\n\n当前筛选：${scope}\n\n报告为项目级汇总，不会只包含被筛出的条目。确认导出？`)) return;
-    withBusy(exportBtn, async () => {
-      try {
-        const blob = await api(`/projects/${project.id}/reports/excel`, { blob: true });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = `${project.project_name}-分析报告.xlsx`;
-        document.body.appendChild(link); link.click(); link.remove();
-        URL.revokeObjectURL(url);
-        toast("报告已导出", "success");
-      } catch (error) { toast(error.message, "error"); }
-    }, "生成中…");
-  });
-}
 
 async function openRiskDetail(evidenceId, onReviewed = null) {
   let detail;
   try {
-    detail = await api(`/risks/${evidenceId}`);
+    detail = await api(`/evidences/${evidenceId}?include_code=true`);
   } catch (error) { toast(error.message, "error"); return; }
-  /* 本页是项目内的审核清单：弹窗直接给出审核表单（省去先选企业组合），
-     需要对照原文时走「三栏原文」。两类证据共用同一套审核组件。 */
+  /* 比对结果页的证据详情弹窗：直接给出审核表单（省去先选企业组合），
+     需要对照原文时走「三栏原文」。项目级与组合内证据共用同一套审核组件。 */
   const projectLevel = !detail.pair_id;
   const files = (detail.files || []).map((file) => `
     <div class="small">${esc(file.company_name || "")} · ${esc(file.file_name || "")} ${file.page_index ? `第 ${num(file.page_index)} 页` : ""}</div>`).join("") || "—";
@@ -3914,7 +3605,6 @@ async function openRiskDetail(evidenceId, onReviewed = null) {
         <dt>发现时间</dt><dd>${fmtDate(detail.created_at)}</dd>
         <dt>审核状态</dt><dd id="risk-detail-status">${pill(detail.review_status, REVIEW[detail.review_status])}</dd>
         <dt>审核人</dt><dd id="risk-detail-reviewer">${esc(detail.reviewer_name || "—")}</dd>
-        <dt>分派给</dt><dd>${esc(detail.assignee_name || "—")}</dd>
         <dt>相关文件</dt><dd>${files}</dd>
         <dt>原始证据</dt><dd>${esc(detail.summary || "")}</dd>
       </dl>
@@ -3927,7 +3617,7 @@ async function openRiskDetail(evidenceId, onReviewed = null) {
   const historyHost = $("#risk-detail-history", modal.root);
   const refresh = async () => {
     try {
-      detail = await api(`/risks/${evidenceId}`);
+      detail = await api(`/evidences/${evidenceId}?include_code=true`);
     } catch (error) { toast(error.message, "error"); return; }
     renderReview();
     if (typeof onReviewed === "function") onReviewed();

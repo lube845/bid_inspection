@@ -237,9 +237,9 @@ def test_share_then_role_limits_actions():
             ).status_code
             == 403
         )
-        # 审批者可以进审核页（读证据列表）
+        # 审批者可以查看比对结果（审核动作已收进比对分析与比对结果两页）
         assert (
-            client.get(f"/api/v1/projects/{pid}/reviews", headers=reviewer).status_code
+            client.get(f"/api/v1/projects/{pid}/results/overview", headers=reviewer).status_code
             == 200
         )
         # 创建者可以改
@@ -376,21 +376,21 @@ def test_viewer_cannot_review_and_fake_ids_are_rejected(db):
         access_service.ensure_access(db, project, viewer, access_service.REVIEW)
     assert ctx.value.forbidden is True
 
-    # 接口层：批量审核传伪造 id 直接 404，不会返回 200
+    # 接口层：按线索审核传伪造 id 直接 404，不会返回 200
     from fastapi.testclient import TestClient
     from app.main import app
 
     with TestClient(app) as client:
         headers = _login(client, "BX02", "pass1234")
         fake = client.post(
-            "/api/v1/risks/batch-review",
+            "/api/v1/evidences/cluster-review",
             headers=headers,
             json={"evidence_ids": ["no-such-evidence"], "status": "undecided"},
         )
         assert fake.status_code == 404, fake.text
 
         real = client.post(
-            "/api/v1/risks/batch-review",
+            "/api/v1/evidences/cluster-review",
             headers=headers,
             json={"evidence_ids": [evidence.id], "status": "undecided"},
         )

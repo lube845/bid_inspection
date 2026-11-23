@@ -10,7 +10,6 @@ from app.models import (
     AnalysisTask,
     ComparisonEvidence,
     ComparisonPair,
-    EvidenceParticipant,
     PriceQuote,
     Project,
     ReviewRecord,
@@ -143,6 +142,18 @@ _RISK_ORDER = {
     RiskLevel.MEDIUM.value: 2,
     RiskLevel.HIGH.value: 3,
 }
+
+TYPE_CODES = {
+    EvidenceType.TEXT.value: "TEXT",
+    EvidenceType.PERSONNEL.value: "PERSONNEL",
+    EvidenceType.PRICE.value: "PRICE",
+    EvidenceType.FILE.value: "FILE",
+    EvidenceType.METADATA.value: "META",
+}
+
+
+class ReviewError(Exception):
+    """审核相关的业务校验错误（按线索审核、越权批量操作等）。"""
 
 
 def get_task(
@@ -373,8 +384,39 @@ def overview(db: Session, project: Project, task_id: str | None = None) -> dict:
         "matrix": pair_rows,
         "pairs": pair_rows,
         "top_evidences": top_payload,
+        "project_level_evidences": _project_level_payload(db, all_evidences),
         "tasks": task_history(db, project.id),
     }
+
+
+def _project_level_payload(db: Session, evidences: list[ComparisonEvidence]) -> list[dict]:
+    """项目级证据（无企业组合，如价格/报价质量项）的完整清单。
+
+    这类证据不会出现在任何一个企业组合的三栏视图中，审核入口只能放在
+    比对结果页。这里返回全部条目（不截断），保证不会有证据「无处可审」。
+    """
+    project_level = [e for e in evidences if e.comparison_pair_id is None]
+    if not project_level:
+        return []
+    codes = evidence_codes(db, project_level)
+    project_level.sort(key=lambda e: (_RISK_ORDER.get(e.severity, 0), e.created_at), reverse=True)
+    payload = []
+    for evidence in project_level:
+        item = _evidence_summary(evidence)
+        payload.append(
+            {
+                "id": evidence.id,
+                "evidence_code": codes.get(evidence.id),
+                "evidence_type": evidence.evidence_type,
+                "subtype": evidence.evidence_subtype,
+                "severity": evidence.severity,
+                "summary": evidence.summary,
+                "review_status": evidence.review_status,
+                "companies": item.get("companies") or [],
+                "created_at": evidence.created_at,
+            }
+        )
+    return payload
 
 
 def task_history(db: Session, project_id: str) -> list[dict]:
@@ -843,8 +885,6 @@ def _evidence_summary(evidence: ComparisonEvidence) -> dict:
         "cluster_index": evidence.cluster_index or 0,
         "cluster_lead_id": evidence.cluster_lead_id,
         "is_cluster_lead": evidence.cluster_lead_id == evidence.id,
-        # 审核与分派
-        "assignee_id": evidence.assignee_id,
     }
 
 
@@ -876,14 +916,22 @@ def _with_group_positions(items: list[dict]) -> list[dict]:
     return items
 
 
-def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
+def evidence_detail(
+    db: Session, evidence: ComparisonEvidence, *, include_code: bool = False
+) -> dict:
     pair = evidence.pair
     task = db.get(AnalysisTask, evidence.analysis_task_id)
+    project = db.get(Project, evidence.project_id)
     names = _snapshot_names(task) if task else {}
-    return {
+    records = list(evidence.review_records)
+    payload = {
         "id": evidence.id,
         "project_id": evidence.project_id,
+        "project_name": project.project_name if project else "",
+        "project_code": project.project_code if project else None,
         "task_id": evidence.analysis_task_id,
+        "task_no": task.task_no if task else None,
+        "task_status": task.status if task else None,
         "pair_id": evidence.comparison_pair_id,
         "company_a_id": pair.company_a_id if pair else None,
         "company_b_id": pair.company_b_id if pair else None,
@@ -909,7 +957,10 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
             for p in evidence.participants
         ],
         "review_status": evidence.review_status,
-        "assignee_id": evidence.assignee_id,
+        "reviewer_name": records[-1].reviewer_name if records else "",
+        "companies": [p.company_name for p in evidence.participants if p.company_name],
+        "files": _evidence_files(evidence),
+        "viewer_link": _viewer_link(evidence),
         "cluster_id": evidence.cluster_id,
         "cluster_size": evidence.cluster_size or 1,
         "cluster_index": evidence.cluster_index or 0,
@@ -924,11 +975,54 @@ def evidence_detail(db: Session, evidence: ComparisonEvidence) -> dict:
                 "comment": record.comment,
                 "created_at": record.created_at,
             }
-            for record in evidence.review_records
+            for record in records
         ],
         "algorithm_version": evidence.algorithm_version,
         "created_at": evidence.created_at,
     }
+    if include_code:
+        # 编号需要扫描整个 (任务, 类型) 分区（窗口函数），三栏每次点选证据都会调用
+        # 本接口，因此默认不计算，由需要编号的入口（结果页详情弹窗）显式开启。
+        payload["evidence_code"] = evidence_codes(db, [evidence]).get(evidence.id)
+    return payload
+
+
+def _viewer_link(evidence: ComparisonEvidence) -> str:
+    """跳转到所属项目的三栏比对详情；项目级证据（无组合）跳到比对结果页。"""
+    if evidence.comparison_pair_id:
+        return (
+            f"#/projects/{evidence.project_id}"
+            f"?tab=analysis&pair={evidence.comparison_pair_id}&evidence={evidence.id}"
+        )
+    return f"#/projects/{evidence.project_id}?tab=results"
+
+
+def _evidence_files(evidence: ComparisonEvidence) -> list[dict]:
+    """证据相关的原始文件与页码，供详情弹窗展示。"""
+    files: list[dict] = []
+    for source in (evidence.source_a, evidence.source_b):
+        if source and source.get("file_id"):
+            files.append(
+                {
+                    "file_id": source.get("file_id"),
+                    "file_name": source.get("file_name"),
+                    "page_index": source.get("page_index"),
+                    "printed_page_number": source.get("printed_page_number"),
+                }
+            )
+    for participant in evidence.participants:
+        source = participant.source or {}
+        if source.get("file_id"):
+            files.append(
+                {
+                    "file_id": source.get("file_id"),
+                    "file_name": source.get("file_name"),
+                    "page_index": source.get("page_index"),
+                    "printed_page_number": source.get("printed_page_number"),
+                    "company_name": participant.company_name,
+                }
+            )
+    return files
 
 
 def _cluster_members(db: Session, evidence: ComparisonEvidence) -> list[dict]:
@@ -1032,58 +1126,172 @@ def apply_review(
     return evidence
 
 
-def list_reviews(
+def review_cluster(
     db: Session,
-    project_id: str,
-    evidence_type: str | None = None,
-    severity: str | None = None,
-    review_status: str | None = None,
-    company_id: str | None = None,
-    task_id: str | None = None,
-    page: int = 1,
-    page_size: int = 20,
+    evidence_ids: list[str],
+    new_status: str,
+    comment: str | None,
+    reviewer: User,
+    *,
+    skip_reviewed: bool = False,
 ) -> dict:
-    query = select(ComparisonEvidence).where(
-        ComparisonEvidence.project_id == project_id,
-        ComparisonEvidence.is_current.is_(True),
-    )
-    if evidence_type:
-        query = query.where(ComparisonEvidence.evidence_type == evidence_type)
-    if severity:
-        query = query.where(ComparisonEvidence.severity == severity)
-    if review_status:
-        query = query.where(ComparisonEvidence.review_status == review_status)
-    if task_id:
-        query = query.where(ComparisonEvidence.analysis_task_id == task_id)
-    if company_id:
-        query = query.where(
-            ComparisonEvidence.id.in_(
-                select(EvidenceParticipant.evidence_id).where(
-                    EvidenceParticipant.company_id == company_id
-                )
-            )
-        )
+    """按线索审核：一条操作覆盖同一线索下的全部证据。
 
-    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    每条成员仍各自写一条 ``review_record``（与单条审核同构），只是入口不同。
+    """
+    if new_status not in {"confirmed", "excluded", "undecided"}:
+        raise ReviewError("按线索审核只支持确认 / 排除 / 暂不判断")
+    if not evidence_ids:
+        raise ReviewError("请先选择要处理的线索")
     rows = list(
         db.scalars(
-            query.order_by(ComparisonEvidence.created_at.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
+            select(ComparisonEvidence).where(
+                ComparisonEvidence.id.in_(evidence_ids),
+                ComparisonEvidence.is_current.is_(True),
+            )
         )
     )
-    items = []
+    if not rows:
+        raise ReviewError("没有可处理的证据")
+    updated = 0
+    skipped: list[str] = []
     for evidence in rows:
-        item = _evidence_summary(evidence)
-        item["pair_id"] = evidence.comparison_pair_id
-        item["project_id"] = evidence.project_id
-        items.append(item)
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
+        if skip_reviewed and evidence.review_status != ReviewStatus.PENDING.value:
+            skipped.append(evidence.id)
+            continue
+        _write_review(
+            db,
+            evidence,
+            new_status,
+            comment,
+            reviewer,
+            action="evidence.review_cluster",
+        )
+        updated += 1
+    return {"updated": updated, "skipped_reviewed": skipped, "status": new_status}
+
+
+def _project_code_head(project: Project | None) -> str:
+    """证据编号的项目段。
+
+    优先使用项目编号；没有编号时用「项目名简写 + 创建日期」生成可读标识，
+    避免把内部占位符 NO-CODE 暴露给审核人员。
+    """
+    if project is None:
+        return "NO-CODE"
+    code = (project.project_code or "").strip()
+    if code:
+        return code
+    name = "".join((project.project_name or "").split())[:8] or "项目"
+    created = project.created_at.strftime("%Y%m%d") if project.created_at else ""
+    return f"{name}{created}" if created else name
+
+
+def evidence_code(
+    project: Project | None, task_no: int, evidence_type: str, seq: int
+) -> str:
+    """PRD 5.7：项目编号-任务编号-证据类型-序号，例 DEMO-2026-001-T03-TEXT-0001。"""
+    head = _project_code_head(project)
+    type_code = TYPE_CODES.get(evidence_type, str(evidence_type).upper())
+    return f"{head}-T{int(task_no):02d}-{type_code}-{seq:04d}"
+
+
+def evidence_codes(db: Session, rows: list[ComparisonEvidence]) -> dict[str, str]:
+    """批量计算证据编号（``{evidence_id: code}``），供导出与详情共用。
+
+    编号必须全系统一致：页面展示的编号与 Excel 报告的编号必须能直接对应，
+    否则报告无法反向定位到系统里的证据。
+    """
+    if not rows:
+        return {}
+    task_ids = {row.analysis_task_id for row in rows}
+    project_ids = {row.project_id for row in rows}
+    tasks = {
+        task.id: task
+        for task in db.scalars(select(AnalysisTask).where(AnalysisTask.id.in_(task_ids)))
     }
+    projects = {
+        project.id: project
+        for project in db.scalars(select(Project).where(Project.id.in_(project_ids)))
+    }
+    sequences = _evidence_sequences(db, rows)
+    return {
+        row.id: evidence_code(
+            projects.get(row.project_id),
+            tasks[row.analysis_task_id].task_no if row.analysis_task_id in tasks else 0,
+            row.evidence_type,
+            sequences.get(row.id, 0),
+        )
+        for row in rows
+    }
+
+
+def _evidence_sequences(
+    db: Session, rows: list[ComparisonEvidence]
+) -> dict[str, int]:
+    """同一 (任务, 类型) 内的证据序号。
+
+    跨 is_current=False 的历史行一起编号，保证重跑后编号不变（可能有空洞）。
+    """
+    pairs = {(row.analysis_task_id, row.evidence_type) for row in rows}
+    if not pairs:
+        return {}
+    task_ids = {task_id for task_id, _ in pairs}
+    types = {evidence_type for _, evidence_type in pairs}
+
+    # 窗口函数需要在完整分区上计算，但只把本页要用的编号取回来，
+    # 避免把整份任务的证据行都传回 Python（任务可能有数万条证据）。
+    windowed = (
+        select(
+            ComparisonEvidence.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=(
+                    ComparisonEvidence.analysis_task_id,
+                    ComparisonEvidence.evidence_type,
+                ),
+                order_by=(ComparisonEvidence.created_at, ComparisonEvidence.id),
+            )
+            .label("seq"),
+        )
+        .where(
+            ComparisonEvidence.analysis_task_id.in_(task_ids),
+            ComparisonEvidence.evidence_type.in_(types),
+        )
+        .subquery()
+    )
+    page_ids = [row.id for row in rows]
+    statement = select(windowed.c.id, windowed.c.seq).where(windowed.c.id.in_(page_ids))
+    try:
+        return {row_id: int(seq) for row_id, seq in db.execute(statement).all()}
+    except Exception:
+        # 旧版 SQLite 不支持窗口函数时退回 Python 编号
+        return _evidence_sequences_python(db, task_ids, types)
+
+
+def _evidence_sequences_python(
+    db: Session, task_ids: set[str], types: set[str]
+) -> dict[str, int]:
+    rows = db.execute(
+        select(
+            ComparisonEvidence.id,
+            ComparisonEvidence.analysis_task_id,
+            ComparisonEvidence.evidence_type,
+            ComparisonEvidence.created_at,
+        )
+        .where(
+            ComparisonEvidence.analysis_task_id.in_(task_ids),
+            ComparisonEvidence.evidence_type.in_(types),
+        )
+        .order_by(ComparisonEvidence.created_at, ComparisonEvidence.id)
+    ).all()
+    counters: dict[tuple[str, str], int] = defaultdict(int)
+    sequences: dict[str, int] = {}
+    for row_id, task_id, evidence_type, _ in rows:
+        key = (task_id, evidence_type)
+        counters[key] += 1
+        sequences[row_id] = counters[key]
+    return sequences
 
 
 def export_excel(
@@ -1144,10 +1352,8 @@ def export_excel(
         if evidence.comparison_pair_id:
             counts[evidence.comparison_pair_id][evidence.evidence_type] += 1
 
-    # 全系统统一的证据编号：报告里的编号必须能直接在风险页查到同一条证据
-    from app.services import risk_service
-
-    codes = risk_service.evidence_codes(db, evidences)
+    # 全系统统一的证据编号：报告里的编号必须能直接在详情弹窗查到同一条证据
+    codes = evidence_codes(db, evidences)
 
     def reviewer_summary(evidence: ComparisonEvidence) -> str:
         records = sorted(
