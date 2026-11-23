@@ -4,8 +4,8 @@
 
 > 创建项目 → 上传招标文件 → 创建投标企业 → 上传企业文件 → 人工排序 → 解析（解析完成后自动开始两两比对）→ 查看比对进展 → 企业两两比对 → 三栏查看证据 → 人工审核 → 导出报告。
 
-同时提供 PRD v2 定义的**系统级模块**：**工作台 / 项目管理 / 系统管理**，一级菜单为
-`工作台 · 项目管理 · 系统管理`，登录后默认进入工作台。
+同时提供 PRD v2 定义的**系统级模块**，一级菜单为
+`工作台 · 项目管理 · 系统配置 · 审计日志 · 用户管理`，登录后默认进入工作台。
 
 > PRD §4.11 的「风险管理」已并入项目管理：审核是项目内的工作（`?tab=review`），
 > 不再设独立的跨项目页面，避免与项目内的「比对分析」出现两套审核入口。
@@ -32,9 +32,9 @@ docker compose up --build -d
 | http://localhost:8888/docs | Swagger API 文档 |
 | http://localhost:8001/health | 后端健康检查 |
 
-首次启动会创建管理员账号，并在 `SEED_DEMO=true`（默认）时生成演示项目「演示采购项目A」：3 家企业、招标文件、已解析文本、3 组两两比对结果，可直接进入三栏证据页体验。
+首次启动会创建管理员账号。`SEED_DEMO` 未设置时默认 `true`（`docker-compose.yml` 里的默认值），会生成演示项目「演示采购项目A」：3 家企业、招标文件、已解析文本、3 组两两比对结果，可直接进入三栏证据页体验。仓库里的 `.env.example` 显式写了 `SEED_DEMO=false`，复制成 `.env` 后即不再生成演示数据——正式部署请保持 `false`。
 
-> 生产部署前请修改 `.env` 中的 `SECRET_KEY`、`ADMIN_PASSWORD`、`POSTGRES_PASSWORD`，并将 `SEED_DEMO` 设为 `false`。
+> 生产部署前请修改 `.env` 中的 `SECRET_KEY`、`ADMIN_PASSWORD`、`POSTGRES_PASSWORD`，并确认 `SEED_DEMO=false`（`.env.example` 已是 `false`）。
 >
 > **公网安全要求**：系统本身只监听 HTTP。暴露到公网前必须在反向代理（Nginx / Caddy / 云 LB）上
 > 终止 TLS 并提供 HTTPS，否则登录口令、投标文件与会话令牌都会以明文传输。安全加固完成前
@@ -155,7 +155,7 @@ cd backend
 
 测试覆盖：端到端种子流程（解析 → 3 组比对 → 三级证据 → Excel 导出）、审核记录追加、20 家企业上限、文本规范化偏移映射；文本引擎的结构化分块、MinHash/LSH 召回、Jaccard/有效相似度、招标文件基准排除、局部对齐与块对结果入库；以及系统级模块——工作台防重复计数与待办、风险清单筛选分页与证据编号、批量审核限制、规则版本生命周期与阈值真正生效、操作日志、用户管理与管理员鉴权。
 
-新增覆盖（`pytest` 共 219 项）：迁移脚本与模型一致性（`test_migrations.py`）、报价导入与快照优先级（`test_price_quotes.py`）、尾数参数与大小写一致性（`test_price_rules.py`）、证据聚类边界（`test_clusters.py`）、分派/二审/按线索审核（`test_review_workflow.py`）、结构指纹与错字一致性（`test_structure.py`）、经验模板库（`test_template_library.py`）、跨任务对比（`test_task_diff.py`）、QA 报告（`prd_kimi_test.md`）缺陷回归（`test_qa_1117_regressions.py`）：退出登录令牌吊销、重复分析只看最新任务、千分位/表格合计行报价识别（含「分项在合计之前」的布局）、合计候选矛盾时标记待确认、统一社会信用代码校验位、封面字段雷同降级、关键岗位范围参数生效、取整尾数不报异常、招标正文变化后旧任务标记基准过期、报价清单展示自动识别金额。
+新增覆盖（`pytest` 共 269 项）：迁移脚本与模型一致性（`test_migrations.py`）、报价导入与快照优先级（`test_price_quotes.py`）、尾数参数与大小写一致性（`test_price_rules.py`）、证据聚类边界（`test_clusters.py`）、分派/审核/按线索审核（`test_review_workflow.py`）、结构指纹与错字一致性（`test_structure.py`）、经验模板库（`test_template_library.py`）、跨任务对比（`test_task_diff.py`）、QA 报告（`prd_kimi_test.md`）缺陷回归（`test_qa_1117_regressions.py`）：退出登录令牌吊销、重复分析只看最新任务、千分位/表格合计行报价识别（含「分项在合计之前」的布局）、合计候选矛盾时标记待确认、统一社会信用代码校验位、封面字段雷同降级、关键岗位范围参数生效、取整尾数不报异常、招标正文变化后旧任务标记基准过期、报价清单展示自动识别金额。
 
 ---
 
@@ -164,10 +164,13 @@ cd backend
 分析任务的进度通过 SSE 推送，不再依赖固定间隔轮询：
 
 ```
-GET /api/v1/projects/{project_id}/events?token=<access_token>
+POST /api/v1/projects/{project_id}/events/ticket   → { "ticket": "...", "expires_in": 300 }
+GET  /api/v1/projects/{project_id}/events?ticket=<scoped_ticket>
 ```
 
-后端每 1 秒比对一次快照（解析进度、任务状态、各维度完成数、证据数、待审核数），有变化才推送 `snapshot` 事件。前端在任务详情页订阅该流，进度条、状态和计数就地刷新；SSE 不可用时自动退回 3 秒轮询。
+`EventSource` 无法设置请求头，因此先签一张**限定到该项目、默认 5 分钟**的短期票据，再拼进 SSE 地址；票据里带 `token_version`，退出登录 / 改密后立即失效，长期 JWT 不会出现在 URL 里。票据只证明「是谁」，项目可见性仍按项目权限再校验一次。
+
+后端每 1 秒比对一次快照（解析进度、任务状态、各维度完成数、证据数、待审核数），有变化才推送 `snapshot` 事件，空闲时每 15 秒发一次心跳。前端在任务详情页订阅该流，进度条、状态和计数就地刷新；SSE 不可用时自动退回 3 秒轮询。
 
 ---
 
@@ -178,8 +181,10 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 | 一级菜单 | 路由 | 内容 |
 | --- | --- | --- |
 | 工作台 | `#/workbench` | 全局统计卡片（可点击跳转）、待办事项、最近项目、最近分析任务、风险统计（PRD §4.1） |
-| 项目管理 | `#/projects` | 项目列表、创建/编辑/归档，进入项目后有 9 个子页（见下），含审核页 |
-| 系统管理 | `#/system` | 检测规则版本、操作日志、用户管理（PRD §4.13） |
+| 项目管理 | `#/projects` | 项目列表、创建/编辑/归档，进入项目后有 10 个子页（见下），含审核页与权限管理 |
+| 系统配置 | `#/settings` | 检测规则版本与参数、OCR 识别配置（PRD §4.13.3） |
+| 审计日志 | `#/audit` | 全量操作留痕与筛选（PRD §4.13.4） |
+| 用户管理 | `#/users` | 账号（用户名/工号/邮箱）、角色、启用状态与密码重置（PRD §4.13.1） |
 
 ### 5.1 工作台（PRD §4.1）
 
@@ -190,6 +195,20 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 
 > 统计口径：所有证据计数都带 `is_current` 过滤且只数 `comparison_evidence` 行，**不 JOIN 参与企业表**——一条涉及 3 家企业的项目级价格证据只算 1 条（PRD §4.1.2 要求同一证据不得重复计数）。
 
+### 5.1.1 项目权限（路由 `?tab=permissions`）
+
+- **默认隔离**：用户创建的项目只有创建者自己能看到；其他人在项目列表里看不到，直接访问详情返回 404（与「项目不存在」一致，避免探测）。
+- **系统管理员**：对所有项目拥有管理权限，无需逐条授权。
+- **分享**：管理者在「权限管理」页点「分享项目」，输入对方的**工号或邮箱**定位账号，选择权限级别，弹窗二次确认后生效。
+- **三种权限**（逐级包含）：
+  | 级别 | 能力 |
+  | --- | --- |
+  | 查看 `viewer` | 查看项目全部内容（含审核列表），不能审核、不能改动 |
+  | 审批 `reviewer` | 查看 + 审核/分派证据 |
+  | 管理 `manager` | 审批 + 改项目、管企业/文件/报价、发起分析、继续分享 |
+- **防越权**：不能授予高于自己的级别；创建者不可被移除或降级；批量审核/分派会逐条校验所属项目，任一越权即整体拒绝，伪造证据 id 直接 404。
+- **演示数据**：内置演示项目归初始管理员所有；历史无归属的项目按「仅管理员可见」处理。
+
 ### 5.2 项目审核页（PRD §4.11，路由 `?tab=review`）
 
 - 证据列表字段：证据编号、分析任务编号、证据类型、涉及企业、风险等级、发现时间、审核状态、审核人、分派给、操作。
@@ -199,12 +218,20 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 - 与「比对分析」的分工：比对分析按**企业组合**组织，适合逐对深看原文；审核页按**证据**组织，一个页面看全项目待审条目，并支持分派、批量标记与导出。
 - **批量操作仅允许「批量标记为待进一步核查」**；批量确认 / 批量排除按 PRD §4.11.5 明确禁用并给出提示。
 
-### 5.3 系统管理（PRD §4.13）
+### 5.3 系统配置 / 审计日志 / 用户管理（PRD §4.13）
 
-- **检测规则版本**：按文本相似 / 人员重复 / 价格异常 / OCR 识别四个维度管理。左侧切换维度，右侧按板块分组展示参数（每个参数附一句口径说明）与版本历史。每次修改**新建一个版本**（旧版本转 `archived` 保留），记录修改前/后内容、修改人、修改时间与修改原因；生效需要管理员权限 + 生效确认。
+- **系统配置**（`#/settings`）·**检测规则版本**：按文本相似 / 人员重复 / 价格异常 / OCR 识别四个维度管理。左侧切换维度，右侧按板块分组展示参数（每个参数附一句口径说明）与版本历史。每次修改**新建一个版本**（旧版本转 `archived` 保留），记录修改前/后内容、修改人、修改时间与修改原因；生效需要管理员权限 + 生效确认。
 - **OCR 识别**：页面顶部提供「启用 OCR 识别」开关（改动直接生成并生效一个新版本），并展示调用方式（百度智能云 OCR）、接口文档链接、凭据配置状态、单次上传体积上限与「测试连接」按钮（校验能否换取 access_token）。API Key / Secret Key 属于敏感配置，列表页只显示「已配置 / 未配置」，编辑时留空表示不修改，真实值不返回浏览器。超过单次体积上限的 PDF 会在解析时自动拆分成多个文件逐份上传。
-- **操作日志**：记录登录退出、项目增删改归档、文件上传下载替换删除、启动分析、重试任务、修改检测规则、审核证据、导出报告。操作结果 / 操作来源 / 变更前后信息写在 `audit_log.payload` JSON 中（不改表结构）。
-- **用户管理**：新增 / 编辑 / 禁用 / 重置密码 / 分配角色。系统至少保留一个启用的管理员账号，管理员不能禁用自己。
+- **审计日志**（`#/audit`）：记录登录退出、项目增删改归档、文件上传下载替换删除、启动分析、重试任务、修改检测规则、审核证据、导出报告。操作结果 / 操作来源 / 变更前后信息写在 `audit_log.payload` JSON 中（不改表结构）。
+- **用户管理**（`#/users`）：新增 / 编辑 / 禁用 / 重置密码 / 分配角色。系统至少保留一个启用的管理员账号，管理员不能禁用自己，也不能把最后一个管理员降级。
+- **账号身份**：每个账号有用户名、工号、邮箱三项。**登录只认工号或邮箱**（邮箱不区分大小写）；用户名仅作展示，**允许重复**（同名同事）。工号与邮箱**至少填一项**、各自唯一且互不重复；用户管理页可以修改这三项，清空后仍需满足「至少一项」。
+- **角色只有两种**：管理员（可进入系统配置 / 审计日志 / 用户管理）与用户（只做业务）。原先「项目分析人员 / 风险审核人员」的区分已取消，审核权限不再由角色决定，而是按证据逐一审核/分派。
+- **自助修改密码**：侧边栏账户区的盾牌按钮可改自己的密码（需原密码）。改密后令牌版本号递增，旧会话立即失效。仍使用部署初始口令的账号登录后会被强制引导改密。
+- **项目彻底删除**：删除项目默认是软删除（原始资料保留，便于恢复）；勾选「同时彻底删除全部资料」并输入项目名称确认后，磁盘文件、解析文本、分析任务、证据与审核记录、报价、项目级模板片段一并物理删除，审计日志保留删除动作本身。
+
+### 5.3.1 第三轮 QA（`prd_kimi_test3.md`）修复说明
+
+PDF 康熙部首/兼容汉字折叠（人员、报价、事实、逐项单价均在折叠文本上匹配并映射回原文偏移）、PDF 人员漏报、报价候选矛盾文案、页面详情按文本块分页、证据来源继承真实提取方式（OCR 页不再标 native）、导出时区统一、用户自助修改密码与初始口令强制改密、项目彻底删除（purge）及审计留痕、旧版 DOC 与二进制 WPS 上传即拒绝。
 
 ### 5.4 规则版本真正生效
 
@@ -224,30 +251,59 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 
 「OCR 识别」维度属于**解析期设置**，不进入分析任务快照（避免把解析参数与密钥写进任务配置）：文件解析时读取当前生效的 OCR 版本，决定是否启用 OCR 与调用方式。
 
+### 5.4.1 价格比对矩阵
+
+报价总览回答「每家报了多少」，价格比对回答「每一项谁和谁报得一样」。
+
+- **数据来源与优先级**：企业价格 Excel（`import`）> 手工录入（`manual`）> 正文自动识别（`auto`）。上传过价格 Excel 的企业，矩阵完全以文件为准。
+- **总价一览**：按总价排序的条形图，标出总价来源（价格 Excel / 手工录入 / 自动识别）。
+- **逐项单价矩阵**：以企业为列、清单项为行。每个单元格按与同行价的关系着色：
+
+  | 状态 | 含义 | 颜色 |
+  | --- | --- | --- |
+  | `identical` | 与其他至少一家单价完全相同 | 红 |
+  | `near` | 与同行价偏差在容差内 | 橙 |
+  | `outlier` | 与同项其他企业（≥2 家）的中位价偏差超过阈值 | 紫 |
+  | `peer` | 有同行价但落在正常区间 | 白 |
+  | `single` | 仅这一家报了这个分项 | 灰 |
+
+- **悬浮提示**：同项其他企业的价格、本项中位价、来源文件与页码、是否 OCR 识别。
+- **数据来源**：优先使用企业上传的价格 Excel 分项（`price_item` 表）；没有上传时回退到最新分析任务解析出的文本块（与「逐项单价雷同」证据同源）。
+- **无分析任务也能看**：只上传了价格 Excel、还没跑分析的项目同样能生成矩阵。
+- **阈值**：读取价格维度规则快照里的 `price_line_item_identical_tolerance` 与 `price_matrix_outlier_ratio`（默认 0.0001 / 0.3）。
+  注意：这两个键目前只在 `analysis/thresholds.py` 里解析、**尚未登记进 `rule_service.PRICE_PARAMS`**，所以系统配置页改不到，只能用默认值——已列入待办，见 §10 第 15 条。
+
 ### 5.5 项目内子页面
 
-进入项目后有 9 个子页面（Tab）：
+进入项目后有 10 个子页面（Tab），其中「审核」按项目权限显示、「权限管理」仅管理者可见：
 
 | 子页面 | 内容 |
 | --- | --- |
 | 项目概览 | 项目整体情况：企业/文件/解析进度、下一步操作推荐、最近分析任务 |
-| 文件管理 | 招标文件（招标说明）与按公司管理的投标文件，支持排序、替换、重新解析 |
+| 文件管理 | 招标文件（招标说明）与按公司管理的投标文件，支持排序、替换、重新解析；每家企业还可单独上传**价格 Excel**（总价 + 清单分项） |
 | 解析中心 | 招标说明与投标文件的解析进展、失败原因、重试 |
 | 分析任务 | 项目内企业两两比对的进展状态：任务列表、维度实时进度、执行日志；文件解析完成后自动开始，无需人工勾选范围 |
 | 比对分析 | **选取任意两家企业**查看三栏对比：左侧企业A原文、中间企业B原文、右侧证据列表与详情 |
 | 审核 | **按证据**列出本项目全部待审条目：筛选、逐条审核、分派、批量标记、导出；需看原文时跳转三栏 |
 | 比对结果 | 全部企业组合的统计概览：各维度证据数、风险等级分布、企业组合矩阵、**与上次分析对比** |
-| 报价清单 | **人工确认的投标总报价**：模板下载、批量导入（先校验预览）、逐家补录、版本记录 |
+| 价格比对 | **总价一览 + 逐项单价矩阵**：企业为列、清单项为行，单元格按「与其他企业相同 / 接近 / 偏离同项中位价 / 同行价 / 仅此一家」着色，悬浮显示同行价与原文位置 |
 | 分析报告 | 导出整体统计报告（Excel，含文件取证与逐项单价表） |
+| 权限管理 | 查看当前成员与权限，按工号/邮箱分享项目、调整级别、移除成员；仅管理者可见 |
 
 ### 报价清单与价格维度
 
+> 现状说明：原先独立的「报价清单」页在菜单重构时被移除，报价录入现在走
+> **文件管理 → 企业卡片 → 上传价格 Excel / 手工录入总价**。批量导入与模板下载的
+> 后端接口（`/projects/{id}/quotes/import`、`/quotes/template`）仍然可用，但暂无界面入口，
+> 见 §10 第 17 条。
+
 价格维度不再「猜不到报价就当作没有异常」：
 
-- **权威输入**：报价清单里的报价（导入或补录）优先于正文自动识别；自动识别只做兜底。
+- **权威输入**：价格 Excel 与人工补录的报价优先于正文自动识别；自动识别只做兜底。
 - **快照固化**：分析任务启动时把人工报价写进 `analysis_config.price_snapshot`；首次运行时把自动识别结果也补进快照。之后改报价不影响历史任务，任务详情会提示「报价已更新」。
 - **覆盖情况**：结果页与任务详情显示「已识别 x / y 家」以及来源拆分（人工 / 正文识别），未识别时给出补录入口。
-- **导入流程**：下载模板 → 上传 → 校验预览（逐行错误/警告）→ 确认写入。支持 `.xlsx` / `.csv`，按企业名称或统一社会信用代码匹配，大小写金额不一致会拒绝该行。
+- **单家导入流程**（有界面）：企业卡片「上传价格 Excel」→ 解析预览（总价 / 分项条数 / 逐行错误与提示）→ 确认写入。支持 `.xlsx` / `.xlsm` / `.csv`，同时识别「清单 + 合计」与「只有总价」两种表；未写合计时按「数量 × 单价」推算并在提示里标明是推算值。
+- **批量导入流程**（后端已实现、暂无界面）：下载模板 → 上传 → 校验预览（逐行错误/警告）→ 确认写入。按企业名称或统一社会信用代码匹配，大小写金额不一致会拒绝该行。
 - **单家质量项**：大小写金额不一致记为 `amount_case_mismatch`，只作为报价文件质量提示，**不计入组合价格风险**。
 
 ### 证据线索（聚类）
@@ -259,12 +315,11 @@ GET /api/v1/projects/{project_id}/events?token=<access_token>
 - 支持「整条线索确认 / 排除」，一次性覆盖全部成员，每条成员仍各留一条审核记录；
 - `cluster_id` 由「企业组合 + 字典序最小的块对」派生，重跑后仍可复现。
 
-### 审核分派与二审
+### 审核分派与结论
 
 - **分派**：风险清单支持勾选后分派给分析员/审核人，可按「分派给」筛选；可分派名单只需登录即可获取（不暴露账号敏感信息）。
-- **二审**：项目可开启「结论需要两位审核人复核」。开启后 `confirmed/excluded` 的结论先落一审（`review_stage=1` 待二审），必须由**另一位审核人**完成终审；同一人重复提交二审会被拒绝；一审与终审结论不同时页面标出冲突。
-- **批量不绕过二审**：「暂不判断」直接终审；批量标记仍只允许这一种结论，不是双人复核的后门。
-- **待办口径**：工作台与项目待办按 `review_stage` 统计（待一审 / 待二审），一审完成不再算「待审核」。
+- **单级审核**：一次审核即结论，没有二审。任何有「审批」权限的人都可以给出或改判结论，改判同样是追加一条审核记录，历史不覆盖。
+- **待办口径**：工作台与项目待办按 `review_status` 统计（待审核），已给出结论的证据不再进入待办。
 
 ### 比对分析（三栏证据对比）
 
@@ -295,7 +350,7 @@ Bid_Inspection/
 ├── Makefile                      # dev / prod / logs / watch / test / reset 等命令
 ├── .env.example
 ├── prd.md
-├── prd_v2.md                      # 系统级模块（工作台/风险管理/系统管理）的产品需求；风险管理现为项目内审核页
+├── prd_v2.md                      # 系统级模块（工作台/风险管理/系统管理）的产品需求；风险管理已并入项目
 ├── backend/
 │   ├── Dockerfile                 # 生产镜像
 │   ├── Dockerfile.dev             # 开发镜像（多装 pytest / watchdog）
@@ -363,10 +418,12 @@ Bid_Inspection/
 | 项目审核页：证据清单 / 筛选 / 分页 / 详情 | `api/routes/risks.py`、`services/risk_service.py` |
 | 证据编号（PRD §5.7） | `services/risk_service.py#evidence_code` |
 | 批量审核（仅允许「待进一步核查」） | `services/risk_service.py#batch_review` |
-| 检测规则版本管理 / 生效确认 | `services/rule_service.py`、`api/routes/system.py` |
+| 系统配置：检测规则版本管理 / 生效确认 | `services/rule_service.py`、`api/routes/system.py` |
 | 规则版本真正作用于检测引擎 | `analysis/thresholds.py` + 各分析函数的 `thresholds` 参数 |
-| 操作日志查询（管理员） | `services/system_service.py#list_logs`、`api/routes/system.py` |
-| 用户管理（新增/禁用/重置密码/分配角色） | `services/system_service.py`、`api/routes/system.py` |
+| 审计日志查询（管理员） | `services/system_service.py#list_logs`、`api/routes/system.py` |
+| 用户管理（身份字段/角色/禁用/重置密码） | `services/system_service.py`、`api/routes/system.py` |
+| 项目级权限（可见性、分享、三种级别） | `services/access_service.py`、`services/project_share_service.py`、`api/routes/projects.py` |
+| 项目成员表（project_member） | `models/project_member.py`、迁移 `0007_project_member.py` |
 | 管理员鉴权 | `api/deps.py#require_admin` |
 
 ### 7.3 关键业务规则
@@ -389,8 +446,10 @@ Bid_Inspection/
 - **BR-19** 分析任务启动时固化规则版本与阈值快照，运行期从快照取阈值，规则后续变更不影响历史任务。
 - **BR-20** 人工报价（导入/补录）优先于正文自动识别；两者都在任务启动/首次运行时固化进 `analysis_config.price_snapshot`，之后改报价不影响历史任务。
 - **BR-21** 只有「正常 / 排除」的结论才能同时记为模板；模板片段限 30～200 字，超长雷同不得被模板吞掉。
-- **BR-22** 开启二审的项目，`confirmed/excluded` 必须由两位不同审核人完成；批量「暂不判断」视为终审，不是二审后门。
+- **BR-22** 审核是单级的：一次审核即结论，不要求第二位审核人复核。
 - **BR-23** 证据聚类只在同一企业组合内进行，`cluster_id` 由块对派生，重跑可复现。
+- **BR-24** 项目默认只对创建者与系统管理员可见；不可见的项目在列表里不出现、直连详情返回 404（与「不存在」一致，避免探测）。
+- **BR-25** 项目分享只能授予不高于自己的级别；创建者不可被移除或降级；批量审核/分派逐条校验所属项目，任一越权整体拒绝。
 
 ### 7.4 核心数据模型
 
@@ -417,13 +476,19 @@ audit_log                   # 结果/来源/变更前后写在 payload JSON
 app_user
 detection_rule_version      # 检测规则版本：按维度存参数快照，旧版本转 archived 保留
 price_quote                 # 人工确认的投标报价（版本化，旧版本保留）
+price_item                  # 价格 Excel 导入的清单分项单价（按清单项规范化对齐）
 template_fragment           # 经验模板库：审核人确认的行业范本片段
+project_member              # 项目授权：user × project → viewer/reviewer/manager
 ```
 
 `comparison_evidence` 新增列：`cluster_id/cluster_size/cluster_index/cluster_lead_id`（线索）、
-`assignee_id/assigned_at`（分派）、`review_stage/first_reviewer_id/first_review_status`（二审）。
+`assignee_id/assigned_at`（分派）。
 `analysis_task.template_snapshot` 固化任务使用的模板片段 id。
-表结构由 Alembic 管理（`backend/alembic/`），增量迁移见 `0002_features.py`。
+`app_user` 的身份字段为 `username`（可重复，仅展示）/ `employee_no`（唯一，可空）/ `email`（唯一、小写，可空），登录只认后两项。
+`project` 记录 `created_by`（创建者即项目管理者），`project.deleted_at` 为软删除标记。
+表结构由 Alembic 管理（`backend/alembic/`），当前版本链为
+`0001_baseline` → `0002_features` → `0003_token_revocation` → `0004_credit_code_type` →
+`0005_price_item` → `0006_user_identity` → `0007_project_member` → `0008_drop_second_review`。
 
 ---
 
@@ -433,21 +498,25 @@ template_fragment           # 经验模板库：审核人确认的行业范本�
 
 | 模块 | 接口 |
 | --- | --- |
-| 认证 | `POST /auth/login`、`POST /auth/logout`、`GET /auth/me` |
+| 认证 | `POST /auth/login`、`POST /auth/logout`、`GET /auth/me`、`POST /auth/change-password`（自助改密，需原密码） |
 | 工作台 | `GET /workbench` |
 | 风险 | `GET /risks`（支持 `assignee_id` / `review_queue` / `cluster_lead_only`）、`GET /risks/filters`、`GET /risks/{id}`、`POST /risks/batch-review`、`POST /risks/batch-assign`、`POST /risks/cluster-review` |
 | 报价 | `GET /projects/{id}/quotes`、`GET /projects/{id}/quotes/template`、`POST /projects/{id}/quotes/import?dry_run=`、`PUT /companies/{id}/quote`、`DELETE /companies/{id}/quote` |
+| 价格矩阵 | `GET /projects/{id}/price-matrix`（总价一览 + 逐项单价矩阵，无分析任务时只用价格 Excel） |
+| 价格文件 | `POST /companies/{id}/price-file?dry_run=`（单家企业价格 Excel：总价 + 清单分项） |
 | 系统 | `GET /system/rules`、`POST /system/rules/versions`、`POST /system/rules/versions/{id}/activate`、`POST /system/ocr/test`（校验百度 OCR 凭据）、`GET /system/logs`、`GET /system/log-options`、`GET/POST /system/users`、`PATCH /system/users/{id}`、`POST /system/users/{id}/password` |
-| 项目 | `GET/POST /projects`、`GET/PATCH/DELETE /projects/{id}`、`POST /projects/{id}/archive`、`GET /projects/{id}/dashboard` |
+| 项目 | `GET/POST /projects`、`GET/PATCH/DELETE /projects/{id}`（`?purge=true` 物理删除）、`POST /projects/{id}/archive`、`POST /projects/{id}/unarchive`、`GET /projects/{id}/dashboard` |
+| 项目权限 | `GET /projects/{id}/permissions`、`POST /projects/{id}/permissions`（按工号/邮箱分享）、`PATCH /projects/{id}/permissions/{member_id}`、`DELETE /projects/{id}/permissions/{member_id}` |
 | 企业 | `GET/POST /projects/{id}/companies`、`GET/PATCH/DELETE /companies/{id}`、`POST /companies/{id}/confirm`、`PUT /companies/{id}/file-order`、`GET /companies/{id}/logical-document` |
-| 文件 | `POST /projects/{id}/tender-files`、`POST /companies/{id}/files`、`GET /projects/{id}/files`、`GET/DELETE /files/{id}`、`POST /files/{id}/replace`、`POST /files/{id}/parse`、`POST /projects/{id}/parse`、`GET /projects/{id}/parse-center`、`GET /files/{id}/pages/{page}`、`GET /files/{id}/original`、`GET /files/{id}/content` |
+| 文件 | `POST /projects/{id}/tender-files`、`POST /companies/{id}/files`、`GET /projects/{id}/files`、`GET/DELETE /files/{id}`、`POST /files/{id}/replace`、`POST /files/{id}/parse`、`POST /projects/{id}/parse`、`GET /projects/{id}/parse-center`、`GET /files/{id}/pages`、`GET /files/{id}/pages/{page}?block_offset=&block_limit=`（文本块分页）、`POST /files/{id}/ticket`、`GET /files/{id}/original`、`GET /files/{id}/content`、`GET /files/{id}/download` |
+| 实时 | `POST /projects/{id}/events/ticket`、`GET /projects/{id}/events?ticket=`（SSE，见 §4） |
 | 分析 | `GET /projects/{id}/analysis/prepare`、`POST /projects/{id}/analysis/tasks`、`GET /projects/{id}/tasks`、`GET /tasks/{id}`、`POST /tasks/{id}/cancel`、`POST /tasks/{id}/pairs/{pairId}/retry` |
 | 结果 | `GET /projects/{id}/results/overview`、`GET /pairs/{id}`、`GET /pairs/{id}/evidences`（证据 + 默认上下文，分页）、`GET /evidences/{id}`、`GET /evidences/{id}/context`（按需扩展上下文） |
 | 审核 | `POST /evidences/{id}/review`（支持 `learn_as_template`）、`GET /projects/{id}/reviews` |
 | 对比 | `GET /projects/{id}/tasks/{task_id}/diff?against=` |
 | 报告 | `GET /projects/{id}/reports/excel`、`GET /pairs/{id}/reports/excel`（单组合证据导出） |
 
-PDF 预览接口支持 `?token=` 查询参数（浏览器 iframe 无法设置 Authorization 头）；其他接口只接受 Bearer 头。
+原文预览、下载与 SSE 这三个浏览器无法设置请求头的入口，使用**限定到单个文件 / 单个项目、默认 5 分钟有效**的短期票据（`POST /files/{id}/ticket`、`POST /projects/{id}/events/ticket`，参数名 `ticket`）；其他接口只接受 `Authorization: Bearer`。长期登录 JWT 不出现在 URL 中。
 
 ---
 
@@ -483,6 +552,8 @@ PDF 预览接口支持 `?token=` 查询参数（浏览器 iframe 无法设置 Au
 - 特殊尾数（888/999/998）与尾数集中。
 
 价格证据通过 `evidence_participant` 记录全部参与企业，企业组合页面只展示与该组合相关的结果，不把项目级异常拆成单家企业结论。
+
+「价格比对」页的逐项单价矩阵由 `services/price_matrix_service.py` 生成：分项来源优先级为价格 Excel（`price_item`）> 正文自动识别，单元格状态 `identical / near / outlier / peer / single` 与证据识别同源，因此矩阵里的「一致」与证据里的「雷同」不会出现两套结论。
 
 ### 9.4 入口归一与噪声抑制
 
@@ -521,7 +592,7 @@ PDF 预览接口支持 `?token=` 查询参数（浏览器 iframe 无法设置 Au
 rsid 均在解析时一次性抽取（`services/document_metadata.py`、`services/document_forensics.py`）
 并固化进任务快照，历史结果可复现；存量文件在创建分析任务时按需回填。
 
-### 9.6 报价清单与关键事实
+### 9.6 报价与关键事实
 
 - **DOCX 表格（`services/parser.py`）**：按 body 顺序遍历段落与表格，表格转成「一行一条、
   单元格制表符分隔」的文本。此前只读 `document.paragraphs`，整张报价表被丢弃。
@@ -549,7 +620,7 @@ rsid 均在解析时一次性抽取（`services/document_metadata.py`、`service
 - 图片文件用 `image`（base64）；
 - 识别失败只记日志并把该页标记为未识别，不伪造识别文本。
 
-**单次体积上限与自动拆分**：百度接口限制的是 base64 + urlencode 之后的请求体（8MB），换算成原始文件约 6MB。系统管理里的「单次 OCR 文件大小上限（MB）」就是按原始文件计的上限（1～6MB，默认 6）。识别时的处理顺序：
+**单次体积上限与自动拆分**：百度接口限制的是 base64 + urlencode 之后的请求体（8MB），换算成原始文件约 6MB。系统配置里的「单次 OCR 文件大小上限（MB）」就是按原始文件计的上限（1～6MB，默认 6）。识别时的处理顺序：
 
 1. 把需要识别的页（只有没有文本层的扫描页）用 pypdf 拆成**单页 PDF 文件**，每个文件都在上限内；
 2. 逐份上传，用 `pdf_file_num` 指定该文件里的页码（拆分后固定为 1）；
@@ -557,7 +628,7 @@ rsid 均在解析时一次性抽取（`services/document_metadata.py`、`service
 
 按页拆分而不是整份上传，是因为接口一次只识别一页：整份上传会让 N 页传输 N 份完整文件，拆开后总传输量约等于原文件大小。原生文本页不参与拆分，因此不会浪费额度。
 
-开关与凭据在**系统管理 → 检测规则 → OCR 识别**里配置（走规则版本管理，改动有版本记录）；未启用时扫描页标记为空白/需 OCR，文件状态为部分成功。接入其他服务只需再实现一个 `OCRProvider` 子类并在 `build_ocr_provider()` 里注册。
+开关与凭据在**系统配置 → OCR 识别**里配置（走规则版本管理，改动有版本记录）；未启用时扫描页标记为空白/需 OCR，文件状态为部分成功。接入其他服务只需再实现一个 `OCRProvider` 子类并在 `build_ocr_provider()` 里注册。
 
 ### 9.9 对话式取证补充
 
@@ -608,9 +679,9 @@ rsid 均在解析时一次性抽取（`services/document_metadata.py`、`service
 2. **分片/断点续传**：上传按 1MB 流式落盘并限制 500MB，尚未实现分片上传协议。
 3. **PDF 文本坐标与印刷页码**：解析器保存页面尺寸和 `bbox` 字段，但 pypdf 不提供字符级坐标；当前定位精度为文本块级，并在证据中明确标记。印刷页码（printed_page_number）字段已预留但尚未自动识别。生产环境建议接入 PyMuPDF/OCR 坐标输出。
 4. **DOCX 页码**：DOCX 当前按单页组织提取文本，分页与印刷页码不精确；投标文件建议以 PDF 提交。
-5. **OCR**：仅接口占位。
+5. ~~**OCR**~~：已接入百度智能云 OCR 并跑通（含按页拆分与体积压缩），见 §9.8。仍缺的是：只处理「无文本层的扫描页」，图片型表格的结构还原（行列关系）依赖 OCR 返回的位置信息，尚未做表格重建。
 6. **任务恢复**：Celery 任务失败可重试，但容器重启时运行中任务不会自动恢复；当前由任务日志和“重跑任务”兜底。
-7. **项目级数据权限**：已有用户/JWT/角色字段、`require_admin` 管理员鉴权和完整审计日志，但**尚未实现按项目的数据隔离**（PRD §7.2「不同用户只能访问授权项目」）。当前任何已登录用户可见全部项目，`/workbench` 与 `/risks` 返回全量数据。**证据级分派与项目内二审已实现**（`assignee_id`、`review_stage`），接入项目隔离时需新增 `project_member` 表，并在 `risk_service.list_risks` 与 `workbench` 追加项目过滤条件。
+7. ~~**项目级数据权限**~~：已实现，见 §5.1.1「项目权限」。项目默认只有创建者与系统管理员可见，可按工号/邮箱分享为查看 / 审批 / 管理三级；`/workbench` 与 `/risks` 也只统计当前用户可见的项目。
 8. **大数据量性能**：企业/文件/文本块查询为基础实现；20 家企业 × 大文本时建议对文本块加倒排索引与分批任务。
 9. **分项报价**：已支持人工导入 / 补录投标总报价，并有逐项单价雷同识别；**工程量清单的结构化导入**（多行分项 + 合计校验）尚未实现。
 10. **PDF 报告**：PRD 中列为可后置，本版本只实现 Excel 导出（含逐项单价对比表）。
@@ -618,6 +689,10 @@ rsid 均在解析时一次性抽取（`services/document_metadata.py`、`service
 12. **规则参数覆盖度**：~~大小写金额一致性~~ 已接入（`amount_case_mismatch`，质量项）；`special_tail` / `tail_concentration_min_count` / `price_line_item_min_*` 均已真正生效；人员维度的关键岗位范围（`key_positions`）自 2026-11-17 起也已接入检测引擎（非空时只比对命中岗位的人员）。
 13. **报告导出待办的初值**：工作台的「报告尚未导出」依赖新增的 `report.export` 审计记录，历史导出无该记录的项目会多显示一次此待办，导出一次后即消失。
 14. **语义相似（embedding）**：当前仍是字面 + 结构 + 事实三层；同义改写只能靠结构指纹与错字一致部分覆盖。接入向量召回时必须保留原文偏移回填，否则三栏高亮与报告定位会失效。
+15. **价格矩阵两项阈值未进规则注册表**：`price_line_item_identical_tolerance` / `price_matrix_outlier_ratio` 只能吃默认值。
+16. **合计金额未与分项之和校验**：目前只做「合计行优先 + 候选矛盾标记待确认」，表格错位时仍可能采用错误总价（QA 第二轮实测 1,450,000 被取成 145,000）。
+17. **批量报价导入没有界面**：`/projects/{id}/quotes/import` 与模板下载接口仍在，但前端入口（原「报价清单」页）已随菜单重构移除；现在只能逐家企业上传价格 Excel。
+18. **大文件性能**：页详情已支持文本块分页与文本截断，但实现仍先把整页文本块全部读进内存再切片，单页上万块时首屏依然偏慢。
 
 ---
 
